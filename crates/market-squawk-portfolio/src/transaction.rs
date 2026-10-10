@@ -76,6 +76,7 @@ pub struct Trade {
     pub(crate) price: Money,
     pub(crate) fee: Money,
     pub(crate) lot_selection: LotSelection,
+    pub(crate) executed_notional: Option<Money>,
 }
 
 impl Trade {
@@ -97,8 +98,6 @@ impl Trade {
             || price.amount().is_sign_negative()
             || fee.amount().is_sign_negative()
             || price.currency() != fee.currency()
-            || matches!(side, TradeSide::Buy | TradeSide::SellShort)
-                && !matches!(lot_selection, LotSelection::Fifo)
         {
             return Err(PortfolioError::InvalidTransaction);
         }
@@ -109,7 +108,49 @@ impl Trade {
             price,
             fee,
             lot_selection,
+            executed_notional: None,
         })
+    }
+
+    /// Retains the source execution's exact gross; displayed average prices may be rounded.
+    /// The source producer owns both figures. Neither a quotient nor multiplication may silently
+    /// replace the actual settled notional retained on that execution.
+    pub fn try_from_execution(
+        side: TradeSide,
+        instrument_id: InstrumentId,
+        quantity: Decimal,
+        displayed_price: Money,
+        fee: Money,
+        lot_selection: LotSelection,
+        executed_notional: Money,
+    ) -> Result<Self, PortfolioError> {
+        let mut trade = Self::try_new(
+            side,
+            instrument_id,
+            quantity,
+            displayed_price,
+            fee,
+            lot_selection,
+        )?;
+        if executed_notional.currency() != displayed_price.currency()
+            || executed_notional.amount() <= Decimal::ZERO
+        {
+            return Err(PortfolioError::InvalidTransaction);
+        }
+        trade.executed_notional = Some(executed_notional);
+        Ok(trade)
+    }
+    pub const fn executed_notional(&self) -> Option<Money> {
+        self.executed_notional
+    }
+    pub(crate) fn gross_notional(&self) -> Result<Money, PortfolioError> {
+        match self.executed_notional {
+            Some(value) => Ok(value),
+            None => self
+                .price
+                .checked_mul_decimal(self.quantity)
+                .map_err(|_| PortfolioError::Arithmetic),
+        }
     }
 
     /// Returns the closed lifecycle side.

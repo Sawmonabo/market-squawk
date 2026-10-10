@@ -28,6 +28,15 @@ pub(super) fn plan_shape(
     valuation_cutoff: market_squawk_domain::Timestamp,
     records: &[CorporateActionRecord],
 ) -> Result<PlanShape, CorporateActionError> {
+    plan_shape_for_records(policy, knowledge_cutoff, valuation_cutoff, records.iter())
+}
+
+pub(super) fn plan_shape_for_records<'a>(
+    policy: CorporateActionPolicy,
+    knowledge_cutoff: market_squawk_domain::Timestamp,
+    valuation_cutoff: market_squawk_domain::Timestamp,
+    records: impl Iterator<Item = &'a CorporateActionRecord>,
+) -> Result<PlanShape, CorporateActionError> {
     let mut admitted = 0_usize;
     let mut exclusions = 0_usize;
     let mut steps = 0_usize;
@@ -151,7 +160,9 @@ fn output_counts(
     }
 }
 
-fn record_dynamic_bytes(record: &CorporateActionRecord) -> Result<usize, CorporateActionError> {
+pub(super) fn record_dynamic_bytes(
+    record: &CorporateActionRecord,
+) -> Result<usize, CorporateActionError> {
     let context = record.observation.context();
     let provenance = context.provenance();
     let mut retained = provenance.source_id().retained_bytes();

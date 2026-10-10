@@ -21,9 +21,9 @@ use market_squawk_portfolio::{
     ExposureReport, FactorLoading, InstrumentClassification, LedgerEntry, LedgerEntryKind,
     LotSelection, MoneyWeightedMethod, PerformancePeriod, PerformancePolicy, PerformanceReport,
     PortfolioAnalyticsEvidence, PortfolioError, PortfolioLedger, PortfolioLimitInput,
-    PortfolioLimits, PortfolioRevision, PortfolioRiskReport, RebalanceConstraintInput,
-    RebalanceConstraints, RebalanceProposal, RebalanceTarget, RevisionEvidence, ScenarioDefinition,
-    Trade, TradeSide, TransactionRevision, ValuationSet,
+    PortfolioLimits, PortfolioRevision, PortfolioRiskReport, RebalanceCalculation,
+    RebalanceConstraintInput, RebalanceConstraints, RebalanceProposal, RebalanceTarget,
+    RevisionEvidence, ScenarioDefinition, Trade, TradeSide, TransactionRevision, ValuationSet,
 };
 use rust_decimal::Decimal;
 
@@ -735,6 +735,95 @@ fn analytics_reports_are_policy_explicit_bounded_and_revision_bound() -> TestRes
             .checked_div(Decimal::from(1_010_u32))
             .ok_or("one-way turnover expectation")?
     );
+
+    // Regression: scaling purchases and sales together cannot credit the unscaled sales.
+    let mixed_targets = [
+        RebalanceTarget::try_new(
+            instrument(1)?,
+            ExactRate::try_new(Decimal::new(25, 2), ExactDecimalScale::Unit)?,
+        )?,
+        RebalanceTarget::try_new(
+            instrument(2)?,
+            ExactRate::try_new(Decimal::new(75, 2), ExactDecimalScale::Unit)?,
+        )?,
+    ];
+    let constraints_for = |turnover, reserve| {
+        RebalanceConstraints::try_new(RebalanceConstraintInput {
+            max_proposals: NonZeroUsize::new(4).ok_or(PortfolioError::InvalidPolicy)?,
+            max_turnover: ExactRate::try_new(turnover, ExactDecimalScale::Unit)
+                .map_err(|_| PortfolioError::Analytics)?,
+            minimum_cash: money(reserve, usd),
+            allow_short: false,
+        })
+    };
+    let mixed = RebalanceCalculation::try_calculate(
+        money(100, usd),
+        &[
+            (instrument(1)?, money(200, usd)),
+            (instrument(2)?, money(100, usd)),
+        ],
+        &mixed_targets,
+        constraints_for(Decimal::ONE, 50)?,
+        super::limits()?,
+    )?;
+    assert_eq!(mixed.projected_cash(), money(50, usd));
+    assert_eq!(mixed.trades()[0].value_change(), money(-50, usd));
+    assert_eq!(mixed.trades()[1].value_change(), money(100, usd));
+    assert_eq!(mixed.turnover().value(), Decimal::new(1875, 4));
+    assert!(mixed.constrained());
+
+    // A 1/3 cash scale with two sales needs conservative residual handling. A separate
+    // nonterminating turnover scale must also respect the exact cap, not only its displayed rate.
+    let rounding_holdings = [
+        (instrument(1)?, money(3, usd)),
+        (instrument(2)?, money(3, usd)),
+        (instrument(3)?, money(1, usd)),
+    ];
+    let rounding_targets = [
+        RebalanceTarget::try_new(
+            instrument(1)?,
+            ExactRate::try_new(Decimal::new(2, 1), ExactDecimalScale::Unit)?,
+        )?,
+        RebalanceTarget::try_new(
+            instrument(2)?,
+            ExactRate::try_new(Decimal::new(2, 1), ExactDecimalScale::Unit)?,
+        )?,
+        RebalanceTarget::try_new(
+            instrument(3)?,
+            ExactRate::try_new(Decimal::new(6, 1), ExactDecimalScale::Unit)?,
+        )?,
+    ];
+    for (cap, reserve) in [(Decimal::ONE, 2), (Decimal::new(1, 1), 0)] {
+        let rounded = RebalanceCalculation::try_calculate(
+            money(3, usd),
+            &rounding_holdings,
+            &rounding_targets,
+            constraints_for(cap, reserve)?,
+            super::limits()?,
+        )?;
+        let mut net = money(0, usd);
+        let mut gross = money(0, usd);
+        let mut projected = rounded.projected_cash();
+        for &(id, value) in &rounding_holdings {
+            let change = rounded
+                .trades()
+                .iter()
+                .find(|trade| trade.instrument_id() == id)
+                .ok_or("expected nonzero rebalance adjustment")?
+                .value_change();
+            net = net.checked_add(change)?;
+            gross = gross.checked_add(Money::new(change.amount().abs(), usd))?;
+            let after = value.checked_add(change)?;
+            assert!(after.amount() >= Decimal::ZERO);
+            projected = projected.checked_add(after)?;
+        }
+        assert_eq!(money(3, usd).checked_sub(net)?, rounded.projected_cash());
+        assert_eq!(projected, rounded.total_value());
+        assert!(rounded.projected_cash().amount() >= Decimal::from(reserve));
+        assert!(gross.amount() <= Decimal::from(20_u32).checked_mul(cap).ok_or("gross cap")?);
+        assert!(rounded.turnover().value() <= cap);
+        assert!(rounded.constrained());
+    }
 
     let returns = ReturnSeries::try_new(
         vec![

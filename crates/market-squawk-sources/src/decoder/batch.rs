@@ -1,9 +1,59 @@
+/// Untrusted provider-native identity coordinates carried by a decoder.
+///
+/// These values describe the wire instrument; only the installed catalog authority can validate
+/// their relationship to the independent canonical route.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProviderNativeInstrumentIdentity {
+    namespace: market_squawk_domain::SourceId,
+    provider_instrument_id: market_squawk_domain::ProviderInstrumentId,
+    venue_symbol: market_squawk_domain::VenueSymbol,
+}
+
+impl ProviderNativeInstrumentIdentity {
+    /// Retains exact native coordinates without granting identity authority.
+    pub const fn new(
+        namespace: market_squawk_domain::SourceId,
+        provider_instrument_id: market_squawk_domain::ProviderInstrumentId,
+        venue_symbol: market_squawk_domain::VenueSymbol,
+    ) -> Self {
+        Self {
+            namespace,
+            provider_instrument_id,
+            venue_symbol,
+        }
+    }
+
+    /// Returns the provider identity namespace, independent of the live source ID.
+    pub const fn namespace(&self) -> &market_squawk_domain::SourceId {
+        &self.namespace
+    }
+
+    /// Returns the exact provider instrument identity.
+    pub const fn provider_instrument_id(&self) -> &market_squawk_domain::ProviderInstrumentId {
+        &self.provider_instrument_id
+    }
+
+    /// Returns the independent venue-native symbol.
+    pub const fn venue_symbol(&self) -> &market_squawk_domain::VenueSymbol {
+        &self.venue_symbol
+    }
+
+    fn dynamic_retained_bytes(&self) -> Result<usize, DecodeError> {
+        checked_sum([
+            self.namespace.retained_bytes(),
+            self.provider_instrument_id.retained_bytes(),
+            self.venue_symbol.retained_bytes(),
+        ])
+    }
+}
+
 /// Bounded provider-normalized observation that has not yet mutated live state.
 #[derive(Clone, Debug)]
 pub struct ProviderNormalizedObservation {
     source_identifier: SourceIdentifier,
     venue: VenueId,
     instrument: InstrumentId,
+    native_identity: ProviderNativeInstrumentIdentity,
     timestamp: ProviderTimestampEvidence,
     sequence: ProviderSequenceEvidence,
     snapshot: ProviderSnapshotEvidence,
@@ -25,6 +75,7 @@ impl ProviderNormalizedObservation {
         source_identifier: SourceIdentifier,
         venue: VenueId,
         instrument: InstrumentId,
+        native_identity: ProviderNativeInstrumentIdentity,
         timestamp: ProviderTimestampEvidence,
         sequence: ProviderSequenceEvidence,
         snapshot: ProviderSnapshotEvidence,
@@ -32,6 +83,13 @@ impl ProviderNormalizedObservation {
         payload: ProviderObservationPayload,
     ) -> Result<Self, DecodeError> {
         let event_class = payload.event_class();
+        // Observational chart/cohort families have no current-price decoder representation.
+        if matches!(
+            event_class,
+            LiveEventClass::Chart | LiveEventClass::Screener
+        ) {
+            return Err(DecodeError::InvalidProviderEvidence);
+        }
         let valid_state_relation = if event_class.requires_book_state() {
             matches!(
                 snapshot,
@@ -48,6 +106,7 @@ impl ProviderNormalizedObservation {
             source_identifier,
             venue,
             instrument,
+            native_identity,
             timestamp,
             sequence,
             snapshot,
@@ -69,6 +128,11 @@ impl ProviderNormalizedObservation {
     /// Returns the resolved internal instrument.
     pub const fn instrument(&self) -> InstrumentId {
         self.instrument
+    }
+
+    /// Returns the untrusted native identity to match against the catalog-selected route.
+    pub const fn native_identity(&self) -> &ProviderNativeInstrumentIdentity {
+        &self.native_identity
     }
 
     /// Returns the provider event class.
@@ -127,21 +191,19 @@ impl ProviderNormalizedObservation {
             } => provider_snapshot_reference
                 .as_ref()
                 .map_or(0, SourceIdentifier::retained_bytes),
-            ProviderSnapshotEvidence::NotApplicable(rule) => {
-                rule.provider_rule().retained_bytes()
-            }
+            ProviderSnapshotEvidence::NotApplicable(rule) => rule.provider_rule().retained_bytes(),
         };
         let checksum_bytes = match &self.checksum {
-            ProviderChecksumEvidence::Provided { value, rule } => {
-                checked_sum([value.retained_bytes(), rule.provider_rule().retained_bytes()])?
-            }
-            ProviderChecksumEvidence::Unsupported { rule } => {
-                rule.provider_rule().retained_bytes()
-            }
+            ProviderChecksumEvidence::Provided { value, rule } => checked_sum([
+                value.retained_bytes(),
+                rule.provider_rule().retained_bytes(),
+            ])?,
+            ProviderChecksumEvidence::Unsupported { rule } => rule.provider_rule().retained_bytes(),
         };
         checked_sum([
             self.source_identifier.retained_bytes(),
             self.venue.retained_bytes(),
+            self.native_identity.dynamic_retained_bytes()?,
             timestamp_rule,
             sequence_dynamic_retained_bytes(&self.sequence),
             snapshot_bytes,
@@ -149,7 +211,6 @@ impl ProviderNormalizedObservation {
             self.payload.deep_retained_bytes()?,
         ])
     }
-
 }
 
 /// Intrinsically bounded pre-state observations emitted by one synchronous decode call.
@@ -171,22 +232,14 @@ impl DecodedProviderBatch {
         evidence: DecoderEvidence,
         observations: Vec<ProviderNormalizedObservation>,
     ) -> Result<Self, DecodeError> {
-        if observations.is_empty() {
-            return Err(DecodeError::EmptyBatch);
-        }
-        let observations = BoundedVec::try_new(observations)
-            .map_err(|error| DecodeError::TooManyEvents { max: error.max })?;
-        let mut book_item_count = 0_usize;
+        let observations = bounded_provider_observations(observations)?;
         for observation in observations.as_slice() {
-            book_item_count = book_item_count
-                .checked_add(observation.payload.book_item_count())
-                .ok_or(DecodeError::TooManyNumericFields {
-                    max: MAX_DECODED_BOOK_ITEMS,
-                })?;
-            if book_item_count > MAX_DECODED_BOOK_ITEMS {
-                return Err(DecodeError::TooManyNumericFields {
-                    max: MAX_DECODED_BOOK_ITEMS,
-                });
+            if let ProviderObservationPayload::Quote { bid, ask } = &observation.payload {
+                for level in bid.iter().chain(ask.iter()) {
+                    if let Some(original) = level.accumulated_evidence() {
+                        original.validate(&evidence, observation)?;
+                    }
+                }
             }
         }
         Ok(Self {
@@ -238,6 +291,30 @@ impl DecodedProviderBatch {
             .and_then(|bytes| bytes.checked_add(deep))
             .ok_or(DecodeError::RetainedSizeOverflow)
     }
+}
+
+pub(crate) fn bounded_provider_observations(
+    observations: Vec<ProviderNormalizedObservation>,
+) -> Result<BoundedVec<ProviderNormalizedObservation, MAX_DECODED_EVENTS>, DecodeError> {
+    if observations.is_empty() {
+        return Err(DecodeError::EmptyBatch);
+    }
+    let observations = BoundedVec::try_new(observations)
+        .map_err(|error| DecodeError::TooManyEvents { max: error.max })?;
+    let mut book_item_count = 0_usize;
+    for observation in observations.as_slice() {
+        book_item_count = book_item_count
+            .checked_add(observation.payload.book_item_count())
+            .ok_or(DecodeError::TooManyNumericFields {
+                max: MAX_DECODED_BOOK_ITEMS,
+            })?;
+        if book_item_count > MAX_DECODED_BOOK_ITEMS {
+            return Err(DecodeError::TooManyNumericFields {
+                max: MAX_DECODED_BOOK_ITEMS,
+            });
+        }
+    }
+    Ok(observations)
 }
 
 /// Synchronous object-safe provider decoder.
@@ -299,9 +376,7 @@ fn checked_sum(values: impl IntoIterator<Item = usize>) -> Result<usize, DecodeE
 fn sequence_dynamic_retained_bytes(sequence: &ProviderSequenceEvidence) -> usize {
     match sequence {
         ProviderSequenceEvidence::Provided { rule, .. }
-        | ProviderSequenceEvidence::Unsupported { rule } => {
-            rule.provider_rule().retained_bytes()
-        }
+        | ProviderSequenceEvidence::Unsupported { rule } => rule.provider_rule().retained_bytes(),
     }
 }
 
@@ -486,12 +561,7 @@ mod tests {
                 decoder_rule: IntegrityRule::new(decoder, RuleVersion::new(1)?),
             })
         }
-        let compact = evidence(
-            SourceId::try_from("s")?,
-            id("r")?,
-            id("i")?,
-            id("d")?,
-        )?;
+        let compact = evidence(SourceId::try_from("s")?, id("r")?, id("i")?, id("d")?)?;
         let expanded = evidence(
             SourceId::try_from(expanded("s", SourceId::MAX_LENGTH))?,
             SourceIdentifier::try_from(expanded("r", SourceIdentifier::MAX_LENGTH))?,
@@ -533,10 +603,8 @@ mod tests {
     #[test]
     fn delta_retained_bytes_include_every_nested_change_allocation() -> TestResult {
         for count in [1_usize, 10_000, 20_000] {
-            let payload = ProviderObservationPayload::book_delta(
-                MarketDepth::PriceLevel,
-                changes(count)?,
-            )?;
+            let payload =
+                ProviderObservationPayload::book_delta(MarketDepth::PriceLevel, changes(count)?)?;
             let expected = count
                 .checked_mul(size_of::<ProviderBookChange>() + 2)
                 .ok_or("delta fixture size overflow")?;
@@ -549,7 +617,10 @@ mod tests {
     #[test]
     fn every_payload_variant_has_closed_dynamic_accounting() -> TestResult {
         let status = || -> TestResult<ProviderStatusEvidence> {
-            Ok(ProviderStatusEvidence::new(id("status")?, rule("status-rule")?))
+            Ok(ProviderStatusEvidence::new(
+                id("status")?,
+                rule("status-rule")?,
+            ))
         };
         let payloads = vec![
             ProviderObservationPayload::Trade {
@@ -561,6 +632,7 @@ mod tests {
                     Some(id("buy")?),
                     rule("aggressor-rule")?,
                 ),
+                taker_order_type: None,
             },
             ProviderObservationPayload::quote(Some(level()?), Some(level()?))?,
             ProviderObservationPayload::book_snapshot(
@@ -568,10 +640,7 @@ mod tests {
                 levels(1)?,
                 levels(1)?,
             )?,
-            ProviderObservationPayload::book_delta(
-                MarketDepth::PriceLevel,
-                changes(1)?,
-            )?,
+            ProviderObservationPayload::book_delta(MarketDepth::PriceLevel, changes(1)?)?,
             ProviderObservationPayload::Auction {
                 provider_code: id("auction")?,
                 rule: rule("auction-rule")?,

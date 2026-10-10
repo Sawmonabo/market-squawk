@@ -18,16 +18,53 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 pub mod analysis;
+pub(crate) mod analytical_profile;
+pub mod analytical_workflow;
+pub mod backup;
+pub(crate) mod company_security_resolution;
 mod contracts;
+pub mod decision;
 mod domain_support;
 pub mod fair_value;
+pub mod governance;
+pub mod job;
+pub mod lifecycle;
 mod live_fair_value;
+pub mod logs;
+pub(crate) mod market_calendar;
+pub(crate) mod market_collection;
+mod market_runtime;
+pub(crate) mod market_selection;
 pub mod model;
+pub mod operations;
 mod paper;
+pub(crate) mod recommendation;
 mod research;
+pub(crate) use research::fiscal_projection::{
+    fiscal_projection_policy_value, fiscal_projection_targets,
+};
+#[cfg(all(feature = "board-installed-fixture", debug_assertions))]
+pub use research::{
+    H15InstalledAcceptance, H15InstalledAcceptanceError, H15InstalledAcceptanceRead,
+};
+pub(crate) use research::{
+    InvestmentFinancialPreparation, InvestmentFinancialPreparationInput,
+    map_current_population_error,
+};
+pub(crate) use research::{benchmark, saved_benchmark};
+pub mod settings;
+pub mod setup;
 pub mod source;
+pub mod workspace;
 
 pub use contracts::{APPLICATION_CONTRACT_VERSION, application_capabilities};
+pub(crate) use contracts::{
+    PRODUCT_LOOKUP_ACTION_OPEN_INVESTMENT, PRODUCT_LOOKUP_ACTION_OPEN_SAVED_SCREEN,
+    PRODUCT_LOOKUP_CATEGORIES, PRODUCT_LOOKUP_CATEGORY_INVESTMENT,
+    PRODUCT_LOOKUP_CATEGORY_SAVED_SCREEN, PRODUCT_LOOKUP_QUERY_MAXIMUM_CHARACTERS,
+    internal_forecast_generation_descriptor, product_lookup_query_is_canonical,
+};
+pub(crate) use domain_support::{opaque_product_text_token, opaque_product_token};
 pub use fair_value::{
     AnalyticsFairValueInputPublisher, FairValueDomainService, FairValueInputAuthorityError,
     FairValueInputAuthorityLimitInput, FairValueInputAuthorityLimits,
@@ -39,22 +76,118 @@ pub use fair_value::{
     ResearchFairValueInputPublisher,
 };
 pub use live_fair_value::{LiveFairValueObservationBuffer, LiveFairValueObservationBufferError};
+pub(crate) use market_runtime::{
+    AccountGroupStopReceipt, AccountMarketRuntimeReconnect, AccountMarketSurface,
+    AlpacaHistoricalRuntimeCapability, AlpacaOptionChainRuntime, AlpacaPublicationRuntime,
+    EquityPaperRouteEvidence, EquityPaperSourceBinding, EquityPaperSourceRoute,
+    MarketProviderGroupLifecycleEvidence, MarketRuntimeGroupGeneration, MarketRuntimeRegistry,
+    MarketSourceRuntimeGeneration, OptionChainDemand, OptionChainDemandError,
+    OptionChainDemandResult, PreparedAccountStop, PreparedMarketProviderConfigurationRequest,
+    PreparedMarketProviderConfigurationResolver, PreparedPublicMarketStart,
+    PreparedSchwabMarketRuntimeResolver, PublicMarketStartPreparation,
+    SCHWAB_CURRENT_LIVE_AUTHORITY_KEY, SchwabRestQuoteCurrentRuntimeInput,
+    SchwabRestQuoteRuntimeBounds, SchwabRestQuoteRuntimeError, SchwabRestQuoteSourceEvidence,
+    ensure_alpaca_iex_asset_reference,
+};
 pub use paper::PaperApplicationServices;
+pub(crate) use paper::PaperCredentialRuntimeControl;
+pub(crate) use paper::{
+    EquityPaperServices, MarketReferenceMatchKind, MarketReferenceRecord,
+    MarketReferenceSearchAuthority, MarketReferenceSearchPage, PaperAuditBackupKind,
+    PaperRuntimeActivityAuthority, PaperStoppedBackupAuthority, PaperStoppedBackupLease,
+    PaperStoppedBackupStreamCustody, PortfolioCandidateResolutionFactory,
+};
+pub(crate) use research::corporate_actions::{
+    ApplicableActionPlanError, ForecastOutcomeSourcePreparation, PendingCurrentPriceActions,
+    SourceActionPreparationCapability, SourceAppliedCorporateActionPlan,
+    SourceAppliedCorporateActionPlanReference, SourceAppliedCorporateActionReadCapability,
+    map_analytical_error as map_source_analytical_error,
+    map_research_error as map_source_research_error,
+};
+pub(crate) use research::fiscal_projection::FiscalProjectionTarget;
+pub(crate) use research::{
+    AlpacaHistoricalAuthorizedPlan, AlpacaHistoricalPlanAdmissionError,
+    AlpacaHistoricalPlanReceipt, AlpacaHistoricalSourceMutationAuthority,
+    AnalyticalForecastEvidenceReader, CensusLiveComposition, CensusMacroApplicationClosure,
+    CensusMacroApplicationError, CensusPublicationReceipt, CensusSealFirstExtractionLimits,
+    CoinbaseMarketApplicationOutcome, CompanyResearchReadCapability, CryptoCommittedRowIngress,
+    CryptoMarketPublicationAuthority, CryptoMarketPublicationError, CryptoPendingFrameIngress,
+    CryptoPublicationRendezvousLimits, DatasetPreparationAuthority, DatasetPreparationError,
+    DatasetPreparationOptions, DatasetPreparationPreview, DatasetPreparationPreviewRequest,
+    DatasetPreparationReceipt, DatasetPreparationSelection, DatasetPreparationUse,
+    EiaApplicationAcquisitionLimits, EiaLiveComposition, EiaMacroApplicationClosure,
+    EiaMacroApplicationError, EiaMacroEffectiveCutoff, EiaMacroPointInTimeRequest,
+    EiaMacroPublicationReceipt, EiaMacroRestartReceipt, EiaMacroRestartSelector,
+    FeatureDatasetProductionFinalizer, FiscalDatasetPreparationRequest, FredLatestKnownOperation,
+    FredPublishedGenerationHandoff, InstrumentContext, InstrumentContextOutcome,
+    InstrumentContextReadCapability, InstrumentContextReadError, InstrumentContextRequest,
+    InstrumentIdentityReadCapability, InstrumentIdentityResolutionOutcome,
+    InstrumentIdentityResolutionRead, InstrumentIdentityResolutionRequest,
+    InstrumentOfficialLifecycleEvidence, InstrumentSearchCandidate, InstrumentSearchListing,
+    InstrumentSearchMatchReason, InstrumentSearchRead, InstrumentSearchRequest,
+    KrakenMarketApplicationOutcome, MacroContextReadCapability, MacroFeatureVector,
+    MarketEventDurableRead, MarketEventDurableReadWriter, MarketEventReadError,
+    MarketEventRestartSelector, MarketHistoryReadCapability, MarketHistoryUnavailableReason,
+    OptionsContextAvailability, OptionsContextError, OptionsContextReadCapability,
+    OptionsContextRequest, OptionsContextUnavailableReason, PreparedFeatureDatasetBuild,
+    PreparedFiscalDatasetPair, ResearchProviderPublicationOperation,
+    ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
+    SEC_FUNDAMENTALS_RESEARCH_STATUS_OPERATION, SchwabMarketPublicationError,
+    SchwabRestQuoteGenerationAuthority, SchwabRestQuotePostSealFailure,
+    SchwabRestQuotePublicationPackage, SchwabRestQuoteSourceHealthOutcome,
+    SchwabStreamerApplicationOutcome, SchwabStreamerGenerationAuthority,
+    SchwabStreamerPublicationPackage, SecFundPublicationReceipt, SecFundamentalsResearchError,
+    SecFundamentalsResearchOperation, SecFundamentalsResearchRequest,
+    SecFundamentalsResearchStatus, SecLiveFundApplicationError, SecLiveFundRequest,
+    SecLiveFundSource, SecResearchFamilyBinding, TiingoCompletedEodActionRead,
+    TiingoCompletedEodHistoryReference, TiingoEodHistoryPublicationReceipt,
+    TiingoHistoryApplicationError, TreasuryApplicationClosure, TreasuryLatestKnownOperation,
+    TreasuryMacroPublicationReceipt, TreasurySelectedObjectRequest, read_macro_feature_vector,
+};
+pub(crate) use research::{
+    AlpacaMarketPublicationClosure, AlpacaMarketPublicationError,
+    AlpacaOptionMarketPointInTimeSelector, AlpacaOptionMarketPublicationReceipt,
+    AlpacaOptionMarketRestartReceipt, AlpacaOptionMarketRestartSelector,
+    AlpacaPublicationRegistration, AlpacaPublicationRuntimeInput, MACRO_CONTEXT_INDICATOR_COUNT,
+    PreparedProbabilityDatasetPair, ProbabilityBenchmarkSource,
+    ProbabilityCohortPreparationRequest, ProbabilitySubjectInputRequest,
+    RESIDENTIAL_ELECTRICITY_PRICE_DATASET,
+};
+pub(crate) use research::{
+    BlsLiveComposition, BlsLiveOutcome, BlsLivePublicationError, BlsLiveRequest, BlsLiveRuntime,
+    BlsMacroCapabilityState,
+};
+pub(crate) use research::{
+    BoardFullHistoryApplicationError, EquityPremiumReadError, InstrumentContextRead,
+    RecommendationBenchmarkSelection, RecommendationBenchmarkSelectionReadCapability,
+    SelectedRecommendationBenchmark, TiingoLatestApplicationError,
+    map_market_definition_read_error, required_annual_source_dates,
+};
+pub(crate) use research::{
+    CurrentFindPartitionPreparationEvidence, CurrentFindScreenPartition,
+    FindPopulationExclusionReason, HISTORICAL_FISCAL_MAXIMUM_ORIGINS,
+    HISTORICAL_FISCAL_MAXIMUM_PAGE_BYTES, HISTORICAL_FISCAL_MAXIMUM_PAGES,
+    HISTORICAL_FISCAL_PAGE_SIZE, HistoricalFiscalCompletedJobs,
+    HistoricalFiscalForecastReadCapability, HistoricalFiscalJobReference,
+    HistoricalFiscalPageDescriptor, HistoricalFiscalPageReference, HistoricalFiscalStudyBinding,
+    HistoricalFiscalTrainingAuthority, HistoricalFiscalUnavailableReference,
+    PreparedCurrentFindFeaturePartition, PreparedCurrentFindFeatures, PreparedFindPopulation,
+    PreparedHistoricalFiscalDatasets, prepare_find_population, prepare_fixed_current_population,
+    read_find_population,
+};
 pub use research::{
     ManagedResearchExtractionSource, PrepublishedResearchSourceRegistration,
     ProductionResearchIngestCoordinator, ResearchApplicationServices, ResearchExtractionLimits,
-    ResearchIngestCompositionError, ResearchIngestCoordinator, ResearchProviderRuntimeGeneration,
-    ResearchRevisionPlanError, ResearchRightsAuthority, ResearchSourceDiscovery,
-    ResearchSourceDiscoveryCoordinator, ResearchSourceDiscoveryObject,
+    ResearchIngestCommitAuthority, ResearchIngestCompositionError, ResearchIngestCoordinator,
+    ResearchProviderRuntimeGeneration, ResearchRevisionPlanError, ResearchRightsAuthority,
+    ResearchSourceDiscovery, ResearchSourceDiscoveryCoordinator, ResearchSourceDiscoveryObject,
     ResearchSourceDiscoveryRights, ResearchSourceObjectListing,
-};
-pub(crate) use research::{
-    ResearchProviderRuntimeMutationAuthority, ResearchProviderRuntimeReplacement,
 };
 pub use source::{
     EphemeralSourceInspectionAuthority, EphemeralSourceInspectionRequest,
     EphemeralSourceInspectionResult, SourceApplicationError, SourceDomainService,
-    SourceRuntimeRequest, SourceRuntimeSnapshot, SourceRuntimeSnapshotBatch,
+    SourceLifecycleAuthority, SourceLifecycleCommand, SourceLifecycleError, SourceLifecycleReceipt,
+    SourceLifecycleStatus, SourceRuntimeRequest, SourceRuntimeSnapshot, SourceRuntimeSnapshotBatch,
     SourceRuntimeSnapshotError, SourceRuntimeView, SourceRuntimeViewError,
 };
 
@@ -178,8 +311,8 @@ impl ApplicationDomainServices {
     }
 
     fn service(&self, domain: ServiceDomain) -> Option<&Arc<dyn ApplicationDomainService>> {
-        self.services
-            .get(domain_index(domain))
+        domain_index(domain)
+            .and_then(|index| self.services.get(index))
             .filter(|service| service.domain() == domain)
     }
 }
@@ -200,6 +333,60 @@ pub struct Application {
     shutdown_budget: ApplicationShutdownBudget,
     accepting_requests: AtomicBool,
     shutdown: tokio::sync::Mutex<Option<ApplicationShutdownReport>>,
+    startup_tasks: Option<Arc<crate::local_product::startup::ProductStartupTasks>>,
+}
+
+/// Owns the code-only contract and shutdown budget before persistent product authorities open.
+///
+/// The exact prepared registry is consumed by final composition; no second descriptor allocation
+/// or source-authority recovery permission is created here.
+#[derive(Debug)]
+pub(crate) struct PreparedApplicationComposition {
+    capabilities: ServiceCapabilities,
+    shutdown_budget: ApplicationShutdownBudget,
+}
+
+impl PreparedApplicationComposition {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each required product domain remains explicit at the sole composition root"
+    )]
+    pub(crate) fn compose_product_services(
+        self,
+        source: Arc<dyn ApplicationDomainService>,
+        research: &ResearchApplicationServices,
+        portfolio: Arc<dyn ApplicationDomainService>,
+        analysis: Arc<dyn ApplicationDomainService>,
+        model: Arc<dyn ApplicationDomainService>,
+        fair_value: Arc<dyn ApplicationDomainService>,
+        paper: &PaperApplicationServices,
+    ) -> Result<Application, ApplicationCompositionError> {
+        let services = vec![
+            source,
+            paper.market(),
+            research.research(),
+            research.fundamental(),
+            research.macroeconomics(),
+            portfolio,
+            analysis,
+            model,
+            fair_value,
+            paper.bot(),
+            paper.execution(),
+        ];
+        Ok(self.with_domains(ApplicationDomainServices::try_new(services)?))
+    }
+
+    fn with_domains(self, domains: ApplicationDomainServices) -> Application {
+        Application {
+            capabilities: self.capabilities,
+            domains,
+            shutdown_budget: self.shutdown_budget,
+            accepting_requests: AtomicBool::new(true),
+            shutdown: tokio::sync::Mutex::new(None),
+            startup_tasks: None,
+        }
+    }
 }
 
 impl Application {
@@ -223,22 +410,8 @@ impl Application {
         paper: &PaperApplicationServices,
         source_shutdown_timeout: Duration,
     ) -> Result<Self, ApplicationCompositionError> {
-        let services = vec![
-            source,
-            paper.market(),
-            research.research(),
-            research.fundamental(),
-            research.macroeconomics(),
-            portfolio,
-            analysis,
-            model,
-            fair_value,
-            paper.bot(),
-            paper.execution(),
-        ];
-        Self::try_new(
-            ApplicationDomainServices::try_new(services)?,
-            source_shutdown_timeout,
+        Self::prepare_composition(source_shutdown_timeout)?.compose_product_services(
+            source, research, portfolio, analysis, model, fair_value, paper,
         )
     }
 
@@ -251,15 +424,26 @@ impl Application {
         domains: ApplicationDomainServices,
         source_shutdown_timeout: Duration,
     ) -> Result<Self, ApplicationCompositionError> {
-        Ok(Self {
+        Ok(Self::prepare_composition(source_shutdown_timeout)?.with_domains(domains))
+    }
+
+    pub(crate) fn prepare_composition(
+        source_shutdown_timeout: Duration,
+    ) -> Result<PreparedApplicationComposition, ApplicationCompositionError> {
+        Ok(PreparedApplicationComposition {
             capabilities: application_capabilities()?,
-            domains,
             shutdown_budget: ApplicationShutdownBudget::try_from_source_timeout(
                 source_shutdown_timeout,
             )?,
-            accepting_requests: AtomicBool::new(true),
-            shutdown: tokio::sync::Mutex::new(None),
         })
+    }
+
+    pub(crate) fn with_startup_tasks(
+        mut self,
+        startup: Arc<crate::local_product::startup::ProductStartupTasks>,
+    ) -> Self {
+        self.startup_tasks = Some(startup);
+        self
     }
 
     /// Returns the product-owned deadline budget for complete reverse-order shutdown.
@@ -302,14 +486,22 @@ impl Application {
         self.call(request, context).await
     }
 
-    /// Synchronously closes request admission and cancels every domain in reverse dependency order.
+    /// Closes request admission, stops automation, and cancels owned startup publications.
     ///
-    /// The operation is nonblocking and idempotent. Call [`Self::shutdown`] to complete bounded
-    /// reconciliation and task joining.
+    /// Source/data teardown follows their actual startup drain in [`Self::shutdown`].
     pub fn begin_shutdown(&self) {
         if self.accepting_requests.swap(false, Ordering::AcqRel) {
+            if let Some(startup) = &self.startup_tasks {
+                startup.begin_shutdown();
+            }
             for service in self.domains.services.iter().rev() {
-                service.begin_shutdown();
+                if matches!(
+                    service.domain(),
+                    ServiceDomain::Bot | ServiceDomain::Execution
+                ) || (self.startup_tasks.is_none() && service.domain() != ServiceDomain::Market)
+                {
+                    service.begin_shutdown();
+                }
             }
         }
     }
@@ -329,14 +521,121 @@ impl Application {
         }
 
         let mut report = ApplicationShutdownReport::complete();
-        for service in self.domains.services.iter().rev() {
+        // These facades share the paper owner. Stop financial automation and retain its actual
+        // continuation before any Market teardown can consume the live hook authority.
+        for service in self.domains.services.iter().rev().filter(|service| {
+            matches!(
+                service.domain(),
+                ServiceDomain::Bot | ServiceDomain::Execution
+            )
+        }) {
             let outcome =
                 tokio::time::timeout_at(deadline, service.finish_shutdown(deadline.into_std()))
                     .await
                     .unwrap_or(Err(ServiceError::DeadlineExceeded));
-            report.failures[domain_index(service.domain())] = outcome.err();
+            if let Some(index) = domain_index(service.domain()) {
+                report.failures[index] = outcome.err();
+            }
         }
-        *retained = Some(report);
+        let paper_failure = [ServiceDomain::Bot, ServiceDomain::Execution]
+            .into_iter()
+            .filter_map(domain_index)
+            .find_map(|index| report.failures[index]);
+        let mut startup_failure = None;
+        if let Some(startup) = &self.startup_tasks {
+            if let Err(error) = startup.finish_shutdown(deadline.into_std()).await {
+                if startup.is_drained() {
+                    if let Some(index) = domain_index(ServiceDomain::Research) {
+                        report.failures[index] = Some(error);
+                    }
+                } else {
+                    startup_failure = Some(error);
+                }
+            }
+        }
+        let dependency_failure = |domain| {
+            if domain == ServiceDomain::Market {
+                paper_failure
+            } else if matches!(
+                domain,
+                ServiceDomain::Research | ServiceDomain::Fundamental | ServiceDomain::Macro
+            ) {
+                startup_failure
+            } else {
+                None
+            }
+        };
+        for service in self.domains.services.iter().rev() {
+            if matches!(
+                service.domain(),
+                ServiceDomain::Bot | ServiceDomain::Execution
+            ) {
+                continue;
+            }
+            if let Some(error) = dependency_failure(service.domain()) {
+                if let Some(index) = domain_index(service.domain()) {
+                    report.failures[index] = report.failures[index].or(Some(error));
+                }
+            } else {
+                service.begin_shutdown();
+            }
+        }
+        let mut market_finished = false;
+        let mut market_failure = dependency_failure(ServiceDomain::Market);
+        for service in self.domains.services.iter().rev() {
+            if matches!(
+                service.domain(),
+                ServiceDomain::Bot | ServiceDomain::Execution | ServiceDomain::Market
+            ) {
+                continue;
+            }
+            let research_domain = matches!(
+                service.domain(),
+                ServiceDomain::Research | ServiceDomain::Fundamental | ServiceDomain::Macro
+            );
+            if research_domain && !market_finished {
+                // Higher-level shutdown barriers ran. Market still owns raw captures that
+                // need the shared research I/O worker, so drain Market before its owner.
+                market_finished = true;
+                if market_failure.is_none()
+                    && let Some(market) = self.domains.service(ServiceDomain::Market)
+                {
+                    market_failure = tokio::time::timeout_at(
+                        deadline,
+                        market.finish_shutdown(deadline.into_std()),
+                    )
+                    .await
+                    .unwrap_or(Err(ServiceError::DeadlineExceeded))
+                    .err();
+                }
+                if let Some(index) = domain_index(ServiceDomain::Market) {
+                    report.failures[index] = report.failures[index].or(market_failure);
+                }
+            }
+            let blocked = dependency_failure(service.domain()).or(if research_domain {
+                market_failure
+            } else {
+                None
+            });
+            if let Some(error) = blocked {
+                // A failed Market drain may still own originals. Keep the research capture
+                // worker available for retained cleanup, and report the unmet dependency.
+                if let Some(index) = domain_index(service.domain()) {
+                    report.failures[index] = report.failures[index].or(Some(error));
+                }
+                continue;
+            }
+            let outcome =
+                tokio::time::timeout_at(deadline, service.finish_shutdown(deadline.into_std()))
+                    .await
+                    .unwrap_or(Err(ServiceError::DeadlineExceeded));
+            if let Some(index) = domain_index(service.domain()) {
+                report.failures[index] = report.failures[index].or(outcome.err());
+            }
+        }
+        if report.is_complete() {
+            *retained = Some(report);
+        }
         report
     }
 }
@@ -390,7 +689,10 @@ impl ToolServices for Application {
             result
                 .validate_against(context.limits())
                 .map_err(ServiceError::from)?;
-            result.validate_for(descriptor).map_err(ServiceError::from)
+            result.validate_for(descriptor).map_err(|error| {
+                tracing::warn!(operation = descriptor.name(), %error, "application result contract failed");
+                ServiceError::from(error)
+            })
         })();
         match validation {
             Ok(()) => {
@@ -479,7 +781,10 @@ impl ApplicationShutdownReport {
     /// Returns the terminal failure for one domain, if any.
     #[must_use]
     pub const fn failure(self, domain: ServiceDomain) -> Option<ServiceError> {
-        self.failures[domain_index(domain)]
+        match domain_index(domain) {
+            Some(index) => self.failures[index],
+            None => None,
+        }
     }
 }
 
@@ -524,19 +829,20 @@ fn effective_service_limits(
     .map_err(|_error| ServiceError::InvalidRequest)
 }
 
-const fn domain_index(domain: ServiceDomain) -> usize {
+const fn domain_index(domain: ServiceDomain) -> Option<usize> {
     match domain {
-        ServiceDomain::Source => 0,
-        ServiceDomain::Market => 1,
-        ServiceDomain::Research => 2,
-        ServiceDomain::Fundamental => 3,
-        ServiceDomain::Macro => 4,
-        ServiceDomain::Portfolio => 5,
-        ServiceDomain::Analysis => 6,
-        ServiceDomain::Model => 7,
-        ServiceDomain::FairValue => 8,
-        ServiceDomain::Bot => 9,
-        ServiceDomain::Execution => 10,
+        ServiceDomain::Job | ServiceDomain::Decision | ServiceDomain::Operations => None,
+        ServiceDomain::Source => Some(0),
+        ServiceDomain::Market => Some(1),
+        ServiceDomain::Research => Some(2),
+        ServiceDomain::Fundamental => Some(3),
+        ServiceDomain::Macro => Some(4),
+        ServiceDomain::Portfolio => Some(5),
+        ServiceDomain::Analysis => Some(6),
+        ServiceDomain::Model => Some(7),
+        ServiceDomain::FairValue => Some(8),
+        ServiceDomain::Bot => Some(9),
+        ServiceDomain::Execution => Some(10),
     }
 }
 
@@ -677,3 +983,11 @@ mod tests {
         ))
     }
 }
+
+// BEA concrete runtime remains owned by the research ingest capability.
+pub(crate) use research::{
+    BEA_PROVIDER_PERIOD_LATEST_KNOWN_OPERATION, BeaLivePublicationError, BeaMacroApplicationError,
+    BeaMacroCapabilityState, BeaProviderPeriodLatestKnownDto, BeaProviderPeriodLatestKnownRequest,
+    BeaRegionalLiveComposition, BeaRegionalLiveOutcome, BeaRegionalLiveRequest,
+    BeaRegionalLiveRuntime, BeaRegisteredSource,
+};

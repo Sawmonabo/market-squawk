@@ -1,7 +1,10 @@
 //! Bounded namespace-authoritative parser for XBRL and Inline XBRL occurrences.
 
+mod acquisition;
 mod model;
 mod normalize;
+mod number_words;
+mod staging;
 mod support;
 mod wire;
 
@@ -21,30 +24,42 @@ use quick_xml::events::Event;
 use quick_xml::name::NamespaceResolver;
 use rust_decimal::Decimal;
 use sha2::{Digest as _, Sha256};
+use tokio_util::sync::CancellationToken;
 
+pub(crate) use acquisition::{SecTaxonomyAcquisitionRequest, SecTaxonomyClosure};
+pub(crate) use model::{
+    MAX_TAXONOMY_ARTIFACT_BYTES, SecPendingValidatedXbrlTaxonomySet, SecValidatedXbrlTaxonomySet,
+    SecXbrlTaxonomyArtifact, SecXbrlTaxonomyReference, SecXbrlTaxonomyRegistry,
+};
 pub use model::{
-    ParsedXbrlDocument, XbrlDocumentContext, XbrlNonnumericOccurrence, XbrlNumericFact,
+    ParsedXbrlDocument, XbrlDocumentContext, XbrlFootnoteOccurrence, XbrlNonnumericOccurrence,
+    XbrlNumericFact,
 };
 use normalize::NormalizedDraft;
+pub(crate) use staging::IndexedXbrlDocument;
 pub use support::SecXbrlError;
 use wire::*;
 
-/// Every prospective charge includes a twofold allowance for collection growth, string spare
-/// capacity, and allocator size-class rounding on the pinned production toolchain. Charges are
-/// cumulative and are never refunded when an allocation is moved or released, so the admitted
-/// total conservatively bounds every simultaneously live parser-draft and output allocation.
+/// Prospective event allocations include collection-growth headroom. At each event boundary,
+/// charges are rebased to the live open XML state: completed records now belong to disk staging.
+/// Cumulative work and durable filing size are not retained-memory charges.
 const RETAINED_CAPACITY_ALLOWANCE: usize = 2;
 const BTREE_LINK_WORDS_PER_ENTRY: usize = 4;
 
 #[derive(Debug)]
 struct RetainedOutputBudget {
     admitted: usize,
+    peak: usize,
     limit: usize,
 }
 
 impl RetainedOutputBudget {
     const fn new(limit: usize) -> Self {
-        Self { admitted: 0, limit }
+        Self {
+            admitted: 0,
+            peak: 0,
+            limit,
+        }
     }
 
     fn admit(&mut self, language_visible_bytes: usize) -> Result<(), SecXbrlError> {
@@ -59,6 +74,7 @@ impl RetainedOutputBudget {
             return Err(SecXbrlError::RetainedOutputLimitExceeded);
         }
         self.admitted = admitted;
+        self.peak = self.peak.max(admitted);
         Ok(())
     }
 
@@ -132,46 +148,75 @@ fn dimension_dynamic_bytes(dimension: &XbrlDimensionEvidence) -> Result<usize, S
     checked_retained_sum([qname_dynamic_bytes(dimension.dimension())?, member])
 }
 
-fn unit_dynamic_bytes(unit: &XbrlUnitExpression) -> Result<usize, SecXbrlError> {
-    if let Some(measure) = unit.measure_name() {
-        return qname_dynamic_bytes(measure);
-    }
-    let Some((numerator, denominator)) = unit.divide_parts() else {
-        return Err(SecXbrlError::ParserInvariant);
-    };
-    numerator.iter().chain(denominator).try_fold(
-        numerator
-            .len()
-            .checked_add(denominator.len())
-            .and_then(|length| length.checked_mul(size_of::<XbrlQualifiedName>()))
-            .ok_or(SecXbrlError::RetainedOutputLimitExceeded)?,
-        |total, name| {
-            total
-                .checked_add(qname_dynamic_bytes(name)?)
-                .ok_or(SecXbrlError::RetainedOutputLimitExceeded)
-        },
-    )
-}
-
 /// Bounded XBRL/Inline-XBRL parser.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct XbrlDocumentParser;
 
 impl XbrlDocumentParser {
-    /// Parses one exact filing document using namespace-aware non-DOM pull processing.
-    pub fn parse(
+    /// Consumes one exact document context while parsing with cooperative per-event cancellation.
+    pub fn parse_with_cancellation(
         bytes: &[u8],
         limits: SecParserLimits,
         document: XbrlDocumentContext,
+        cancellation: &CancellationToken,
     ) -> Result<ParsedXbrlDocument, SecXbrlError> {
+        Self::parse_indexed_with_cancellation(bytes, limits, document, cancellation)?
+            .materialize(cancellation)
+    }
+
+    /// Parses and validates a complete filing using disk-backed indexes. Finalized source
+    /// occurrences remain in the operation-owned index until individually consumed.
+    pub(crate) fn parse_indexed_with_cancellation(
+        bytes: &[u8],
+        limits: SecParserLimits,
+        document: XbrlDocumentContext,
+        cancellation: &CancellationToken,
+    ) -> Result<IndexedXbrlDocument, SecXbrlError> {
+        let result = Self::parse_indexed(bytes, limits, document, cancellation, None);
+        check_xbrl_cancelled(cancellation)?;
+        result
+    }
+
+    /// Uses an application-owned operation directory so crash recovery can reclaim scratch.
+    pub(crate) fn parse_indexed_in_with_cancellation(
+        bytes: &[u8],
+        limits: SecParserLimits,
+        document: XbrlDocumentContext,
+        cancellation: &CancellationToken,
+        scratch_parent: &std::path::Path,
+    ) -> Result<IndexedXbrlDocument, SecXbrlError> {
+        let result =
+            Self::parse_indexed(bytes, limits, document, cancellation, Some(scratch_parent));
+        check_xbrl_cancelled(cancellation)?;
+        result
+    }
+
+    fn parse_indexed(
+        bytes: &[u8],
+        limits: SecParserLimits,
+        document: XbrlDocumentContext,
+        cancellation: &CancellationToken,
+        scratch_parent: Option<&std::path::Path>,
+    ) -> Result<IndexedXbrlDocument, SecXbrlError> {
         if bytes.len() > limits.decoded_bytes() {
             return Err(SecXbrlError::ByteLimitExceeded);
         }
+        check_xbrl_cancelled(cancellation)?;
+        let scratch = parser_scratch_reservation(bytes, limits, cancellation)?;
+        let output_admission = limits
+            .retained_output_bytes()
+            .checked_sub(scratch)
+            .filter(|remaining| *remaining > 0)
+            .ok_or(SecXbrlError::RetainedOutputLimitExceeded)?;
+        let limits = limits
+            .with_retained_bytes(output_admission)
+            .map_err(|_| SecXbrlError::RetainedOutputLimitExceeded)?;
         let mut reader = NsReader::from_reader(bytes);
         reader.config_mut().trim_text(false);
         reader.config_mut().expand_empty_elements = true;
-        let mut state = ParserState::new(limits, document);
+        let mut state = ParserState::new(limits, document, cancellation, scratch_parent)?;
         loop {
+            check_xbrl_cancelled(cancellation)?;
             let (resolution, event) = reader.read_resolved_event()?;
             match event {
                 Event::Start(start) => {
@@ -194,8 +239,17 @@ impl XbrlDocumentParser {
                 Event::Decl(_) | Event::PI(_) | Event::Comment(_) | Event::GeneralRef(_) => {}
                 Event::Empty(_) => return Err(SecXbrlError::ParserInvariant),
             }
+            state.refresh_retained()?;
         }
-        state.finish()
+        state.finish(cancellation)
+    }
+}
+
+fn check_xbrl_cancelled(cancellation: &CancellationToken) -> Result<(), SecXbrlError> {
+    if cancellation.is_cancelled() {
+        Err(SecXbrlError::Cancelled)
+    } else {
+        Ok(())
     }
 }
 
@@ -203,43 +257,122 @@ struct ParserState {
     limits: SecParserLimits,
     retained_output: RetainedOutputBudget,
     document: XbrlDocumentContext,
+    index: staging::FilingIndex,
     depth: usize,
-    contexts: BTreeMap<String, ContextDraft>,
-    units: BTreeMap<String, XbrlUnitExpression>,
     current_context: Option<ContextDraft>,
     current_unit: Option<UnitDraft>,
     context_container: Option<(usize, XbrlDimensionLocation)>,
     capture: Option<Capture>,
     active_facts: Vec<FactDraft>,
-    active_continuation: Option<ContinuationDraft>,
-    continuations: BTreeMap<String, ContinuationDraft>,
-    exclude_depth: Option<usize>,
-    facts: Vec<FactDraft>,
-    relationships: Vec<RelationshipDraft>,
+    active_footnotes: Vec<FootnoteDraft>,
+    language_scopes: Vec<(usize, String)>,
+    active_continuations: Vec<ContinuationDraft>,
+    element_ordinal: usize,
+    exclude_depths: Vec<usize>,
     next_fact_ordinal: usize,
 }
 
 impl ParserState {
-    fn new(limits: SecParserLimits, document: XbrlDocumentContext) -> Self {
-        Self {
+    fn new(
+        limits: SecParserLimits,
+        document: XbrlDocumentContext,
+        cancellation: &CancellationToken,
+        scratch_parent: Option<&std::path::Path>,
+    ) -> Result<Self, SecXbrlError> {
+        Ok(Self {
+            index: staging::FilingIndex::new(
+                limits.retained_output_bytes(),
+                cancellation,
+                scratch_parent,
+            )?,
             retained_output: RetainedOutputBudget::new(limits.retained_output_bytes()),
             limits,
             document,
             depth: 0,
-            contexts: BTreeMap::new(),
-            units: BTreeMap::new(),
             current_context: None,
             current_unit: None,
             context_container: None,
             capture: None,
             active_facts: Vec::new(),
-            active_continuation: None,
-            continuations: BTreeMap::new(),
-            exclude_depth: None,
-            facts: Vec::new(),
-            relationships: Vec::new(),
+            active_footnotes: Vec::new(),
+            language_scopes: Vec::new(),
+            active_continuations: Vec::new(),
+            element_ordinal: 0,
+            exclude_depths: Vec::new(),
             next_fact_ordinal: 0,
+        })
+    }
+
+    fn refresh_retained(&mut self) -> Result<(), SecXbrlError> {
+        let mut live = 2 * 1024 * 1024 + size_of::<Self>(); // SQLite page cache, not corpus size.
+        live = checked_retained_sum([
+            live,
+            self.active_facts.capacity() * size_of::<FactDraft>(),
+            self.active_footnotes.capacity() * size_of::<FootnoteDraft>(),
+            self.active_continuations.capacity() * size_of::<ContinuationDraft>(),
+            self.exclude_depths.capacity() * size_of::<usize>(),
+            self.language_scopes.capacity() * size_of::<(usize, String)>(),
+        ])?;
+        for (_, language) in &self.language_scopes {
+            live = checked_retained_sum([live, language.capacity()])?;
         }
+        for fact in &self.active_facts {
+            live = checked_retained_sum([live, fact.dynamic_bytes()?])?;
+        }
+        for note in &self.active_footnotes {
+            live = checked_retained_sum([
+                live,
+                note.id.capacity(),
+                note.language.capacity(),
+                note.role.capacity(),
+                note.title.as_ref().map_or(0, String::capacity),
+                note.continued_at.as_ref().map_or(0, String::capacity),
+                note.text.capacity(),
+            ])?;
+        }
+        for continuation in &self.active_continuations {
+            live = checked_retained_sum([
+                live,
+                continuation.id.capacity(),
+                continuation
+                    .continued_at
+                    .as_ref()
+                    .map_or(0, String::capacity),
+                continuation.text.capacity(),
+            ])?;
+        }
+        if let Some(context) = &self.current_context {
+            live = checked_retained_sum([
+                live,
+                context.id.capacity(),
+                context.clone_dynamic_bytes()?,
+            ])?;
+        }
+        if let Some(unit) = &self.current_unit {
+            live = checked_retained_sum([
+                live,
+                unit.id.capacity(),
+                (unit.simple.capacity() + unit.numerator.capacity() + unit.denominator.capacity())
+                    * size_of::<XbrlQualifiedName>(),
+            ])?;
+            for name in unit
+                .simple
+                .iter()
+                .chain(&unit.numerator)
+                .chain(&unit.denominator)
+            {
+                live = checked_retained_sum([live, qname_dynamic_bytes(name)?])?;
+            }
+        }
+        if let Some(capture) = &self.capture {
+            live = checked_retained_sum([
+                live,
+                capture.text.capacity(),
+                capture.kind.dynamic_bytes()?,
+            ])?;
+        }
+        self.retained_output.admitted = 0;
+        self.retained_output.admit(live)
     }
 
     fn start(
@@ -256,6 +389,28 @@ impl ParserState {
             return Err(SecXbrlError::DepthLimitExceeded);
         }
 
+        if let Some(language) =
+            attributes.namespaced("http://www.w3.org/XML/1998/namespace", "lang")
+        {
+            self.retained_output
+                .admit_vec_entry::<(usize, String)>(language.len())?;
+            self.language_scopes.push((self.depth, language.to_owned()));
+        }
+        self.element_ordinal = self
+            .element_ordinal
+            .checked_add(1)
+            .ok_or(SecXbrlError::RecordLimitExceeded)?;
+        if name
+            .namespace_uri()
+            .is_some_and(|namespace| namespace.as_str() == IX_NAMESPACE)
+        {
+            if let Some(reference) = attributes.unqualified("continuedAt") {
+                self.retained_output
+                    .admit_btree_entry::<String, ()>(reference.len())?;
+                self.index.reference(reference)?;
+            }
+        }
+
         let container_location = if is_element(&name, XBRLI_NAMESPACE, "segment") {
             Some(XbrlDimensionLocation::Segment)
         } else if is_element(&name, XBRLI_NAMESPACE, "scenario") {
@@ -269,20 +424,71 @@ impl ParserState {
             self.append_context_start(name.clone(), &attributes)?;
         }
 
-        if is_element(&name, IX_NAMESPACE, "continuation") {
-            if self.active_continuation.is_some() || !self.active_facts.is_empty() {
-                return Err(SecXbrlError::NestedContinuation);
+        if is_element(&name, IX_NAMESPACE, "footnote") {
+            if self
+                .index
+                .count("footnote")?
+                .checked_add(self.active_footnotes.len())
+                .is_none_or(|count| count >= self.limits.records())
+            {
+                return Err(SecXbrlError::RecordLimitExceeded);
             }
             let id = attributes
                 .unqualified("id")
                 .ok_or(SecXbrlError::MissingAttribute)?;
+            let language = self
+                .language_scopes
+                .last()
+                .map(|(_, language)| language.as_str())
+                .filter(|language| !language.is_empty())
+                .ok_or(SecXbrlError::MissingAttribute)?;
+            let role = attributes
+                .unqualified("footnoteRole")
+                .unwrap_or("http://www.xbrl.org/2003/role/footnote");
+            let title = attributes.unqualified("title");
             let continued_at = attributes.unqualified("continuedAt");
-            self.retained_output.admit(checked_retained_sum([
-                id.len(),
-                continued_at.map_or(0, str::len),
-            ])?)?;
-            self.active_continuation = Some(ContinuationDraft {
+            self.retained_output
+                .admit_vec_entry::<FootnoteDraft>(checked_retained_sum([
+                    id.len(),
+                    language.len(),
+                    role.len(),
+                    title.map_or(0, str::len),
+                    continued_at.map_or(0, str::len),
+                ])?)?;
+            self.active_footnotes.push(FootnoteDraft {
                 start_depth: self.depth,
+                span: ElementSpan::new(self.element_ordinal),
+                id: id.to_owned(),
+                language: language.to_owned(),
+                role: role.to_owned(),
+                title: title.map(str::to_owned),
+                continued_at: continued_at.map(str::to_owned),
+                continuation_chain: Vec::new(),
+                text: String::new(),
+            });
+            return Ok(());
+        }
+        if is_element(&name, IX_NAMESPACE, "continuation") {
+            let id = attributes
+                .unqualified("id")
+                .ok_or(SecXbrlError::MissingAttribute)?;
+            let continued_at = attributes.unqualified("continuedAt");
+            if self
+                .index
+                .count("continuation")?
+                .checked_add(self.active_continuations.len())
+                .is_none_or(|count| count >= self.limits.records())
+            {
+                return Err(SecXbrlError::RecordLimitExceeded);
+            }
+            self.retained_output
+                .admit_vec_entry::<ContinuationDraft>(checked_retained_sum([
+                    id.len(),
+                    continued_at.map_or(0, str::len),
+                ])?)?;
+            self.active_continuations.push(ContinuationDraft {
+                start_depth: self.depth,
+                span: ElementSpan::new(self.element_ordinal),
                 id: id.to_owned(),
                 continued_at: continued_at.map(str::to_owned),
                 text: String::new(),
@@ -290,19 +496,17 @@ impl ParserState {
             return Ok(());
         }
         if is_element(&name, IX_NAMESPACE, "exclude") {
-            if self.exclude_depth.is_some() {
-                return Err(SecXbrlError::NestedExclude);
-            }
-            self.exclude_depth = Some(self.depth);
+            self.retained_output.admit_vec_entry::<usize>(0)?;
+            self.exclude_depths.push(self.depth);
             return Ok(());
         }
         if is_element(&name, IX_NAMESPACE, "relationship") {
             self.retained_output.admit_vec_entry::<RelationshipDraft>(
                 RelationshipDraft::dynamic_bytes_from_attributes(&attributes)?,
             )?;
-            self.relationships
-                .push(RelationshipDraft::try_new(&attributes)?);
-            if self.relationships.len() > self.limits.records() {
+            self.index
+                .relationship(RelationshipDraft::try_new(&attributes)?)?;
+            if self.index.count("relationship")? > self.limits.records() {
                 return Err(SecXbrlError::RecordLimitExceeded);
             }
             return Ok(());
@@ -447,6 +651,7 @@ impl ParserState {
                 .admit_vec_entry::<FactDraft>(fact_dynamic)?;
             self.active_facts.push(FactDraft {
                 start_depth: self.depth,
+                span: ElementSpan::new(self.element_ordinal),
                 concept,
                 context_id: context_ref
                     .map(str::to_owned)
@@ -545,23 +750,45 @@ impl ParserState {
         if text.len() > self.limits.string_bytes() {
             return Err(SecXbrlError::StringLimitExceeded);
         }
-        if self.exclude_depth.is_none() {
-            let retained_copies = self
-                .active_facts
-                .len()
-                .checked_add(if self.active_continuation.is_some() {
-                    1
-                } else {
-                    0
-                })
-                .and_then(|copies| copies.checked_mul(text.len()))
-                .ok_or(SecXbrlError::RetainedOutputLimitExceeded)?;
-            self.retained_output.admit(retained_copies)?;
-            for fact in &mut self.active_facts {
+        // An exclusion suppresses its ancestor capture, but independently tagged
+        // descendants inside that exclusion still retain their own source content.
+        let excluded_at = self.exclude_depths.last().copied();
+        let included = |start_depth| excluded_at.is_none_or(|depth| depth < start_depth);
+        let copies = self
+            .active_facts
+            .iter()
+            .filter(|fact| included(fact.start_depth))
+            .count()
+            .checked_add(
+                self.active_continuations
+                    .iter()
+                    .filter(|continuation| included(continuation.start_depth))
+                    .count(),
+            )
+            .and_then(|copies| {
+                copies.checked_add(
+                    self.active_footnotes
+                        .iter()
+                        .filter(|footnote| included(footnote.start_depth))
+                        .count(),
+                )
+            })
+            .and_then(|copies| copies.checked_mul(text.len()))
+            .ok_or(SecXbrlError::RetainedOutputLimitExceeded)?;
+        self.retained_output.admit(copies)?;
+        for fact in &mut self.active_facts {
+            if included(fact.start_depth) {
                 append_bounded(&mut fact.text, text, self.limits.string_bytes())?;
             }
-            if let Some(continuation) = &mut self.active_continuation {
+        }
+        for continuation in &mut self.active_continuations {
+            if included(continuation.start_depth) {
                 append_bounded(&mut continuation.text, text, self.limits.string_bytes())?;
+            }
+        }
+        for footnote in &mut self.active_footnotes {
+            if included(footnote.start_depth) {
+                append_bounded(&mut footnote.text, text, self.limits.string_bytes())?;
             }
         }
         if let Some(capture) = &mut self.capture {
@@ -642,35 +869,54 @@ impl ParserState {
                 .push(XbrlXmlEvent::End { name: name.clone() });
         }
         if self
-            .active_continuation
-            .as_ref()
+            .active_footnotes
+            .last()
+            .is_some_and(|footnote| footnote.start_depth == self.depth)
+        {
+            let mut footnote = self
+                .active_footnotes
+                .pop()
+                .ok_or(SecXbrlError::ParserInvariant)?;
+            footnote.span.end = self.element_ordinal;
+            self.retained_output.admit_vec_entry::<FootnoteDraft>(0)?;
+            self.index.insert(
+                "footnote",
+                &footnote.id,
+                self.index.count("footnote")?,
+                &footnote,
+            )?;
+        }
+        if self
+            .active_continuations
+            .last()
             .is_some_and(|continuation| continuation.start_depth == self.depth)
         {
-            let continuation = self
-                .active_continuation
-                .take()
+            let mut continuation = self
+                .active_continuations
+                .pop()
                 .ok_or(SecXbrlError::ParserInvariant)?;
+            continuation.span.end = self.element_ordinal;
             self.retained_output
                 .admit_btree_entry::<String, ContinuationDraft>(continuation.id.len())?;
-            if self
-                .continuations
-                .insert(continuation.id.clone(), continuation)
-                .is_some()
-            {
-                return Err(SecXbrlError::DuplicateIdentity);
-            }
+            self.index.insert(
+                "continuation",
+                &continuation.id,
+                self.index.count("continuation")?,
+                &continuation,
+            )?;
         }
         if self
             .active_facts
             .last()
             .is_some_and(|fact| fact.start_depth == self.depth)
         {
-            let fact = self
+            let mut fact = self
                 .active_facts
                 .pop()
                 .ok_or(SecXbrlError::ParserInvariant)?;
+            fact.span.end = self.element_ordinal;
             self.retained_output.admit_vec_entry::<FactDraft>(0)?;
-            self.facts.push(fact);
+            self.index.fact(&fact)?;
         }
         if self
             .capture
@@ -695,8 +941,10 @@ impl ParserState {
         {
             self.context_container = None;
         }
-        if is_element(name, IX_NAMESPACE, "exclude") && self.exclude_depth == Some(self.depth) {
-            self.exclude_depth = None;
+        if is_element(name, IX_NAMESPACE, "exclude")
+            && self.exclude_depths.last() == Some(&self.depth)
+        {
+            self.exclude_depths.pop();
         }
         if is_element(name, XBRLI_NAMESPACE, "context") {
             let context = self
@@ -705,9 +953,12 @@ impl ParserState {
                 .ok_or(SecXbrlError::ParserInvariant)?;
             self.retained_output
                 .admit_btree_entry::<String, ContextDraft>(context.id.len())?;
-            if self.contexts.insert(context.id.clone(), context).is_some() {
-                return Err(SecXbrlError::DuplicateIdentity);
-            }
+            self.index.insert(
+                "context",
+                &context.id,
+                self.index.count("context")?,
+                &context,
+            )?;
         }
         if is_element(name, XBRLI_NAMESPACE, "unit") {
             let unit = self
@@ -718,9 +969,15 @@ impl ParserState {
             let expression = unit.finish()?;
             self.retained_output
                 .admit_btree_entry::<String, XbrlUnitExpression>(id.len())?;
-            if self.units.insert(id, expression).is_some() {
-                return Err(SecXbrlError::DuplicateIdentity);
-            }
+            self.index
+                .insert("unit", &id, self.index.count("unit")?, &expression)?;
+        }
+        if self
+            .language_scopes
+            .last()
+            .is_some_and(|(depth, _)| *depth == self.depth)
+        {
+            self.language_scopes.pop();
         }
         self.depth -= 1;
         Ok(())
@@ -819,305 +1076,163 @@ impl ParserState {
         Ok(())
     }
 
-    fn finish(mut self) -> Result<ParsedXbrlDocument, SecXbrlError> {
+    fn finish(
+        mut self,
+        cancellation: &CancellationToken,
+    ) -> Result<IndexedXbrlDocument, SecXbrlError> {
+        check_xbrl_cancelled(cancellation)?;
         if self.depth != 0
             || self.current_context.is_some()
             || self.current_unit.is_some()
             || !self.active_facts.is_empty()
-            || self.active_continuation.is_some()
+            || !self.active_footnotes.is_empty()
+            || !self.language_scopes.is_empty()
+            || !self.active_continuations.is_empty()
             || self.capture.is_some()
-            || self.exclude_depth.is_some()
+            || !self.exclude_depths.is_empty()
             || self.context_container.is_some()
         {
             return Err(SecXbrlError::UnexpectedEof);
         }
-        let mut occurrence_ids = BTreeSet::new();
-        for fact in &self.facts {
-            self.retained_output
-                .admit_btree_entry::<String, ()>(fact.occurrence_id.len())?;
-            if !occurrence_ids.insert(fact.occurrence_id.clone()) {
+        for ordinal in 0..self.index.count("footnote")? {
+            check_xbrl_cancelled(cancellation)?;
+            let footnote: FootnoteDraft = self
+                .index
+                .at("footnote", ordinal)?
+                .ok_or(SecXbrlError::ParserInvariant)?;
+            if self.index.contains("fact", &footnote.id)?
+                || self.index.contains("continuation", &footnote.id)?
+            {
                 return Err(SecXbrlError::DuplicateIdentity);
             }
         }
-        for fact in &mut self.facts {
-            let mut next = fact.continued_at.take();
-            let mut seen = BTreeSet::new();
-            while let Some(continuation_id) = next {
-                self.retained_output
-                    .admit_btree_entry::<String, ()>(continuation_id.len())?;
-                if !seen.insert(continuation_id.clone()) {
-                    return Err(SecXbrlError::ContinuationCycle);
-                }
-                let continuation = self
-                    .continuations
-                    .get(&continuation_id)
-                    .ok_or(SecXbrlError::UnknownContinuation)?;
-                self.retained_output.admit(continuation.text.len())?;
-                append_bounded(
-                    &mut fact.text,
-                    &continuation.text,
-                    self.limits.string_bytes(),
-                )?;
-                self.retained_output.admit_vec_entry::<String>(0)?;
-                fact.continuation_chain.push(continuation_id);
-                self.retained_output.admit(
-                    continuation
-                        .continued_at
-                        .as_ref()
-                        .map_or(0, String::capacity),
-                )?;
-                next = continuation.continued_at.clone();
-            }
-        }
-        let mut relationships = Vec::new();
-        let mut relationship_clone_bytes = Vec::new();
-        for relationship in self.relationships {
-            let clone_bytes = relationship.evidence_dynamic_bytes()?;
-            self.retained_output
-                .admit_vec_entry::<XbrlRelationshipEvidence>(clone_bytes)?;
-            self.retained_output.admit_vec_entry::<usize>(0)?;
-            relationships.push(relationship.into_evidence()?);
-            relationship_clone_bytes.push(clone_bytes);
-        }
-        for relationship in &relationships {
-            if relationship
-                .from_refs()
-                .iter()
-                .chain(relationship.to_refs())
-                .any(|reference| !occurrence_ids.contains(reference.as_str()))
-            {
-                return Err(SecXbrlError::UnknownRelationshipReference);
-            }
-        }
-        let mut children = BTreeMap::<String, Vec<SourceIdentifier>>::new();
-        for fact in &self.facts {
-            if let Some(parent) = &fact.parent_occurrence_id {
-                self.retained_output
-                    .admit_vec_entry::<SourceIdentifier>(fact.occurrence_id.len())?;
-                let child = SourceIdentifier::try_from(fact.occurrence_id.clone())?;
-                if let Some(existing) = children.get_mut(parent) {
-                    existing.push(child);
-                } else {
-                    self.retained_output
-                        .admit_btree_entry::<String, Vec<SourceIdentifier>>(parent.len())?;
-                    children.insert(parent.clone(), vec![child]);
+        for ordinal in 0..self.index.count("relationship")? {
+            check_xbrl_cancelled(cancellation)?;
+            let relation: XbrlRelationshipEvidence = self
+                .index
+                .at("relationship", ordinal)?
+                .ok_or(SecXbrlError::ParserInvariant)?;
+            for id in relation.from_refs() {
+                if !self.index.contains("fact", id.as_str())? {
+                    return Err(SecXbrlError::UnknownRelationshipReference);
                 }
             }
-        }
-        let mut occurrence_graph = BTreeMap::new();
-        let mut occurrence_graph_clone_bytes = BTreeMap::new();
-        for fact in &self.facts {
-            let id = SourceIdentifier::try_from(fact.occurrence_id.clone())?;
-            let mut incident = Vec::new();
-            let mut incident_dynamic = 0usize;
-            for (index, relationship) in relationships.iter().enumerate() {
-                if relationship.from_refs().contains(&id) || relationship.to_refs().contains(&id) {
-                    let clone_bytes = *relationship_clone_bytes
-                        .get(index)
-                        .ok_or(SecXbrlError::ParserInvariant)?;
-                    self.retained_output
-                        .admit_vec_entry::<XbrlRelationshipEvidence>(clone_bytes)?;
-                    incident_dynamic = incident_dynamic
-                        .checked_add(size_of::<XbrlRelationshipEvidence>())
-                        .and_then(|bytes| bytes.checked_add(clone_bytes))
-                        .ok_or(SecXbrlError::RetainedOutputLimitExceeded)?;
-                    incident.push(relationship.clone());
+            let mut footnote_targets = 0;
+            for id in relation.to_refs() {
+                if self.index.contains("footnote", id.as_str())? {
+                    footnote_targets += 1;
+                } else if !self.index.contains("fact", id.as_str())? {
+                    return Err(SecXbrlError::UnknownRelationshipReference);
+                }
+                if relation.from_refs().contains(id) {
+                    return Err(SecXbrlError::InvalidRelationshipGraph);
                 }
             }
-            let parent_dynamic = fact
-                .parent_occurrence_id
-                .as_ref()
-                .map_or(0, String::capacity);
-            let child_occurrences = children.remove(&fact.occurrence_id).unwrap_or_default();
-            let child_dynamic = child_occurrences.iter().try_fold(
-                child_occurrences
-                    .len()
-                    .checked_mul(size_of::<SourceIdentifier>())
-                    .ok_or(SecXbrlError::RetainedOutputLimitExceeded)?,
-                |total, child| {
-                    total
-                        .checked_add(child.retained_bytes())
-                        .ok_or(SecXbrlError::RetainedOutputLimitExceeded)
-                },
+            if footnote_targets != 0 && footnote_targets != relation.to_refs().len() {
+                return Err(SecXbrlError::InvalidRelationshipGraph);
+            }
+        }
+        for ordinal in 0..self.index.count("fact")? {
+            check_xbrl_cancelled(cancellation)?;
+            self.refresh_retained()?;
+            let mut fact: FactDraft = self
+                .index
+                .at("fact", ordinal)?
+                .ok_or(SecXbrlError::ParserInvariant)?;
+            resolve_continuations(
+                fact.span,
+                &mut fact.continued_at,
+                &mut fact.text,
+                &mut fact.continuation_chain,
+                &self.index,
+                &mut self.retained_output,
+                self.limits.string_bytes(),
+                cancellation,
             )?;
-            let continuation_dynamic = fact.continuation_chain.iter().try_fold(
-                fact.continuation_chain
-                    .len()
-                    .checked_mul(size_of::<SourceIdentifier>())
-                    .ok_or(SecXbrlError::RetainedOutputLimitExceeded)?,
-                |total, continuation| {
-                    total
-                        .checked_add(continuation.capacity())
-                        .ok_or(SecXbrlError::RetainedOutputLimitExceeded)
-                },
-            )?;
-            let graph_clone_bytes = checked_retained_sum([
-                parent_dynamic,
-                child_dynamic,
-                continuation_dynamic,
-                incident_dynamic,
-            ])?;
-            self.retained_output
-                .admit_btree_entry::<String, XbrlOccurrenceRelationships>(
-                    fact.occurrence_id
-                        .len()
-                        .checked_add(graph_clone_bytes)
-                        .ok_or(SecXbrlError::RetainedOutputLimitExceeded)?,
-                )?;
-            self.retained_output
-                .admit_btree_entry::<String, usize>(fact.occurrence_id.len())?;
-            occurrence_graph.insert(
-                fact.occurrence_id.clone(),
-                XbrlOccurrenceRelationships::try_new(
-                    fact.parent_occurrence_id
-                        .as_deref()
-                        .map(SourceIdentifier::try_from)
-                        .transpose()?,
-                    child_occurrences,
-                    fact.continuation_chain
-                        .iter()
-                        .map(|id| SourceIdentifier::try_from(id.as_str()))
-                        .collect::<Result<Vec<_>, _>>()?,
-                    incident,
-                )?,
-            );
-            occurrence_graph_clone_bytes.insert(fact.occurrence_id.clone(), graph_clone_bytes);
-        }
-        let mut normalized = Vec::new();
-        for fact in self.facts {
-            let context = self
-                .contexts
-                .get(&fact.context_id)
+            let context: ContextDraft = self
+                .index
+                .get("context", &fact.context_id)?
                 .ok_or(SecXbrlError::UnknownContext)?;
-            let unit_dynamic = fact
+            let unit = fact
                 .unit_id
                 .as_ref()
-                .and_then(|unit_id| self.units.get(unit_id))
-                .map(unit_dynamic_bytes)
+                .map(|id| self.index.get::<XbrlUnitExpression>("unit", id))
                 .transpose()?
-                .unwrap_or(0);
-            let occurrence_dynamic = *occurrence_graph_clone_bytes
-                .get(&fact.occurrence_id)
-                .ok_or(SecXbrlError::ParserInvariant)?;
-            let normalized_dynamic = checked_retained_sum([
-                qname_dynamic_bytes(&fact.concept)?,
-                fact.occurrence_id.len(),
-                fact.context_id.len(),
-                fact.unit_id.as_ref().map_or(0, String::capacity),
-                fact.text
-                    .trim()
-                    .len()
-                    .checked_mul(2)
-                    .ok_or(SecXbrlError::RetainedOutputLimitExceeded)?,
-                context.clone_dynamic_bytes()?,
-                unit_dynamic,
-                occurrence_dynamic,
-                self.document.accession.retained_bytes(),
-                SourceIdentifier::MAX_LENGTH,
-                SourceIdentifier::MAX_LENGTH,
-                self.document
-                    .source_payload
-                    .dynamic_retained_bytes()
-                    .ok_or(SecXbrlError::RetainedOutputLimitExceeded)?,
-                "sec-xbrl-duplicate-v2".len(),
-                "sec-xbrl-parser-v2".len(),
-                "sec-xbrl-rounding-v2".len(),
-            ])?;
-            self.retained_output.admit_vec_entry::<NormalizedDraft>(
-                size_of::<XbrlFactEvidenceInput>()
-                    .checked_add(normalized_dynamic)
-                    .ok_or(SecXbrlError::RetainedOutputLimitExceeded)?,
+                .flatten();
+            let graph = XbrlOccurrenceRelationships::try_new(
+                fact.parent_occurrence_id
+                    .as_deref()
+                    .map(SourceIdentifier::try_from)
+                    .transpose()?,
+                self.index.children(&fact.occurrence_id)?,
+                fact.continuation_chain
+                    .iter()
+                    .map(|id| SourceIdentifier::try_from(id.as_str()))
+                    .collect::<Result<Vec<_>, _>>()?,
+                self.index.incident(&fact.occurrence_id)?,
             )?;
-            normalized.push(NormalizedDraft::try_new(
-                fact,
-                &self.contexts,
-                &self.units,
-                &occurrence_graph,
-                &self.document,
-            )?);
-        }
-        let mut groups = BTreeMap::<[u8; 32], Vec<usize>>::new();
-        for (index, draft) in normalized.iter().enumerate() {
-            if let NormalizedDraft::Numeric { evidence_input, .. } = draft {
-                let digest = semantic_aspect_digest(evidence_input);
-                if !groups.contains_key(&digest) {
-                    self.retained_output
-                        .admit_btree_entry::<[u8; 32], Vec<usize>>(0)?;
-                }
-                self.retained_output.admit_vec_entry::<usize>(0)?;
-                groups.entry(digest).or_default().push(index);
+            let normalized = NormalizedDraft::try_new(fact, &context, unit, graph, &self.document)?;
+            match normalized {
+                NormalizedDraft::Nonnumeric(value) => self.index.nonnumeric(*value)?,
+                numeric => self.index.numeric(&numeric)?,
             }
         }
-        let mut group_metadata = BTreeMap::new();
-        for (digest, indices) in groups {
-            let classification =
-                classify_duplicate_group(&normalized, &indices, &mut self.retained_output)?;
-            let group_id = if indices.len() == 1 {
-                None
-            } else {
-                self.retained_output.admit("xbrl-duplicate-".len() + 32)?;
-                Some(SourceIdentifier::try_from(format!(
-                    "xbrl-duplicate-{}",
-                    hex_prefix(&digest, 16)
-                ))?)
+        for ordinal in 0..self.index.count("footnote")? {
+            check_xbrl_cancelled(cancellation)?;
+            self.refresh_retained()?;
+            let mut footnote: FootnoteDraft = self
+                .index
+                .at("footnote", ordinal)?
+                .ok_or(SecXbrlError::ParserInvariant)?;
+            resolve_continuations(
+                footnote.span,
+                &mut footnote.continued_at,
+                &mut footnote.text,
+                &mut footnote.continuation_chain,
+                &self.index,
+                &mut self.retained_output,
+                self.limits.string_bytes(),
+                cancellation,
+            )?;
+            let relationships = self.index.incident(&footnote.id)?;
+            let value = model::XbrlFootnoteOccurrence {
+                occurrence_id: SourceIdentifier::try_from(footnote.id)?,
+                accession: self.document.accession.clone(),
+                language: XbrlText::try_from(footnote.language)?,
+                role: SourceIdentifier::try_from(footnote.role)?,
+                title: footnote.title.map(XbrlText::try_from).transpose()?,
+                lexical_value: XbrlText::try_from(footnote.text)?,
+                source_payload: self.document.source_payload.clone(),
+                occurrence_relationships: XbrlOccurrenceRelationships::try_new(
+                    None,
+                    Vec::new(),
+                    footnote
+                        .continuation_chain
+                        .into_iter()
+                        .map(SourceIdentifier::try_from)
+                        .collect::<Result<Vec<_>, _>>()?,
+                    relationships,
+                )?,
             };
-            self.retained_output
-                .admit_btree_entry::<[u8; 32], (XbrlDuplicateClass, Option<SourceIdentifier>)>(
-                    group_id
-                        .as_ref()
-                        .map_or(0, SourceIdentifier::retained_bytes),
-                )?;
-            group_metadata.insert(digest, (classification, group_id));
+            self.index.insert(
+                "footnote_output",
+                value.occurrence_id().as_str(),
+                ordinal,
+                &value,
+            )?;
         }
-        let mut numeric_facts = Vec::new();
-        let mut nonnumeric_occurrences = Vec::new();
-        for draft in normalized {
-            match draft {
-                NormalizedDraft::Nonnumeric(value) => {
-                    self.retained_output
-                        .admit_vec_entry::<XbrlNonnumericOccurrence>(0)?;
-                    nonnumeric_occurrences.push(*value);
-                }
-                NormalizedDraft::Numeric {
-                    concept,
-                    unit,
-                    value,
-                    evidence_input,
-                    ..
-                } => {
-                    let digest = semantic_aspect_digest(&evidence_input);
-                    let group_id_dynamic = group_metadata
-                        .get(&digest)
-                        .and_then(|(_, group_id)| group_id.as_ref())
-                        .map_or(0, SourceIdentifier::retained_bytes);
-                    self.retained_output.admit(group_id_dynamic)?;
-                    self.retained_output.admit("sec-xbrl-duplicate-v2".len())?;
-                    let (classification, group_id) = group_metadata
-                        .get(&digest)
-                        .cloned()
-                        .ok_or(SecXbrlError::ParserInvariant)?;
-                    let evidence = XbrlFactEvidence::try_new(XbrlFactEvidenceInput {
-                        duplicate: XbrlDuplicateEvidence::try_new(
-                            classification,
-                            group_id,
-                            SourceIdentifier::try_from("sec-xbrl-duplicate-v2")?,
-                        )?,
-                        ..*evidence_input
-                    })?;
-                    evidence.validate_value(value)?;
-                    self.retained_output.admit_vec_entry::<XbrlNumericFact>(0)?;
-                    numeric_facts.push(XbrlNumericFact {
-                        concept,
-                        unit,
-                        value,
-                        evidence,
-                    });
-                }
-            }
-        }
-        Ok(ParsedXbrlDocument {
-            numeric_facts,
-            nonnumeric_occurrences,
+        self.index.classify(cancellation)?;
+        self.index.seal(cancellation)?;
+        Ok(IndexedXbrlDocument {
+            numeric_count: self.index.count("numeric")?,
+            nonnumeric_count: self.index.count("nonnumeric")?,
+            footnote_count: self.index.count("footnote_output")?,
+            peak_retained_bytes: self
+                .retained_output
+                .peak
+                .max(self.index.working_set_bytes()?),
+            index: self.index,
+            document: self.document,
         })
     }
 }
@@ -1302,64 +1417,6 @@ fn hash_text(hasher: &mut Sha256, text: &str) {
     hasher.update(text.as_bytes());
 }
 
-fn classify_duplicate_group(
-    drafts: &[NormalizedDraft],
-    indices: &[usize],
-    retained_output: &mut RetainedOutputBudget,
-) -> Result<XbrlDuplicateClass, SecXbrlError> {
-    if indices.len() == 1 {
-        return Ok(XbrlDuplicateClass::Unique);
-    }
-    let mut values_at_accuracy = BTreeMap::<EffectiveAccuracy, Decimal>::new();
-    let mut common_interval: Option<(Decimal, Decimal)> = None;
-    for index in indices {
-        let NormalizedDraft::Numeric {
-            value,
-            evidence_input,
-            ..
-        } = drafts.get(*index).ok_or(SecXbrlError::ParserInvariant)?
-        else {
-            return Err(SecXbrlError::ParserInvariant);
-        };
-        let accuracy_key = effective_accuracy(*value, evidence_input.accuracy);
-        if !values_at_accuracy.contains_key(&accuracy_key) {
-            retained_output.admit_btree_entry::<EffectiveAccuracy, Decimal>(0)?;
-        }
-        if values_at_accuracy
-            .insert(accuracy_key, *value)
-            .is_some_and(|existing| existing != *value)
-        {
-            return Ok(XbrlDuplicateClass::Inconsistent);
-        }
-        let Some((lower, upper)) = accuracy_interval(*value, evidence_input.accuracy) else {
-            return Ok(XbrlDuplicateClass::Unclassified);
-        };
-        common_interval = Some(match common_interval {
-            None => (lower, upper),
-            Some((current_lower, current_upper)) => {
-                let lower = if lower > current_lower {
-                    lower
-                } else {
-                    current_lower
-                };
-                let upper = if upper < current_upper {
-                    upper
-                } else {
-                    current_upper
-                };
-                (lower, upper)
-            }
-        });
-    }
-    Ok(
-        if common_interval.is_some_and(|(lower, upper)| lower <= upper) {
-            XbrlDuplicateClass::ConsistentNumeric
-        } else {
-            XbrlDuplicateClass::Inconsistent
-        },
-    )
-}
-
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
 enum EffectiveAccuracy {
     Exact,
@@ -1421,6 +1478,7 @@ fn half_unit_in_last_place(decimals: i32) -> Option<Decimal> {
     }
 }
 
+#[derive(serde::Serialize, serde::Deserialize)]
 struct ContextDraft {
     id: String,
     entity_scheme: Option<String>,
@@ -1452,6 +1510,24 @@ impl ContextDraft {
             (None, Some(start), Some(end)) => Ok(XbrlPeriod::duration(start, end)?),
             _ => Err(SecXbrlError::IncompleteContext),
         }
+    }
+
+    fn occurrence_context(
+        &self,
+    ) -> Result<std::sync::Arc<model::XbrlOccurrenceContext>, SecXbrlError> {
+        Ok(std::sync::Arc::new(model::XbrlOccurrenceContext {
+            entity: market_squawk_domain::XbrlEntity::try_new(
+                self.entity_scheme
+                    .as_deref()
+                    .ok_or(SecXbrlError::IncompleteContext)?,
+                self.entity_value
+                    .as_deref()
+                    .ok_or(SecXbrlError::IncompleteContext)?,
+            )?,
+            period: self.period()?,
+            dimensions: self.dimensions.clone(),
+            context_graph: XbrlContextGraph::try_new(self.graph_events.clone())?,
+        }))
     }
 
     fn clone_dynamic_bytes(&self) -> Result<usize, SecXbrlError> {
@@ -1616,8 +1692,66 @@ impl CaptureKind {
     }
 }
 
+fn resolve_continuations(
+    span: ElementSpan,
+    continued_at: &mut Option<String>,
+    text: &mut String,
+    chain: &mut Vec<String>,
+    continuations: &staging::FilingIndex,
+    budget: &mut RetainedOutputBudget,
+    string_limit: usize,
+    cancellation: &CancellationToken,
+) -> Result<(), SecXbrlError> {
+    let mut next = continued_at.take();
+    let mut seen = BTreeSet::new();
+    let mut chain_spans = BTreeMap::new();
+    if next.is_some() {
+        span.admit_chain_member(&mut chain_spans, budget)?;
+    }
+    while let Some(continuation_id) = next {
+        check_xbrl_cancelled(cancellation)?;
+        budget.admit_btree_entry::<String, ()>(continuation_id.len())?;
+        if !seen.insert(continuation_id.clone()) {
+            return Err(SecXbrlError::ContinuationCycle);
+        }
+        let continuation: ContinuationDraft = continuations
+            .get("continuation", &continuation_id)?
+            .ok_or(SecXbrlError::UnknownContinuation)?;
+        continuation
+            .span
+            .admit_chain_member(&mut chain_spans, budget)?;
+        budget.admit(continuation.text.len())?;
+        append_bounded(text, &continuation.text, string_limit)?;
+        budget.admit_vec_entry::<String>(0)?;
+        chain.push(continuation_id);
+        budget.admit(
+            continuation
+                .continued_at
+                .as_ref()
+                .map_or(0, String::capacity),
+        )?;
+        next = continuation.continued_at.clone();
+    }
+    Ok(())
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct FootnoteDraft {
+    start_depth: usize,
+    span: ElementSpan,
+    id: String,
+    language: String,
+    role: String,
+    title: Option<String>,
+    continued_at: Option<String>,
+    continuation_chain: Vec<String>,
+    text: String,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
 struct FactDraft {
     start_depth: usize,
+    span: ElementSpan,
     concept: XbrlQualifiedName,
     context_id: String,
     unit_id: Option<String>,
@@ -1635,8 +1769,69 @@ struct FactDraft {
     text: String,
 }
 
+impl FactDraft {
+    fn dynamic_bytes(&self) -> Result<usize, SecXbrlError> {
+        checked_retained_sum([
+            qname_dynamic_bytes(&self.concept)?,
+            self.context_id.capacity(),
+            self.unit_id.as_ref().map_or(0, String::capacity),
+            self.occurrence_id.capacity(),
+            self.parent_occurrence_id
+                .as_ref()
+                .map_or(0, String::capacity),
+            self.format
+                .as_ref()
+                .map(qname_dynamic_bytes)
+                .transpose()?
+                .unwrap_or(0),
+            self.language.as_ref().map_or(0, String::capacity),
+            self.continued_at.as_ref().map_or(0, String::capacity),
+            self.text.capacity(),
+            self.continuation_chain.capacity() * size_of::<String>(),
+            self.continuation_chain.iter().map(String::capacity).sum(),
+        ])
+    }
+}
+
+/// Inclusive XML preorder interval. Valid continuation chains contain disjoint
+/// intervals: nesting in another chain is allowed, nesting within one is not.
+#[derive(Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct ElementSpan {
+    start: usize,
+    end: usize,
+}
+
+impl ElementSpan {
+    const fn new(start: usize) -> Self {
+        Self { start, end: start }
+    }
+
+    fn admit_chain_member(
+        self,
+        spans: &mut BTreeMap<usize, usize>,
+        budget: &mut RetainedOutputBudget,
+    ) -> Result<(), SecXbrlError> {
+        if spans
+            .range(..=self.start)
+            .next_back()
+            .is_some_and(|(_, end)| *end >= self.start)
+            || spans
+                .range(self.start..)
+                .next()
+                .is_some_and(|(start, _)| *start <= self.end)
+        {
+            return Err(SecXbrlError::NestedContinuation);
+        }
+        budget.admit_btree_entry::<usize, usize>(0)?;
+        spans.insert(self.start, self.end);
+        Ok(())
+    }
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
 struct ContinuationDraft {
     start_depth: usize,
+    span: ElementSpan,
     id: String,
     continued_at: Option<String>,
     text: String,
@@ -1656,7 +1851,7 @@ impl RelationshipDraft {
     ) -> Result<usize, SecXbrlError> {
         let arcrole = attributes
             .unqualified("arcrole")
-            .ok_or(SecXbrlError::MissingAttribute)?;
+            .unwrap_or("http://www.xbrl.org/2003/arcrole/fact-footnote");
         let from_refs = attributes
             .unqualified("fromRefs")
             .ok_or(SecXbrlError::MissingAttribute)?;
@@ -1680,30 +1875,12 @@ impl RelationshipDraft {
         ])
     }
 
-    fn evidence_dynamic_bytes(&self) -> Result<usize, SecXbrlError> {
-        let reference_storage = self.from_refs.iter().chain(&self.to_refs).try_fold(
-            self.from_refs
-                .len()
-                .checked_add(self.to_refs.len())
-                .and_then(|length| length.checked_mul(size_of::<SourceIdentifier>()))
-                .ok_or(SecXbrlError::RetainedOutputLimitExceeded)?,
-            |total, reference| {
-                total
-                    .checked_add(reference.capacity())
-                    .ok_or(SecXbrlError::RetainedOutputLimitExceeded)
-            },
-        )?;
-        checked_retained_sum([
-            self.arcrole.capacity(),
-            reference_storage,
-            self.link_role.as_ref().map_or(0, String::capacity),
-            self.order.as_ref().map_or(0, String::capacity),
-        ])
-    }
-
     fn try_new(attributes: &ResolvedAttributes) -> Result<Self, SecXbrlError> {
         Ok(Self {
-            arcrole: attributes.required_unqualified("arcrole")?,
+            arcrole: attributes
+                .unqualified("arcrole")
+                .unwrap_or("http://www.xbrl.org/2003/arcrole/fact-footnote")
+                .to_owned(),
             from_refs: split_references(&attributes.required_unqualified("fromRefs")?),
             to_refs: split_references(&attributes.required_unqualified("toRefs")?),
             link_role: attributes.unqualified("linkRole").map(str::to_owned),
@@ -1730,4 +1907,262 @@ impl RelationshipDraft {
 
 fn split_references(value: &str) -> Vec<String> {
     value.split_whitespace().map(str::to_owned).collect()
+}
+
+/// Parser-only regression sharing the owning test's admitted taxonomy; these
+/// in-memory documents never enter source publication or financial admission.
+#[cfg(test)]
+fn exercise_nested_continuations(document: XbrlDocumentContext) -> Result<(), SecXbrlError> {
+    let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"
+        xmlns:ix="http://www.xbrl.org/2013/inlineXBRL"
+        xmlns:xbrli="http://www.xbrl.org/2003/instance"
+        xmlns:dei="http://xbrl.sec.gov/dei/2025"><body>
+        <xbrli:context id="c"><xbrli:entity><xbrli:identifier scheme="http://www.sec.gov/CIK">0000320193</xbrli:identifier></xbrli:entity><xbrli:period><xbrli:instant>2025-07-24</xbrli:instant></xbrli:period></xbrli:context>
+        <ix:nonNumeric id="a" name="dei:EntityFileNumber" contextRef="c" continuedAt="ca">a</ix:nonNumeric>
+        <ix:nonNumeric id="b" name="dei:EntityFileNumber" contextRef="c" continuedAt="cb">b</ix:nonNumeric>
+        <ix:continuation id="ca">c<ix:continuation id="cb">d</ix:continuation><ix:exclude>ignored<ix:nonNumeric id="z" name="dei:EntityFileNumber" contextRef="c">z</ix:nonNumeric></ix:exclude>e</ix:continuation>
+        </body></html>"#;
+    let parsed = XbrlDocumentParser::parse_with_cancellation(
+        xml.as_bytes(),
+        SecParserLimits::production_defaults(),
+        document.clone(),
+        &CancellationToken::new(),
+    )?;
+    let indexed_cancellation = CancellationToken::new();
+    let indexed = XbrlDocumentParser::parse_indexed_with_cancellation(
+        xml.as_bytes(),
+        SecParserLimits::production_defaults(),
+        document.clone(),
+        &indexed_cancellation,
+    )?;
+    assert_eq!(indexed.context_count()?, 1);
+    assert_eq!(
+        indexed.nonnumeric_count,
+        parsed.nonnumeric_occurrences().len()
+    );
+    for (ordinal, expected) in parsed.nonnumeric_occurrences().iter().enumerate() {
+        assert_eq!(indexed.nonnumeric_at(ordinal)?.as_ref(), Some(expected));
+    }
+    indexed_cancellation.cancel();
+    assert!(matches!(
+        indexed.nonnumeric_at(0),
+        Err(SecXbrlError::Cancelled)
+    ));
+    let values = parsed
+        .nonnumeric_occurrences()
+        .iter()
+        .map(|fact| (fact.occurrence_id().as_str(), fact.lexical_value().as_str()))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(values.get("a"), Some(&"acde"));
+    assert_eq!(values.get("b"), Some(&"bd"));
+    assert_eq!(values.get("z"), Some(&"z"));
+    let invalid = xml
+        .replace(" contextRef=\"c\" continuedAt=\"cb\"", " contextRef=\"c\"")
+        .replace(
+            "<ix:continuation id=\"ca\">",
+            "<ix:continuation id=\"ca\" continuedAt=\"cb\">",
+        );
+    assert!(matches!(
+        XbrlDocumentParser::parse_with_cancellation(
+            invalid.as_bytes(),
+            SecParserLimits::production_defaults(),
+            document,
+            &CancellationToken::new(),
+        ),
+        Err(SecXbrlError::NestedContinuation)
+    ));
+    Ok(())
+}
+
+/// The existing captured-taxonomy fixture owns this grammar and numeric-evidence regression.
+#[cfg(test)]
+fn exercise_number_word_transforms(document: XbrlDocumentContext) -> Result<(), SecXbrlError> {
+    let fixed_zero_namespace = "http://www.xbrl.org/inlineXBRL/transformation/2020-02-12";
+    let fixed_zero = XbrlQualifiedName::try_new("ixt:fixed-zero", fixed_zero_namespace)?;
+    // TSLA 2026-06-30 uses all four nonempty spellings; the registry admits any string.
+    for lexical in ["no", "No", "immaterial", "—", "", " \t123\n"] {
+        assert_eq!(transform_numeric(lexical, Some(&fixed_zero))?, "0");
+    }
+    for unsupported in [
+        XbrlQualifiedName::try_new("ixt:fixed-zero", "https://unrelated.test")?,
+        XbrlQualifiedName::try_new("ixt:unknown", fixed_zero_namespace)?,
+    ] {
+        assert!(matches!(
+            transform_numeric("no", Some(&unsupported)),
+            Err(SecXbrlError::UnsupportedTransform)
+        ));
+    }
+    let format = XbrlQualifiedName::try_new(
+        "sec:numwordsen",
+        "http://www.sec.gov/inlineXBRL/transformation/2015-08-31",
+    )?;
+    // SEC registry examples plus the magnitude, separator and zero alternatives. Values are
+    // independent decimal literals; the arithmetic must never bypass the lexical grammar.
+    for (lexical, expected) in [
+        ("No", "0"),
+        ("nil", "0"),
+        (" Zero ", "0"),
+        ("three", "3"),
+        (" One Hundred and Twenty One ", "121"),
+        ("nineteen hundred forty-four", "1944"),
+        ("Seventy Thousand and one", "70001"),
+        (
+            "eighteen million three hundred thousand and fifty-one",
+            "18300051",
+        ),
+        ("one\u{a0}hundred", "100"),
+        ("one million, \tthree", "1000003"),
+        ("one million\u{a0}", "1000000"),
+        (
+            "one quintillion two quadrillion three trillion four billion five million six thousand seven",
+            "1002003004005006007",
+        ),
+        ("nineteen hundred quintillion", "1900000000000000000000"),
+    ] {
+        assert_eq!(
+            transform_numeric(lexical, Some(&format))?,
+            expected,
+            "{lexical}"
+        );
+    }
+    // The registry lists these exact dashes, not every Unicode dash or minus character.
+    for dash in
+        "-\u{058a}\u{05be}\u{2010}\u{2011}\u{2012}\u{2013}\u{2014}\u{2015}\u{fe58}\u{fe63}\u{ff0d}"
+            .chars()
+    {
+        assert_eq!(
+            transform_numeric(&format!("fifty{dash}one"), Some(&format))?,
+            "51"
+        );
+    }
+    for lexical in [
+        "",
+        "   ",
+        "\u{a0}three",
+        "three\u{a0}",
+        "THREE",
+        "tHree",
+        "one one",
+        "fiftyone",
+        "fifty_one",
+        "fifty−one",
+        "zero hundred",
+        "twenty hundred",
+        "one hundred And one",
+        "one million and one",
+        "one thousand one million",
+        "one thousand,",
+        "one million,",
+        "one million, \u{a0}",
+        "four gazillion",
+        "one sextillion",
+        "one and 01/100",
+        "two-thirds",
+        "3",
+        "negative three",
+    ] {
+        assert!(
+            matches!(
+                transform_numeric(lexical, Some(&format)),
+                Err(SecXbrlError::InvalidNumericFact)
+            ),
+            "invalid lexical input: {lexical:?}",
+        );
+    }
+    let unrelated = XbrlQualifiedName::try_new("sec:numwordsen", "https://unrelated.test")?;
+    assert!(matches!(
+        transform_numeric("three", Some(&unrelated)),
+        Err(SecXbrlError::UnsupportedTransform)
+    ));
+
+    let xml = r#"<html xmlns="http://www.w3.org/1999/xhtml"
+        xmlns:ix="http://www.xbrl.org/2013/inlineXBRL"
+        xmlns:xbrli="http://www.xbrl.org/2003/instance"
+        xmlns:us-gaap="http://fasb.org/us-gaap/2026"
+        xmlns:msft="http://www.microsoft.com/20260630"
+        xmlns:iso4217="http://www.xbrl.org/2003/iso4217"
+        xmlns:ixt="http://www.xbrl.org/inlineXBRL/transformation/2020-02-12"
+        xmlns:sec="http://www.sec.gov/inlineXBRL/transformation/2015-08-31"><body>
+        <xbrli:context id="annual"><xbrli:entity><xbrli:identifier scheme="http://www.sec.gov/CIK">0000789019</xbrli:identifier></xbrli:entity><xbrli:period><xbrli:startDate>2025-07-01</xbrli:startDate><xbrli:endDate>2026-06-30</xbrli:endDate></xbrli:period></xbrli:context>
+        <xbrli:unit id="segments"><xbrli:measure>msft:Segment</xbrli:measure></xbrli:unit>
+        <xbrli:unit id="dollars"><xbrli:measure>iso4217:USD</xbrli:measure></xbrli:unit>
+        <ix:nonFraction id="segments-fact" name="us-gaap:NumberOfReportableSegments" contextRef="annual" unitRef="segments" decimals="0" format="sec:numwordsen">three</ix:nonFraction>
+        <ix:nonFraction id="scaled-fact" name="us-gaap:NetIncomeLoss" contextRef="annual" unitRef="dollars" decimals="2" format="sec:numwordsen" scale="-2" sign="-"> nineteen hundred forty-four </ix:nonFraction>
+        <ix:nonFraction id="zero-fact" name="us-gaap:PreferredStockValue" contextRef="annual" unitRef="dollars" decimals="INF" format="ixt:fixed-zero" scale="6" sign="-"> no </ix:nonFraction>
+        </body></html>"#;
+    let parsed = XbrlDocumentParser::parse_with_cancellation(
+        xml.as_bytes(),
+        SecParserLimits::production_defaults(),
+        document.clone(),
+        &CancellationToken::new(),
+    )?;
+    let indexed = XbrlDocumentParser::parse_indexed_with_cancellation(
+        xml.as_bytes(),
+        SecParserLimits::production_defaults(),
+        document.clone(),
+        &CancellationToken::new(),
+    )?;
+    assert_eq!(parsed.numeric_facts().len(), 3);
+    assert_eq!(indexed.numeric_count, 3);
+    for (ordinal, expected) in parsed.numeric_facts().iter().enumerate() {
+        assert_eq!(indexed.numeric_at(ordinal)?.as_ref(), Some(expected));
+    }
+    let segments = &parsed.numeric_facts()[0];
+    assert_eq!(segments.value(), Decimal::from(3));
+    assert_eq!(segments.evidence().lexical_value().as_str(), "three");
+    assert_eq!(segments.evidence().context_id().as_str(), "annual");
+    assert_eq!(
+        segments.evidence().unit().source_identifier()?.as_str(),
+        "msft:Segment"
+    );
+    assert_eq!(segments.evidence().entity().value().as_str(), "0000789019");
+    assert_eq!(
+        segments.evidence().period(),
+        XbrlPeriod::duration(parse_date("2025-07-01")?, parse_date("2026-06-30")?,)?
+    );
+    assert_eq!(
+        serde_json::to_value(segments.evidence())?["transformed_lexeme"],
+        "3"
+    );
+    let scaled = &parsed.numeric_facts()[1];
+    assert_eq!(scaled.value(), Decimal::new(-1944, 2));
+    assert_eq!(
+        scaled.evidence().lexical_value().as_str(),
+        " nineteen hundred forty-four "
+    );
+    assert_eq!(scaled.evidence().inline_scale(), Some(-2));
+    assert_eq!(scaled.evidence().inline_sign(), Some(XbrlSign::Negative));
+    assert_eq!(
+        serde_json::to_value(scaled.evidence())?["transformed_lexeme"],
+        "1944"
+    );
+    assert_eq!(scaled.evidence().normalized_value()?, scaled.value());
+    let zero = &parsed.numeric_facts()[2];
+    assert_eq!(zero.value(), Decimal::ZERO);
+    assert_eq!(zero.evidence().lexical_value().as_str(), " no ");
+    assert_eq!(zero.evidence().inline_scale(), Some(6));
+    assert_eq!(zero.evidence().inline_sign(), Some(XbrlSign::Negative));
+    assert_eq!(
+        serde_json::to_value(zero.evidence())?["transformed_lexeme"],
+        "0"
+    );
+    assert_eq!(zero.evidence().normalized_value()?, zero.value());
+    // The caller must not trim away invalid boundary NBSP before validating the transform.
+    for invalid in [
+        xml.replace(">three<", ">\u{a0}three<"),
+        xml.replace("scale=\"-2\"", "scale=\"28\""),
+        xml.replace("scale=\"6\"", "scale=\"29\""),
+        xml.replace("scale=\"6\" sign=\"-\"", "scale=\"6\" sign=\"invalid\""),
+    ] {
+        assert!(matches!(
+            XbrlDocumentParser::parse_with_cancellation(
+                invalid.as_bytes(),
+                SecParserLimits::production_defaults(),
+                document.clone(),
+                &CancellationToken::new(),
+            ),
+            Err(SecXbrlError::InvalidNumericFact)
+        ));
+    }
+    Ok(())
 }

@@ -679,9 +679,10 @@ fn root_endpoint_identity(
     directory: &Dir,
     root_path: &Path,
 ) -> Result<RootEndpointIdentity, ParquetStoreError> {
-    use cap_fs_ext::MetadataExt as _;
-
-    let metadata = directory.dir_metadata()?;
+    let endpoint = market_squawk_platform::persistent_endpoint_identity(
+        &directory.try_clone()?.into_std_file(),
+        root_path,
+    )?;
     let path = root_path.as_os_str().as_encoded_bytes();
     let mut digest = Sha256::new();
     digest.update(b"market-squawk/analytical-root-endpoint/v2");
@@ -691,8 +692,7 @@ fn root_endpoint_identity(
             .to_be_bytes(),
     );
     digest.update(path);
-    digest.update(metadata.dev().to_be_bytes());
-    digest.update(metadata.ino().to_be_bytes());
+    digest.update(endpoint);
     RootEndpointIdentity::try_new(digest.finalize().into())
         .ok_or(ParquetStoreError::RootCatalogMismatch)
 }
@@ -783,7 +783,10 @@ fn require_only_expected_v2_control_files(
     for entry in directory.entries()? {
         let entry = entry?;
         let name = entry.file_name();
-        let data_namespace = matches!(name.to_str(), Some("objects" | "staging" | "quarantine"));
+        let data_namespace = matches!(
+            name.to_str(),
+            Some("objects" | "staging" | "quarantine" | "sec-prepared")
+        );
         let legacy_control = prepared.kind()
             == crate::authority_transition::AuthorityTransitionKind::LegacyMigration
             && matches!(

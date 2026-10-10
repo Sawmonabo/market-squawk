@@ -1,0 +1,518 @@
+# Desktop product audit — 2026-10-02 / current checkpoint 2026-10-03
+
+## Schwab automatic setup and HTTP correction — 2026-10-03
+
+The `37a66cf7` native retry proved failed-exchange recovery but did not establish OAuth/API access.
+Two further causes are confirmed. Apple's trust tool, without `-k`, records trust without installing
+the certificate in the user keychain; Chrome needs both. The corrected native setup uses the user's
+configured default keychain and checks the exact public-leaf SHA-256 before launch. This runs from
+ordinary Schwab Begin; the user should not need Terminal commands. The manual local repair is not
+proof of automatic enrollment or Chrome callback acceptance.
+
+A credentialed token request with an intentionally invalid diagnostic code returned gzip JSON
+despite requesting identity encoding. No real code or token was retained. Both OAuth and market-data
+clients now use existing reqwest gzip decoding with their decoded-body bounds. Token response
+extensions are ignored as required by OAuth, while duplicate recognized fields remain rejected.
+The existing OAuth lifecycle and REST sealed-evidence checks pass; native/browser/API proof remains
+pending. References: [Apple trust enrollment implementation](https://raw.githubusercontent.com/apple-oss-distributions/Security/main/SecurityTool/macOS/trusted_cert_add.c),
+[Chromium trust discovery](https://chromium.googlesource.com/chromium/src/+/main/net/cert/internal/trust_store_mac.cc),
+[reqwest decoding](https://docs.rs/reqwest/0.13.4/reqwest/struct.ClientBuilder.html#method.gzip),
+and [OAuth response rules](https://www.rfc-editor.org/rfc/rfc6749.html#section-5.1).
+
+## Schwab authorization follow-up — 2026-10-03
+
+Owner browser sign-in has not yet established API access. The exact localhost callback was
+blocked by Chrome's certificate interstitial despite macOS hostname verification succeeding.
+Enrollment used a hostname-policy restriction that Chromium ignores; the correction keeps the
+same non-CA, server-auth leaf with sole SAN127.0.0.1 and omits that unsupported trust restriction.
+See [Chromium trust evaluation](https://chromium.googlesource.com/chromium/src/+/main/net/cert/internal/trust_store_mac.cc).
+The exact callback was recovered under verified installation-leaf TLS, but its token exchange
+failed. Expired authorization is not established as the cause. No token/code was retained in
+reports. Native session remains `runtime_verification_pending`, with no active generation.
+
+A separate confirmed local defect retained completed provider failures as unfinished exchanges,
+preventing retry and falsely failing shutdown custody. The pending correction separates joined
+worker completion from the protected authority result across lifecycle consumers. It preserves
+unfinished/failed worker ownership and durable reconciliation; a fresh Begin uses fresh consent.
+Source inspection, formatting and the focused failed-exchange/custody regression pass. The
+TSLA exact-envelope and financial cursor checks also pass in the same compiled candidate.
+Native/API verification remains pending; source coverage and browser authorization are not closed.
+
+## Matched native follow-up — `935b3b65`
+
+This follow-up supersedes the affected failures in the historical baseline below; it does not
+close the overall audit. Ordinary history preparation completed for the six previously failed
+members. Native history reads now return 251 fully adjusted daily bars for **all nine** watchlist
+members. Observed reads took 3.016–8.668 seconds: this is data-recovery evidence, not instant-loading
+or restart-cache acceptance. SPY's actual chart export contains the plotted history; hidden WKWebView
+page capture can omit canvas pixels and is not by itself evidence that a chart is empty.
+
+After normal preparation rebuilt the derived financial indexes, AAPL and MSFT each returned 32
+reported ratio values on both first and next pages. TSLA returned 32 values on its first page and
+one missing-input row on its next page. That row is a confirmed local grouping defect: the same
+original filing contains net income 2,173,000,000 and revenue 25,182,000,000, but their independent
+concept revision ordinals (3 and 2) incorrectly split the shared reporting envelope. Preserve the
+original ordinals and fix grouping; no source absence is established. NVDA preparation completed,
+but a subsequent financial read timed out. Financial reads also reproduced gate-admission timeout
+while history jobs ran. Read isolation now passes the existing worker-custody/shutdown and actual
+financial-cursor fixtures; matched native contention verification remains required.
+
+Yahoo's native activation succeeded, but its missing ordinary product consumer remains open.
+Tiingo's native activation failed locally with `InvalidProfile` before a provider request; its
+qualification dispatch omitted the configured profile. The correction now passes the existing
+saved-credential continuation fixture; a matched native retry remains required. Schwab still needs its official authorization,
+qualified runtime and captured quotes; no alternative ask coverage is claimed.
+
+Retained evidence: `native-all-nine-history-935b3b65.json`,
+`native-aapl-ratios-ready-935b3b65.json`, `native-stock-ratios-ready-935b3b65.json`,
+`native-yahoo-activation-935b3b65.json` and `native-tiingo-activation-935b3b65.json` under
+`.agents/tmp/v1-first-stock/`. The lead individually inspected seven AAPL ratio tiles, three SPY
+page tiles and the SPY chart export in `native-935b3b65/`. Fund-specific composition, statement
+presentation, remaining source coverage and cold/warm/restart responsiveness remain open.
+
+## Watchlist-wide extension — source tracing and remediation
+
+The subsequent native interaction pass covers all nine actual watchlist instruments: SPY, QQQ,
+DIA, IWM, VTI, AAPL, MSFT, NVDA and TSLA. Native navigation is complete and released on Home;
+all 256 new PNGs have been individually viewed (203 by the auditor, 53 by the delegated
+statement reviewer). This is not full product acceptance. Captures used the prior native generation with the warm-display renderer changes;
+some observation samples overlapped a single local compilation and cannot establish latency
+acceptance. The source findings below were independently inspected against retained evidence.
+
+| Finding | Evidence and implication | Correction / verification status |
+| --- | --- | --- |
+| DP-03 cache continuation | Warm display correction is pushed as `f7bfaa15`; existing 11-case renderer suite and typecheck passed, including closed-lease display reuse. Cached values contain no reusable cursor/authority. | All nine retain their own display on warm return; the three populated financial views retain their own 32 Facts rows before revalidation. Durable restart reuse remains unproven; this is not closure of the original finding. |
+| DP-08 preparation listing | `e780b62a` replaces whole-observation accumulation with streamed summaries and a temporary disk index; selected Preview retains full financial admission. A 9,000-point critical fixture checks complete-span sampling, annual purging and cancellation. | Matched native options read now completes in 3.143 seconds without the decoder error, but returns zero choices. Positive usable selection/Preview remains open. |
+| DP-14 / DP-17 source contracts | `e780b62a` aligns partial two-sided quote counts and backend `admitsSourceStart`, and makes imports reuse the canonical source parser. Producer and consumer changed together. | Matched native source response parses all 25 profiles, including the current admitted doctor with 50 returned / 37 two-sided-valid quotes. Imports parses the same response into zero choices; actual configured import coverage remains open. |
+| DP-18 Important — incomplete source alternatives | The quote index contains only Alpaca IEX equity quotes. DIA/NVDA/TSLA retained originals have zero ask price/size at the displayed times; Schwab/Tiingo are stored but unverified, Yahoo cancelled. Yahoo enrichment has a producer but no ordinary product caller. | Missing in one retained feed is not all-source absence. Complete applicable activation/acquisition/selection; do not combine unrelated quote sides or invent consolidated prices. |
+| DP-19 Important — retained history not displayed | SPY/QQQ each retain 21 raw daily bars. The chart selects only fully adjusted history; adjusted preparation fails with `operation-authority-unavailable` at the required runtime stage. The same all-nine pass reports six failed history preparations. | Repair acquisition/runtime recovery and the supported display policy. Do not relabel raw prices as adjusted or claim a provider returned no prices. |
+| DP-20 Important — misleading ratio enumeration | AAPL March/December periods have complete current ratios in earlier filing envelopes. Later equity-only contexts generate additional missing-input ratios and sort ahead of complete candidates. Exact original-source values and normalized operands agree. | Correct backend default selection over whole reporting envelopes; retain conflicts, actual filing/PIT dates and source evidence. Never borrow operands across filings to fill a ratio. |
+| DP-21 Important — indistinguishable statement rows | All 27 AAPL and 26 MSFT Statements tiles were individually viewed. Both show repeated indistinguishable filing rows; long first pages provide insufficient local orientation. Values stay contained and aligned at the captured width. | Improve ordinary statement presentation while retaining exact source context in evidence. Screenshot alignment does not prove arithmetic or interaction. |
+
+Detailed retained evidence lives in
+[cross-source selection](../../.agents/tmp/desktop-product-audit/2026-10-03/watchlist-wide/cross-source-selection.md),
+[AAPL ratio originals](../../.agents/tmp/desktop-product-audit/2026-10-03/watchlist-wide/AAPL-ratio-source-trace.md),
+[AAPL visual review](../../.agents/tmp/desktop-product-audit/2026-10-03/watchlist-wide/AAPL-statements-visual-review.md)
+and [MSFT visual review](../../.agents/tmp/desktop-product-audit/2026-10-03/watchlist-wide/MSFT-statements-visual-review.md).
+The VTI name concern is withdrawn: the captured name matches Vanguard's current official product
+page. Failed audit JavaScript selectors on initial SPY/QQQ/DIA warm attempts are harness failures,
+excluded from app-defect evidence; successful recaptures remain separate.
+
+Subsequent matched-native check: NVDA preparation completed and all four financial reads return32
+reported items; the actual Facts screen renders32 rows without an alert. Its earlier pending
+state is preserved in the baseline below. Full NVIDIA source accuracy/history and preparing-state
+copy remain open. The new shared ratio-applicability correction passes the existing envelope and
+cursor checks; next-page native verification is still pending. Original facts and verified nil,
+partial/conflicting inputs remain explicit; this is not a blanket filter hiding unavailable ratios.
+
+### All-nine baseline and remaining red flags
+
+
+All prices below are USD. Positive changes appeared signed green and agree with `(selected price / Oct1 completed close − 1) × 100` at returned precision (Decimal difference at most rounding residue). This checks the returned arithmetic only; it does not independently validate all source prices. The price/trade/quote dates are Oct2; quote/trade freshness flags are false. Each profile is available, correctly classified stock/fund with currency and venue; successor/delisting lifecycle is explicitly not established.
+
+| Actual member / class | Selected price / basis / displayed change | Quote sides; profile | History / chart | Applicable information / next dependency |
+|---|---|---|---|---|
+| SPY / fund |769.72 last trade / +0.74% | Bid and ask present; ARCX | Adjusted read unavailable; automatic job failed. Raw21 bars retained. | Four corporate tabs empty `identity_missing`; fund NAV/holdings/docs not composed. Restore history acquisition authority and applicable fund consumer. |
+| QQQ / fund |749.2 last trade / +0.97% | Bid and ask present; XNAS | Same; raw21 retained. | Same four empty tabs and fund gap; history authority and fund consumer required. |
+| DIA / fund |510.92 previous close / +0.48% | Bid present; ask/size/mid absent in retained IEX original; ARCX | Adjusted read unavailable; automatic job failed; catalog has raw21. | Same corporate/fund gap; acquire/select eligible history and applicable fund data. A missing IEX ask is not universal source absence. |
+| IWM / fund |281.58 last trade / +0.91% | Bid and ask present; ARCX | Adjusted read unavailable; automatic job failed; raw21 catalog evidence. | Same corporate/fund gap; fund identity/consumer and history authority required. |
+| VTI / fund |378.62 midpoint / +0.92% | Bid367.12/ask390.12; ARCX. Displayed Morningstar name issuer-confirmed. | Adjusted read unavailable; automatic job failed; raw21 catalog evidence. | Same corporate/fund gap; required fund reads and adjusted acquisition remain incomplete. |
+| AAPL / stock |333.265 midpoint / +0.85% | Bid and ask present; XNAS |251 fully adjusted bars, line/candles exported and viewed; date selector exercised. | All4 tabs32+32; Next/Previous exact. Ratios3/32 missing on page1,7/32 on page2. Three page1 cases source-confirmed as envelope/default-selection defect; remaining source tracing and matched verification required. |
+| MSFT / stock |519.54 midpoint / +1.33% | Bid and ask present; XNAS |251 fully adjusted bars, line/candles exported and viewed; date selector exercised. | All4 tabs32+32; Next/Previous exact. First32 ratios reported; next page14/32 missing. Earlier independent32ratio/84input pass covers only that first page. Page2 source tracing required. |
+| NVDA / stock |234 previous close / +1.28% | Bid present; ask/size/mid absent in exact IEX original; XNAS | Adjusted read unavailable; automatic job failed; raw21 catalog evidence. | All4 tabs empty `identity_missing`; financial preparation still running, not proof no NVDA reports exist. Complete preparation, invalidate/reopen current reads and trace any residual identity gap. |
+| TSLA / stock |370.53 last trade / +4.61% | Bid present; ask/size/mid absent in exact IEX original; XNAS |251 fully adjusted bars, line/candles exported and viewed; date selector exercised. | All4 tabs32+32; Next/Previous exact. Ratios2/32 missing on page1,11/32 on page2; exact contexts/inputs retained. Trace upstream/envelope applicability before classifying absence. |
+
+**Units and sessions, every row:** price currency is explicitly USD. All9 quote results retain `quoteSizeBasis:source_units`; current UI displays bare size numbers. Economic shares/lots conversion remains unconfirmed. Full trading-calendar/session controls were not exercised for any member; only exact component times and Oct1 completed-close comparison were checked. Reference round-lot size is not proof of quote-size units. See [source quote/identity trace](../../.agents/tmp/desktop-product-audit/2026-10-03/watchlist-wide/source-quote-identity.md).
+
+
+All 36 financial tabs were selected. Across AAPL/MSFT/TSLA, all 12 available tab pagination
+paths returned 32 next-page items and Previous restored the exact first page. Line/candle
+rendering and date selection were exercised for those three stocks. Six other history charts
+remain blocked. All five funds incorrectly receive corporate financial sections. NVDA's
+financial preparation was still running while the page implied missing reports. These are
+required fixes, not source-absence findings.
+
+Ratios with `missing_input` on page1/page2: AAPL3/7, MSFT0/14, TSLA2/11. The earlier
+MSFT32-ratio source/arithmetic pass covers only page1. The three AAPL page1 cases are source
+traced; later/member cases require their own envelope checks. Bare quote sizes on all9 omit
+the unresolved economic-unit meaning; no shares/lots conversion is established. These extend
+DP-09/DP-20 and the quote presentation findings rather than asserting all missing data has one cause.
+
+Warm first samples retained AAPL/MSFT/TSLA's distinct 32 Facts rows at357/418/382ms respectively.
+These are observer samples, not latency acceptance. Full reads still took seconds. Restart cache,
+range-change loading, all per-row disclosures, pointer/keyboard chart inspection, narrower widths
+and the blocked analytical workflows remain unverified. Background WKWebView captures can miss
+canvas paint or retain outgoing tab styling; direct chart exports were inspected, and those
+capture limitations are not mislabeled application defects.
+
+The [full watchlist matrix](../../.agents/tmp/desktop-product-audit/2026-10-03/watchlist-wide/matrix.md)
+records each control, payload, limitation and source trace. The
+[256-image manifest](../../.agents/tmp/desktop-product-audit/2026-10-03/watchlist-wide/visual-review-manifest.json)
+records reviewer and hash for every captured image. Existing six actually inspected official
+competitor images remain the comparison baseline; no overall superiority claim is supported.
+
+## Current checkpoint — 2026-10-03
+
+**This native investigative pass is complete; full workflow QA and product acceptance remain open.** All 17 sidebar routes, selected IWM/MSFT investment details and the three Onboarding tabs were inspected in the running Desktop. First-page Facts, Statements, Ratios and Filings were read; selected portfolio, research, profile and chart controls were exercised. Missing prerequisites prevented complete analysis/forecast/backtest/trading workflows. This does **not** establish that every button, financial field, responsive width or workflow works.
+
+Audit base: parent-confirmed `d9afd7cb`, existing `feature/v1-installed-product-experience` worktree; Desktop59131/service59088 and Vite1420. No independent Git action or clean-head/release approval is claimed. Standard WebDriver at127.0.0.1:4445 interacted with the actual native WKWebView, without global focus, keystrokes or a browser substitute. No source edits, restart, build/test, provider connection change, credential inspection, expensive new analysis, order or destructive action was performed. The existing USD100000 virtual account and its configured authority were preserved. The final navigation returned Home.
+
+Current evidence root: [2026-10-03](../../.agents/tmp/desktop-product-audit/2026-10-03/). JSON records contain actual selected route, headings, queries, tables, controls and elapsed observer samples. The [control/column inventory](../../.agents/tmp/desktop-product-audit/2026-10-03/control-and-column-inventory.json) retains the captured screens' button labels, disabled states, inputs, selectors and table columns; inspection does not imply execution. [Visual manifest](../../.agents/tmp/desktop-product-audit/2026-10-03/visual-review-manifest.json) records each PNG, hash, reviewer and acceptance limitation.
+
+### Findings and remediation status now
+
+Existing DP, AD and copy-audit identifiers remain the remediation locators. The October2 findings below are historical observations, not a claim that their original defect still reproduces unchanged.
+
+| ID / severity | Current status and concrete evidence | Required next acceptance |
+|---|---|---|
+| DP-01 Important | Global control is now labeled “Go to a page.” This audit did not establish object lookup. The current global-search PNG is rejected: a log dialog remained visible. | Verify actual navigation and agreed object lookup; no global-search pass from the rejected image. |
+| DP-02 Important | Partial improvement verified: all9 Home watchlist positive changes have signed green values. Public chart export visibly renders green/red MSFT candles. | Negative/zero changes, accessible noncolor cues, all financial segments and saved analysis layers remain unverified. |
+| DP-03 Important | **Reproduced:** financial tab return discards visible rows and waits4.778s; whole MSFT return waits10.219s with zero initial financial/history tables. Durable upstream preparation already exists. | Preserve scoped last-good display/query results while releasing snapshot leases; verify first/revisit/range behavior. Details below. |
+| DP-04 Important | Import surface exists; file formats inspected in Onboarding. Actual selected-account import/preview/commit was not performed. Historical stub diagnosis is not freshly reconfirmed here. | Complete existing account-import acceptance with real admissible input and safe preview; current mutation proof absent. |
+| DP-05 Minor | Original placeholder-only Markets input is repaired in current inspected state: visible associated “Find an investment” label, id `markets-investment-search`. | Platform accessibility-tree and keyboard acceptance remain unperformed; visible/DOM label pass only. |
+| DP-06 Important | **Reproduced:** Home has watchlist/guidance, no selected account financial summary, while Portfolio now proves USD100000 value/cash. | Show correct selected-account value/cash/performance/risk with explicit coverage and links. |
+| DP-07 Important | **Reproduced:**23 collections/98063 observations remain generically named; selected collection484 observations returns25 generic “Observation” records without economic value/unit/series identity. | Typed meaningful collection titles and bounded economic evidence. Nested25-row list was not fully scrolled visually. |
+| DP-08 Important | **Reproduced and source traced:** choices fail, not an honest empty catalog. Retained-data decode admission fails during preparation-options evaluation. | Fix bounded preparation admission and useful recovery; validate real choices/preview. No new dataset job run. |
+| DP-09 Important | **Reproduced asset composition gap:** IWM fund renders corporate Facts/Statements/Ratios with automatic preparation disabled; missing family reason is `identity_missing`. Markets admits100 opaque MSFT options without usable option detail. | Compose agreed asset-specific reads and fix identity mapping. Neither observation proves provider data absent. |
+| DP-10 Minor | Original continuously “Updating” observation **not reproduced** in this finite current sample: valid MSFT first/read return reached idle. | Sustained live-feed and refresh-publication acceptance remains unverified; no new60s loop was run. |
+| DP-11 Minor | Primary ratio precision **visibly repaired at this width**:1.23×,67.94%,46.78%,40.31%; context/inputs expand correctly. Exact returned decimals retained and independently checked. | Exact-value accessible tooltip/keyboard retrieval still needs acceptance; no full-precision hover pass claimed. |
+| DP-12 Minor | Current Markets ends at6142px with trading sessions below100 option cards. Original initial y-coordinate shift was not remeasured. Warm selected-investment blank transition is DP-03. | Preserve stable scoped results and meaningful initial layout; avoid hiding ordinary session reads at the bottom. |
+| DP-13 Important | **Reproduced:** default Markets is100 option-code cards repeating “Price unavailable/Change unavailable/Unavailable”; no meaningful movers/breadth/sortable financial comparison/filter view. | Bounded admitted universe and financial discovery with truthful unavailable fields. No source-absence conclusion from cards. |
+| DP-14 Important | **Reproduced with exact provider:** `Source.GetStatus`, `alpaca.basic-market-data`, `Error.message="Invalid Source.GetStatus row"`.27 source checks,1 failure. | Reconcile actual redacted row with parser and verify status after settled startup/restart. Exact invalid predicate remains unconfirmed. |
+| DP-15 Important | Original benchmark overflow **not reproduced at1376px**: bounded286px selector stays in card. | Supported880px minimum, focus/opened menu and long-name accessibility remain untested; narrow visual improvement is not full closure. |
+| DP-16 Minor | Original diagnostic overlap **not reproduced at1376px** across all17 current Logs tiles individually viewed by lead. Long paths remain contained, Evidence/Details readable. | Other supported widths and selected-detail interaction need verification. Button visibility is not execution proof. |
+| DP-17 Important | **New, verified parser failure:** Onboarding → Data imports reports “The installed service returned an unsupported research-source response.” `research-inputs` query fails; source identifier unavailable in the retained safe summary. | Trace normalized research-source response/native parser and expose actual import source choices or typed coverage. No credentials/raw source payload saved. |
+
+DP-17 reproduction/evidence: Settings → Onboarding → Data imports; successful format options CSV/JSON/NDJSON/Parquet coexist with a failed connected-research read. Expected: configured source choices or an actual typed unavailable reason. Actual: parser rejection, distinct from zero imported files. [data-imports-001.png](../../.agents/tmp/desktop-product-audit/2026-10-03/data-imports-001.png), [provider-parser-errors.json](../../.agents/tmp/desktop-product-audit/2026-10-03/provider-parser-errors.json). Status: unresolved, verified UI/query defect; exact producer mismatch not yet diagnosed.
+
+### First reads, revisits and data authority
+
+Times are Python monotonic observer upper bounds until the recorded queries settle, including WebDriver/serialization and other mounted reads. They are neither server-stage durations nor cold-start benchmarks. Current captures use775px viewport height and1376px width; routes were already visited during this audit.
+
+| Action | Observed time | Actual behavior / retained evidence |
+|---|---:|---|
+| Home first / revisit |6.495s /6.402s|9 dated watchlist prices; no saved analyses. `home-first.json`, `home-return.json`. |
+| Valid MSFT first |9.511s|Instrument/Facts ready earlier (~7.189s); history settles by final sample. `msft-valid-first.json`. |
+| Facts → Statements |~5.564s|Fresh first-page financial read; actual32 statement groups. `msft-statements-selected.json`. |
+| Statements → Ratios |5.292s|32 ratio rows appear after pending read. `msft-ratios.json`. |
+| Ratios → Filings |2.126s|32 filing rows. `msft-filings.json`. |
+| Filings → previously read Facts |4.778s|Pending read and zero financial tables before prior facts return. `msft-facts-tab-return.json`. |
+| Home → previously read MSFT |10.219s|At~281ms cached instrument exists but financial/history pending and zero tables. `msft-route-return.json`. |
+| Ratios Next / Previous |0.909s /0.779s|Next changes32-item page; Previous restores prior page. `msft-ratios-next.json`, `msft-ratios-previous.json`. |
+| Research first / revisit |2.409s /1.948s|Collection read succeeds; preparation choices fail both visits. |
+| Portfolio first / revisit |0.773s /0.505s|Existing account accessible; selected panels show actual cash/value and empty holdings. |
+
+Lead source trace: `FinancialSectionRead` and `MarketHistoryRead` use `gcTime:0` and clear last-good refs on unmount; financial tabs also close operation read leases. Releasing immutable snapshot handles is correct; discarding scoped display data forces the observed blank/reload. Shared QueryClient has a five-minute in-memory default, not restart persistence. Original/provider and prepared financial evidence are durable, but each fresh first-page read rebuilds an operation-owned scratch SQLite coordinate snapshot. `selected_display_coordinates` performs per-row SQL selection/JSON decode; `build_snapshot` inserts selected coordinates then sorts/groups. No per-stage measured attribution is claimed. This extends DP-03/AD cache ownership; it does not authorize indefinite lease retention, broader acquisition or a global cache of all financial history.
+
+Lead independently checked [console-msft-source-check.json](../../.agents/tmp/v1-first-stock/console-msft-source-check.json): all32 **current first-page MSFT ratios** recompute exactly at returned precision; all84 retained input occurrences match original SEC CompanyFacts or unsegmented annual filing concept/period/value, with CompanyFacts filing dates matching too. Original raw SHA256 hashes match their basenames. This is a narrow pass, not later-page/all-company/all-family acceptance. [retained-msft-ratios.json](../../.agents/tmp/desktop-product-audit/2026-10-03/retained-msft-ratios.json) preserves exact items, envelopes, inputs and periods. [retained-iwm-missing.json](../../.agents/tmp/desktop-product-audit/2026-10-03/retained-iwm-missing.json) preserves the missing-family response without secrets.
+
+Research DP-08 source cause confirmed by lead: service preparation failed at `observation_decode`, `error_class=decode_memory`, with `Analysis.GetFeatureDatasetPreparationOptions` returning InvalidEvidence/invalid result. `dataset_preparation.rs:910–1070` reads cursor batches but accumulates decoded observations plus digests in a Vec and sorts under a16MiB/4096-row admission bound. This is a retained-data admission failure, not missing provider evidence. Raising the bound is not the audited remedy.
+
+IWM is an ETF. Lead confirms `investment-page.tsx` mounts InvestmentFinancials unconditionally while `preparationEligible` is true only for equity. Corporate facts panels with automatic preparation disabled are therefore an asset-specific product composition gap. `identity_missing` is an application identity failure, not proof SEC or fund information does not exist. Official [iShares IWM product page](https://www.ishares.com/us/products/239710/ishares-russell-2000-etf), inspected by lead October3, supplies dated NAV/close/volume, expense ratio, holdings, distributions, performance, benchmark and financial/legal documents. That proves useful fund information exists; it does not establish that the configured corporate SEC endpoint provides those fund fields or authorize a new scraping integration.
+
+### Route, visual and control coverage
+
+PNG prefixes below are under the current evidence root; numbered tiles overlap and reach the root-page bottom. They were actually opened as images, not accepted from DOM alone. Default and selected state JSON accompany each prefix. A root-page scroll series does not establish full scrolling of every nested collection/table region.
+
+| Route / current screen | Full-page visual proof | Controls exercised / prerequisites and unexecuted actions |
+|---|---|---|
+| Home | `home-000–002` (1565px) | WatchlistMSFT selection and repeat navigation;9 price/change cards inspected. Guidance0; Find opportunities/analysis launch not run. No account summary. |
+| Markets | `markets-000–010` (6142px), lead viewed | SearchMSFT and returned100 option rows inspected. Company-name search screenshot captured while pending, excluded as settled-result proof. Cursors, final company search, session selection/Load trading sessions and option detail not exercised. |
+| Selected IWM | `initial-iwm-000–002` (1679px) | Dated quote; failed history preparation and missing families read. Fund-equivalent financial detail absent; no acquisition/retry job run. |
+| Selected MSFT | Facts `msft-facts-000–006`; Statements `msft-statements-selected-000–025`; Ratios `msft-ratios-000–006`; Filings `msft-filings-000–010` | All4 actual selected tabs and first pages; Ratios Next/Previous; Record dates/Coverage/first ratio Reporting context+Inputs; candle toggle and date slider. Other financial cursors, original filing opening, precision tooltips, manual retries and range changes unexecuted. Analysis no saved Brief. |
+| Opportunities | `opportunities-000–001` (1273px) |3 workflow summaries and3 benchmark choices inspected;1 resumable/2 unavailable,0analyses. Resume/Stop/Find opportunities/Review setup and ranking/Brief layers unexecuted. Existing workflow blocked by missing source actions. |
+| Portfolio | `portfolio-000–002`; selected seven panels `portfolio-expanded-000–012` (7423px) | Existing account selected; Positions, Exposure, Cash/performance, Risk/guidance, Stress, Saved planning, History/planning summaries opened. USD100000 cash/value,0 holdings; position columns, one cash transaction and one observation inspected. Saved preferences viewed. No mutation. Import, transaction-history nested expansion, version comparison, rebalance/scenario calculation and saved-plan details unexecuted. |
+| Paper execution | `paper-execution-000–002` (1762px) | Start preflight visible: current market data/calendar unavailable;0 orders/fills. Start/Try again/manual order/draft submission/safeguard changes unexecuted. No synthetic order created to tick a box. |
+| Advanced | `advanced-000–002`; `advanced-expanded-000–007` (4278px) | Profile summaries/settings/history expanded,48 preferences/8 fixed settings and recommendedversion1 inspected. Copy/edit/validate/save/activate/restore unexecuted. |
+| Research | `advanced-research-data-000–007` (4380px), `research-selected.png`, `research-history.png` | Select first484-observation collection and open history;25 rows returned, first visible nested viewport inspected.23 generic collections,98063 observations; macro0/15. Filters/later history cursor/full nested list, preparation preview/start/import unexecuted; choices blocked DP-08. |
+| Models/forecasts | `advanced-models-forecasts-000–001`, `models-preparation.png` | Forecast preparation summary opened;0 ready choices/models/forecasts/activity. No training/job/forecast or selected calibration/results possible. |
+| Backtests | `advanced-backtests-000` |0 point-in-time choices/results. Run/selected result/equity curve/comparison blocked; no job started. |
+| Valuation/targets | `advanced-valuation-targets-000` |0 analyses; Brief prerequisite missing. Target/uncertainty/harmonic/forecast/benchmark layers blocked, not passed as empty states. |
+| Risk/policy | `advanced-risk-recommendation-policy-000`, `risk-selected.png` | Account selector changed to existing account; ready Wait/abstention and configured limits read. Policy changes unexecuted; selected guidance also covered in Portfolio tiles. |
+| AI Connections | `system-ai-connections-000–002` (1355px) |2 ready client cards and shared service generation20 read. Connect/verify/repair unexecuted; no message sent to another service/user. |
+| Operations/jobs | `system-operations-jobs-000–009` (5573px), lead viewed |14 jobs,5 attention/9 completed/0 active inspected. No selected job expansion/Cancel/Resume/Confirm. Repeated generic job titles omit investment identity; “Results ready” is ambiguous with partial workflow, not proven wrong job status. Failed jobs give generic Logs advice. |
+| Updates/repair | `system-updates-repair-000–001` (1180px) | Development installation limitation/version/status inspected. Update/rollback/repair/removal not executed; installed-package flow cannot be accepted from this runtime. |
+| Backup/recovery | `system-backup-recovery-000–001` (904px) |0 backups; retention/creation controls inspected. Create/delete/restore/retention review/rollback preview unexecuted. Different displayed retention defaults not classified as a defect without authority trace. |
+| Logs | `system-logs-diagnostics-000–016` (9473px), lead viewed |100 records/columns inspected. First Details opens actual structured sequence1 record in DOM. Error filter applied and query returned error records. Dialog paint/close/global follow-on not accepted: snapshots stale and selector ambiguous. No cursor/export/other filters exercised. |
+| Settings | `system-settings-000–004` (2681px) |9 preferences/workspace/select choices and lockoff inspected. No edit/review/save/defaults/lock/workspace switch. Estimated0B despite collections is an unconfirmed metric-definition gap, not established lost data. |
+| Settings Onboarding | Setup `system-settings-onboarding-000–001`; Status `connection-status-000–025` (15028px); Imports `data-imports-000–001` |All3 actual tabs clicked;27 checks/1 failure,25 profiles/19 sessions read; import format choices inspected. No source connect/disconnect/status repair/file picker/import. SEC “No stored dataset” juxtaposed with retained SEC collections needs consumer coverage trace, not a backend-empty claim. |
+
+The selected MSFT Statements page is15038px and Filings6334px; duplicated long explanatory context still requires the existing copy/data-density remediation. The selected portfolio expands to7423px; most selected tables are legitimately empty because this account has no holdings. Empty holdings are not evidence that quote/provider services have no data. Cash/performance needs at least two observations for returns; stress requires holdings/shocks; saved planning has no result. Risk abstention is actual returned guidance, not investment-performance acceptance.
+
+Financial row/segment checks: actual Facts/Statements/Ratios have32 items/groups and2 source-family limitations (`some_reported_facts_not_supported`); Filings32 rows has1 family and no listed limitation. Facts retain USD/share/per-share values and as-of/duration dates; ratio context includes FY2026 annual/consolidated current assets207.710bn and current liabilities168.825bn, producing1.23×. Later pages and every reporting-context/segment value are not numerically accepted. “Consolidation not reported”, “Restatement not reported” and “Segment not available” require exact source-field/period/filing proof before being classified as genuine absence.
+
+Chart checks: MSFT dated history covers October3,2025–October2,2026. Date slider produced October3 OHLC512.67/516.21/510.88/513.17. Original-bar panel was still “Checking saved evidence…” at its retained capture; final original-bar completion was not observed.30/90/365/3650-day choices were inspected but not changed. Background native snapshots may show a blank chart canvas despite available data. Existing public chart `takeScreenshot` flush/export was used: [line](../../.agents/tmp/desktop-product-audit/2026-10-03/msft-chart-line-0.png) and [candles](../../.agents/tmp/desktop-product-audit/2026-10-03/msft-candles-0.png) were individually viewed and prove drawable chart geometry and green/red candles. They do not prove foreground first paint, hover crosshair/tooltip behavior or saved forecast layers. No false missing-chart defect is inferred from the known hidden WKWebView snapshot limitation.
+
+Restart-cache acceptance remains open: this pass reproduced warm tab/route cache loss but did not
+restart the app to measure first displayed data. After remediation, close the existing native
+Desktop/service, reopen the same workspace and select the same watchlist investment; verify its
+dated display returns from persisted data while valid current reads resume. Reused display data
+must not revive expired cursor/session authority or imply that a cached quote is live.
+
+### Automatic reads, copy and exact absence classification
+
+MSFT financial/history first reads and tab changes happen automatically; no ordinary manual Load financial/history button was needed. That improvement does not close the cache/revisit defect. Lead source scan still finds `markets-page.tsx:175` “Load trading sessions”, `research/dataset-evidence.tsx:135` “Open history and revisions”, `investment-financials.tsx:213` “update finished. Refresh to see available reports”, and portfolio saved-planning/history/rebalance/scenario instructions to refresh observations/results. Fold these into the existing [automatic-data audit](2026-10-02-desktop-automatic-data-audit.md) and [product-copy audit](2026-10-02-desktop-product-copy-audit.md): selection changes should fetch ordinary reads and expose useful data; repeated procedural/date/OHLC/benchmark paragraphs dominate financial screens. Optional icon retry, deliberate recalculation, source connection and safety/review confirmations have different purposes and are not blanket removal targets.
+
+| Unexpected unavailable/no-report | Verified classification | Exact remaining confirmation |
+|---|---|---|
+| IWM corporate financial families | Application `identity_missing`; asset-inappropriate corporate composition; no source-absence pass | Identity mapping and agreed fund NAV/holdings/profile/source coverage. |
+| IWM history preparation failure | Actual failed preparation state, quote remains available | Existing operation/job reason and exact history source result; no new job created. |
+|100 option price/change unavailable cards | Incomplete meaningful market/option consumer presentation | Exact admitted contract identifiers, quote operation/entitlement/result and option-family consumer coverage. |
+| Research preparation choices | Retained-data decode admission failure verified by source/log | Correct bounded admission and successful choices/preview. |
+|15 macro indicators unavailable | UI/query observations only; **absence unconfirmed** | Each exact Macro context indicator/cutoff and retained original publication/latest release result. |
+| Ratio reporting metadata unavailable | UI field values only; numeric inputs narrowly proven | Exact source concept/period/filing for consolidation/restatement/segment metadata. |
+| Alpaca provider status | Exact parser failure/provider proved | Safe normalized raw row + failed parser predicate; source lifecycle cause not assumed. |
+| Onboarding research imports | Exact unsupported-response parser error proved | Producer/native/parser contract and actual normalized choices. |
+| No Brief/forecast/backtest/results | Functional prerequisites missing, not a complete available-state workflow | Existing paused workflow's retained source actions; usable model/dataset/analysis evidence. No costly work started here. |
+
+### Screenshot accounting and actual comparator evidence
+
+224 PNGs were captured this date.210 have confirmed individual image-view coverage:172 by the native audit agent and38 by lead (all17 Logs,10 Jobs,11 Markets tiles).205 are accepted visual evidence. Fourteen superseded captures have no image-view claim:7 incorrectly labeled `msft-statements-000–006` actually captured Facts before selector repair, and7 failed portfolio-toggle supplemental images. Five individually viewed supplemental images are excluded as proof of their intended final state: pending company-name search, two stale log-detail captures, log-filter capture behind a stale dialog and mislabeled global navigation capture. This distinction is retained per-file in the manifest. Correct selected Statements and full expanded Portfolio replaced those failed attempts. Lead additionally viewed MSFT Facts001; it is already included in the agent-viewed accepted set and is not double-counted.
+
+The six retained official vendor demonstration images were individually viewed, with source pages/assets/hashes in [comparator manifest](../../.agents/tmp/desktop-competitor-reference/manifest.json). They support concrete composition comparisons: [Fidelity Trader+](https://www.fidelity.com/learning-center/trading-investing/trading-platforms/how-to-use-trader-plus-web) puts account/positions and a chart workspace together; [Power E*TRADE](https://us.etrade.com/platforms/power-etrade) demonstrates named preset scans and legible chart controls; [TradingView screener](https://www.tradingview.com/support/solutions/43000718885-tradingview-screeners-walkthrough/) demonstrates meaningful sortable financial rows/filters. Current Markets'100 opaque option cards and repeated unavailable text fail these information-density/discovery dimensions; Home lacks the available account summary; financial tables devote substantial page height to repeated prose. These are comparisons against actual inspected vendor images, not independent current live brokerage sessions. Vendor assets may depict earlier product versions and do not establish pricing, current feature parity, performance or an overall “better than competitors” claim.
+
+Not exercised: every unsupported-width/opened dropdown/focus/tooltip/keyboard state; full nested Research list; every financial page/record/segment and original-document target; new analysis/dataset/model/backtest/discovery jobs; successful Investment Brief; scenario/rebalance/order execution; provider credentials/connect/disconnect; installation/update/repair; backup/restore/delete; lock/workspace mutations. Relevant workflows remain blocked or unexecuted in the coverage matrix; visibility of their buttons and successful empty queries are not passes. This finite audit is ready for remediation and source-specific follow-up, with no publication/merge/release approval.
+
+---
+
+## Historical checkpoint — 2026-10-02
+
+The following16-Open finding headline, runtime and screen observations describe the October2 baseline. Current reproduction/remediation status is above; historical finding identifiers and evidence are preserved.
+
+
+Status: completed the 19-route survey and full-scroll capture of every available default page at 1376×775 CSS pixels. All 156 unique page/panel/sidebar tiles and six official competitor images were visually inspected. There are 16 Open findings (11 Important, 5 Minor). Expanded/data-dependent workflow, chart-paint, accessibility and responsive-width limits remain below; this is an actionable audit, not implementation or final approval.
+
+Audit source anchor: feature/v1-installed-product-experience, `086029b4e07672b6524f9cd7678c6a61f879064a`, plus preserved prepared financial integration. The lead owns Git and runtime; no Git command, build, branch or worktree operation was performed by this audit. The lead later froze the identical production source at `d0dcb849` (parent-confirmed; no independent Git action). Running evidence is generation `.market-squawk/dev-runtime/session-GR8i4q/generation-xC2hed`, supervisor 99692/session 4797, service 3916/Desktop 3982, after the corrected preparation descriptor deployment. This development runtime is not installed-package or final clean-head acceptance.
+
+Scope: all concrete routes in `src/app/routes.tsx`, available default pages and selected nested read panels, Everyday/Advanced/system/setup/recovery, approved Obsidian Signal design and local34-view mocks. Unexercised nested and mutation-dependent states are listed explicitly. Native evidence uses the development-only background `POST /wdio/eval`; no global keystrokes, foreground screenshot or focus.
+
+Initial source inventory: 19 concrete routes (17 sidebar destinations, additional selected-investment route, Settings Onboarding route); wildcard redirects to Home. Route count is coverage bookkeeping, not a product defect. Nested analysis, forecast, dataset, account, import, profile, search, lifecycle and recovery surfaces require their own coverage rows.
+
+Evidence: `.agents/tmp/desktop-product-audit/source-inventory.json`. Desktop source paths below are relative to `apps/market-squawk-desktop/src/`, unless explicitly native/backend. Every DP finding is **Open**; Important and Minor are both existing-contract remediation, not approval.
+
+## Automatic-data coverage correction
+
+The [all-screen automatic-data supplement](2026-10-02-desktop-automatic-data-audit.md) inventories
+all19routes and their nested read panels, preparation/refresh controls, cache ownership and recovery.
+The original screenshot survey did **not** establish automatic preparation, semantic completeness or
+every populated workflow. Seven grouped supplemental findings track those gaps; successful queries,
+32returned items or an error-free empty screen are not sufficient acceptance. Follow the delivery
+ledger for current remediation rather than treating either audit as a completed product.
+
+## Route coverage matrix
+
+Every listed route exists in `apps/market-squawk-desktop/src/app/routes.tsx:101`. Every route was opened in the real background native WebView and its heading checked before capture. Named subflows with no saved rows or requiring mutation remain explicitly unexercised.
+
+| Route | Screen and required nested surfaces | Primary owner | Current proof |
+|---|---|---|---|
+| /home | Discovery launch, saved decision evidence, watchlist, attention queue | overview/overview-dashboard.tsx | Live Home;9watchlist entries;0saved analyses; `home.json/png` |
+| /markets | Overview cards, universe search, cursor pages, trading sessions | markets/markets-page.tsx | Live market overview10rows after extended read;MSFT search; `markets-extended.json/png` |
+| /investments/:selectionToken | Quote/trade, profile, history windows/layers/accessible date, original bar, financial four tabs/cursors, analysis launch | markets/investment-page.tsx | Live MSFT quote/profile/history and4financial tabs; `investment-msft.json/png`, `financial-*.json/png` |
+| /opportunities | Activity, saved screens, ranked results/history, Investment Brief, forecast/benchmark/harmonic evidence and probabilities | opportunities/opportunities-read-experience.tsx | Live history empty; launch visible, not started; `opportunities.json/png` |
+| /portfolio | Recommendation preferences, accounts, positions/exposure/cash/performance/risk/stress/history/planning, saved plans, import | portfolio/portfolio-page.tsx | Live0accounts; import selected-account branch source-only; `portfolio.json/png` |
+| /paper-execution | Session/orders/fills, selected analysis draft, manual draft, safeguards | paper/paper-execution-page.tsx | Live0orders/fills; account/start choices; no transaction; `paper-execution.json/png` |
+| /advanced | Profile status/editor; links to analytical workspaces | advanced/advanced-overview-page.tsx | Live recommended active profile, controls; no edit; `advanced.json/png` |
+| /advanced/research-data | Macro/rates, collections/cursors/filter/evidence, dataset builder/import | research/research-page.tsx | Live14collections/110496observations; selected25history rows; macro0of15; `research-selected-history-final.json/png` |
+| /advanced/models-forecasts | Models, bundle evidence, forecasts, selected outcomes/calibration, training/jobs | models/models-page.tsx | Live0models/forecasts/activity; preparation collapsed; `advanced-models-forecasts.json/png` |
+| /advanced/backtests | Builder/preflight, activity/cursors, completed result/evidence | backtests/backtests-page.tsx | Live0PIT history choices/results; `advanced-backtests.json/png` |
+| /advanced/valuation-targets | Valuation analysis/measurement, targets/scenarios/evidence | fair-value/fair-value-page.tsx | Live no saved analysis; source consumer exists; `advanced-valuation-targets.json/png` |
+| /advanced/risk-recommendation-policy | Account selector/cursors, risk guidance | risk/risk-page.tsx | Live0accounts; policy placement source-only; `advanced-risk-recommendation-policy.json/png` |
+| /system/ai-connections | Shared-service evidence, Claude/Codex client status/repair | mcp/mcp-page.tsx | Live2client cards and shared-service evidence; no client repair; `system-ai-connections.json/png` |
+| /system/operations-jobs | Job list/cursors/details/phase history and runtime/storage | operations/operations-page.tsx | Live15jobs:14attention,1completed; existing failed financial job; `system-operations-jobs.json/png` |
+| /system/updates-repair | Installation/release/update/rollback/repair/removal preflight | lifecycle/lifecycle-page.tsx | Live source/dev trust-channel unavailable label; previews not requested; `system-updates-repair.json/png` |
+| /system/backup-recovery | Inventory/cursors, backup verify, retention and restore preview, job evidence | backup/backup-recovery-page.tsx | Live0backups and clear recovery boundary; no action; `system-backup-recovery.json/png` |
+| /system/logs-diagnostics | Filters/cursors, selected redacted record, controlled export | logs/logs-page.tsx | Live100redacted records and labeled filters; no export; `system-logs-diagnostics.json/png` |
+| /system/settings | Application lock, settings review/rollback, workspace switch | settings/settings-page.tsx | Live9settings/1workspace; optional lock off; no mutation; `system-settings.json/png` |
+| /system/settings/onboarding | Connections/status/selection, native credential import, OAuth and data-import setup | settings/settings-page.tsx; sources/sources-page.tsx | Live25providers and setup/import controls; Source status parse error1of25; `system-settings-onboarding.json/png` |
+| Global/state surfaces | Header search, feature-local lookup; loading/page failure/workspace recovery/disconnect/locked credentials | components/app-header.tsx; app/routes.tsx | Live header Search; recovery/error states code-only, not induced; `global-search-msft.json/png` |
+
+## Substantiated findings
+
+### DP-01 — Open · Important: global Search only searches navigation labels
+
+Reproduction: open the header's **Search or run a command**, type a ticker/company/object. `components/app-header.tsx:101` builds the dialog exclusively from `navigationSections`; it never uses `LookupSurface`. The real local investment/workspace lookup exists separately in `features/lookup/global-lookup.tsx:43`, so the core capability is present but detached from the persistent expected entry. Impact: a user cannot find an investment or saved object from the primary global search. Owner-test items 3, 5 and 6; mocks `search.png` and installed design Lookup contract. Fix: connect the existing typed lookup to the global entry while retaining bounded navigation commands and availability. Acceptance: ticker/company and an actual saved analysis return the correct bounded result and open the corresponding view using the header and accessible button. Group A, shared shell/lookup; no new search engine. Live confirmation: typing MSFT shows the navigation result “Models & Forecasts,” not Microsoft. `global-search-msft.json/png`.
+
+### DP-02 — Open · Important: financial change values use neutral text without gain/loss semantics
+
+Evidence: `markets/markets-page.tsx:194` renders `changePercent` in an unconditional `text-sm`; `markets/investment-page.tsx:96` embeds it in muted metadata; `markets/market-collection.tsx:191` embeds it in the availability paragraph. Positive values are not given an explicit + direction; negative text is never semantically red here. Candlesticks already use green/red, but that does not repair market/watchlist percent display. Impact: slower visual scanning and inconsistent financial meaning. Owner-test item5 and Obsidian Signal Color/Accessibility rules; mocks Home/Markets show explicit signed green/red changes. Fix: use one agreed semantic presentation for financial gain/loss, neutral zero/unavailable, and direction in text/icon; do not paint every negative accounting field red or turn sell decisions into losses. Acceptance: backend +/−/zero/unavailable rows display correct signs/units and meaningful noncolor cues with AA contrast. Group B, three market surfaces plus shared formatting/theme if needed; Source-confirmed conditional styling defect; this live dataset supplies null price-change fields, so +/− available rows were not exercised. The neutral historical price level line itself is legitimate, and must not be forced to green/red.
+
+### DP-03 — Open · Important: warm investment navigation discards useful displayed data
+
+Evidence: `markets/markets-page.tsx:43,50`, `markets/investment-page.tsx:56`, `markets/investment-profile.tsx:20`, `research/research-page.tsx:86` explicitly use `gcTime:0` despite `app/query-client.ts:39` default five-minute bounded retention. Data disappears with the last observer; returning starts new requests. Financial and portfolio readers deliberately release snapshot/cursor authorities on close. This is not a recommendation to retain released authority or globally cache all payloads. Live `investment-warm-revisit.json` shows both instrument and financial requests pending at413ms after return, instrument first success at6055ms and facts first success at11866ms. The existing view is not displayed while those requests run. `warm-markets.json` also remains pending after6seconds. These are observed upper bounds, not latency acceptance thresholds. Candidate fix: bounded saved display projections keyed by exact workspace/selection/generation, immediate clearly dated cached display, and valid fresh handle reacquisition; preserve unmount cancellation and cursor release. Acceptance: warm navigation paints relevant cached content immediately, then honestly states revalidation status; no stale identity/handle reuse, whole-history retention or background polling. Group C, owning query defaults/readers plus scoped display-projection owner. Keep released financial readToken and cursor authorities separate from harmless saved display content.
+
+### DP-04 — Open · Important: Portfolio import is a permanent UI stub
+
+Source proof: complete `features/portfolio/portfolio-import-workflow.tsx:6–37` only renders an alert; even a selected account always gets “Import is unavailable.” No picker, preview, mapping or commit is composed. Live Portfolio correctly reports zero accounts and points users to importing below, but the offered path cannot establish or update a portfolio. This is a missing implementation confirmed by source, rather than a finding inferred from an empty account list. Impact: owner-test item4's native import/reconciliation journey cannot be completed from Desktop. Fix: compose the existing native import authority, destination choices, typed preview/mapping/reconciliation and explicit confirmation; preserve exact values and unchanged-state failure. Group D, portfolio import/native contract, dependent on existing import authority. Acceptance: real supported file → reviewed identities/amounts/dates/conflicts → explicit save → positions/performance/risk visible; cancellation leaves state unchanged. Evidence `portfolio.json`, `portfolio.png`; selected-account import branch source-only.
+
+### DP-05 — Open · Minor: Markets search lacks a persistent label
+
+`features/markets/markets-page.tsx:68` renders a placeholder-only input with no associated label/id or aria-label. Native `markets.json` confirms empty `labels` and null aria-label. Placeholder text disappears while entering a query and is not a persistent label. The platform may expose a placeholder-derived accessible-name fallback; no actual accessibility-tree interrogation was performed, so an unnamed accessibility node is not proved. Impact: the primary investment-search workflow lacks the approved persistent input label. Fix: attach a visible label to this exact input; preserve a useful query hint. Group A, Markets lookup surface. Acceptance: a visible associated “Find an investment” label remains while typing, and platform accessibility-tree inspection confirms the intended name.
+
+### DP-06 — Open · Important: Home lacks the agreed account/portfolio overview
+
+`features/overview/use-overview.ts:19–34` only reads saved analyses and the followed market collection. `overview-dashboard.tsx` composes discovery, saved decisions, watchlist and static next steps. Live Home explicitly distinguishes its watchlist from owned positions, which is correct; it still has no account value/cash/returns/risk/coverage summary or actual attention queue even when the APIs have such data. The approved installed design and `home.png` mock require that overview; owner-test items4–5 require a complete financial view. Impact: “What needs your attention now?” is largely static guidance rather than the user's current financial position. Fix: demand-load a bounded typed account summary keyed to an explicitly chosen account, preserve currencies/dates/coverage and useful Portfolio links; show an actionable honest no-account state. Group D plus shared account summary. Acceptance: an existing account produces correct value/cash/period performance/risk/coverage and links to the same selected Portfolio; empty-account state never substitutes watchlist balances. Existing live account data is unavailable, so available-state proof is source-only.
+
+### DP-07 — Open · Important: Research cannot identify or inspect its financial information
+
+Live reproduction: open Research → choose the first collection → Open history and revisions. Fourteen distinct collections all display “Research collection”; the selected 736-observation collection returns25 “Observation” rows containing dates, revision and quality only. There is no instrument/series/concept, actual value/missing reason, currency/unit or meaningful family context. Evidence `research-selected-history-final.json/png`; `research-errors.json`; `features/research/research-contracts.ts:8,29`, `dataset-evidence.tsx:209`; native `src-tauri/src/service_client.rs:2489` forces summary projection. Impact: loaded information cannot be evaluated or even reliably found;110496observations is not meaningful research coverage. Fix: retain bounded summary lists but give them real canonical titles and typed family identity, then demand-load family values/units/period/revision/original evidence using existing backend projections. Group E, coherent backend/native/schema/Research vertical; owner-test items1,2,5,6. Acceptance: a real collection can be located by its meaningful name and25-item page exposes exact economic meaning; additional history pages retain the same selection and authority. Do not dump provider JSON into the product.
+
+### DP-08 — Open · Important: Research preparation choices fail, rather than report usable choices
+
+Repeated live Research visits return `operation_failed` / “The Market Squawk service rejected the operation.” for `preparation-choices`; the UI settles at “Available research choices could not be loaded. Try again.” Existing14collections load successfully. Evidence `research-errors.json`, `research-final.json`; `features/research/dataset-builder.tsx:65–79` calls `datasetPreparation({action:"options"})`. Impact: the Dataset Builder's first step is blocked, distinct from an honest empty catalog. Fix: diagnose the actual native/service options rejection and reconcile the existing typed preparation contract; surface a useful operation-specific recovery reason. Group E, native dataset-preparation/service authority, upstream of builder confirmation; owner-test items2,5. Acceptance: current admissible choices or a legitimate typed no-choice reason render without an operation failure, and selected preview uses that exact choice. Preparation/preview/start were not executed in this read-only audit; no new job was created.
+
+### DP-09 — Open · Important: agreed rich family consumer edges remain uncomposed
+
+Current source proof: the complete `lib/transport.ts:67–196` ProductQuery now exposes company financials/profile, rich stock quote/history and saved analysis layers. It still has no closed consumer operation for option expiry/chain/contract Greeks, fund NAV/holdings/overlap, venue-qualified crypto books/trades or selected macro release/vintage/history. Required contract: [canonical typed reads §13](../reference/market-data-canonical-schemas.md#13-bounded-typed-application-reads) explicitly names Options/Funds/Macro; [finite source-family closure inventory](../plans/v1-workflow-completion-plan.md#finite-provider-family-completion-inventory) lines88–114 ties SEC fund holdings, FRED vintages and separate Coinbase/Kraken books/trades to their intended consumer. See also `.agents/tmp/v1-first-stock/screen-contract-coverage.md` E3/E4 (historical audit, not current proof). Impact: a family may be acquired and analytically used while remaining inaccessible as complete financial research. Group E/F, existing family producer → closed native/schema → intended consumer; owner-test items1,2,5–6. Fix: reuse established projections and only the agreed selectors and demand panels, with explicit unsupported/disabled coverage. Acceptance: one real available selection per structurally distinct agreed family exposes exact dates/units/coverage/nullable fields and bounded navigation. Native available-family selection was not exercised; source-only. The older missing company financial/bid-ask findings are superseded. This does not add a bond-detail workspace or a new cross-venue comparison feature. Current Filings has form/revision/times but original-document/lineage consumer completeness remains unverified, rather than asserted missing solely from this list.
+
+### DP-10 — Open · Minor: live updates keep the selected investment permanently “Updating”
+
+Without pressing refresh,20samples across roughly7seconds all show `Market.GetInstrument` fetching while dataUpdatedAt changes8times; the header repeatedly says “Updating price information…” for an already displayed dated price. The longer60second MSFT observation never reached all-reads-idle. Evidence `investment-refresh-observation.json`, `investment-msft.json/png`; `features/markets/investment-page.tsx:56`, `app/domain-refresh.ts`. This proves persistent read/update presentation, not an invented feed correctness or duplicate-network root cause. Impact: users cannot distinguish usable displayed data from initial loading, and the visual refresh control remains busy. Fix: distinguish initial/revalidated/live-following states, maintain stable header content, and coalesce display publication work according to the existing authority contract. Do not globally throttle necessary freshness or suppress actual changes. Group C, market invalidation/presentation; owner-test items5–6. Acceptance: a steady stream preserves useful prices/chart and identifies the last displayed time; foreground manual refresh receives local feedback without permanent generic busy text. Current header positions were stable during these samples; refresh-triggered layout stutter was not reproduced because manual refresh/acquisition was excluded.
+
+### DP-11 — Open · Minor: financial ratios expose machine precision as the primary reading
+
+Live Ratios displays “1.2303272619576484525396120243 ratio” as its primary current-ratio value. Evidence `financial-ratios.png/json`; `investment-financials.tsx:308` applies the lossless grouping formatter to every ratio. Impact: avoidable reading effort and column width in an otherwise useful financial table. Fix: use a financial display convention appropriate to each ratio (e.g. readable current ratio with ×, explicit percent for margin where contract says so), with full exact decimal retained in accessible detail. Group B, financial formatting. Acceptance: the visible value has an unambiguous unit and practical precision while exact values and unavailable reasons remain retrievable. Do not round stored values or infer unavailable margins.
+
+### DP-12 — Open · Minor: first market data shifts the trading-session controls substantially
+
+Markets initially renders no reserved result rows. On the same unscrolled route, the Trading sessions heading moves from y409 to y896.94 CSS pixels when10overview cards arrive (~488px). Evidence `markets.json` vs `markets-extended.json/png`; `markets-page.tsx:70–99`. Impact: a control below the initial loader moves during interaction, and warm returns repeat the empty-to-loaded transition. Fix: retain the correct prior scoped display and reserve a proportionate stable initial result region/skeleton; keep local loading/coverage labels. Group C with DP-03; owner-test items5–6. Acceptance: initial and warm market reads preserve control position through localized loading, error and result publication without fabricated placeholder prices.
+
+### DP-13 — Open · Important: Markets lacks the required market-discovery view
+
+Live Markets eventually shows10individual cards with prices/basis, one free-text instrument search and Trading sessions. It has no gainers/losers/movers ranking, breadth view, useful financial filters or sortable change/volume/liquidity columns. `markets-page.tsx:59–99,194` confirms the entire overview/search composition, not an unseen collapsed panel. Evidence `markets-extended.json/png`, `market-search-msft.json/png`. Impact: users can look up a known investment but cannot discover what is moving or compare market opportunities; starter instruments are not a financial market overview. This follows the owner's explicit discovery requirement and the approved Markets presentation, not a claim that watchlist choices are personal holdings. Group F, existing market/universe projection → bounded Desktop discovery; owner-test items3,5,6. Fix: settle the intended selected universe/coverage and reuse existing available change/activity measures for honest sortable financial rows, bounded filters and gainers/losers/movers and breadth within the tracked universe; distinguish unavailable measures from zero. Acceptance: a known admitted tracked universe produces correctly ordered positive/negative/unchanged moves, meaningful filters/sort and explicit dates/coverage with cursor navigation; changing the personal watchlist never silently defines market breadth. Backend coverage for every requested mover measure is not established by this audit; do not fabricate ranking or trigger a new broad acquisition loop in React.
+
+### DP-14 — Open · Important observed issue: one provider-status response fails the current parser
+
+On the accepted Onboarding capture,1of25 `Source.GetStatus` active queries ends with “Error: Invalid Source.GetStatus row”; the other24 succeed. Evidence `system-settings-onboarding.json`; `features/sources/sources-page.tsx:120–141` reads each provider and `source-evidence.ts:1493` parses its row. Setup content renders, so this is a bounded provider-status failure rather than a whole-page outage. The failing provider identifier was not retained in this privacy-limited query summary, and no second status-tab/native restart pass was performed; persistence versus startup transient is not established. Impact: one source cannot provide trustworthy status evidence in this observation. Group E/provider-contract lane, owner-test1,5. Fix: reproduce the particular row with its provider identity in controlled redacted evidence, reconcile the actual service/projection/parser shape, and retain truthful per-provider recovery. Acceptance: recheck after startup settles and after the existing restart flow; all25selected source rows parse or yield a closed actual unavailable reason, and that provider's status view renders with bounded retry. Do not relabel a parser failure as entitlement unavailability.
+
+### DP-15 — Open · Important: benchmark select escapes the investment-analysis card
+
+Full visual inspection confirms the long default benchmark selector extends past the right-hand Investment analysis card and clips at the window edge. Direct geometry in `benchmark-select-geometry.json` on MSFT: select x1045,width386,right1431; containing label/card content right1331; window width1376. Evidence [MSFT top](../../.agents/tmp/desktop-product-audit/investment-msft-top.png), [full MSFT tile](../../.agents/tmp/desktop-product-audit/full-investment-msft-001.png), [Opportunities](../../.agents/tmp/desktop-product-audit/full-opportunities-000.png) and [measured geometry](../../.agents/tmp/desktop-product-audit/benchmark-select-geometry.json); `features/opportunities/analysis-launch.tsx:50–65` has a grid label with an unconstrained native select. Impact: truncated choice/control affordance breaks an important analytical selection at the normal supported width. Group A/B, shared analysis-launch container/select, confirmed on the current Opportunities header as well. Fix: allow the grid child to shrink with min-width0 and a bounded full-width control; present long selected labels clearly with accessible complete names and a deliberate wrapping/truncation strategy. Acceptance: the current longest admitted benchmark stays inside its card/window at the default width and supported880px minimum, including focus and opened choice list; full identity remains available. No selected benchmark or persisted analysis preference was changed. The880px acceptance check is required for remediation and was not run by this audit.
+
+### DP-16 — Open · Minor: long diagnostic operation text overlaps adjacent columns
+
+Visual reproduction: open Logs and scroll the first records; a long Rust operation path spills out of the Message column across Evidence/Details. [Tile001](../../.agents/tmp/desktop-product-audit/full-system-logs-diagnostics-001.png) and [tile002](../../.agents/tmp/desktop-product-audit/full-system-logs-diagnostics-002.png) retain the observed overlap. `features/logs/logs-page.tsx:294` (`LogRecords`) gives the cell a maximum width but leaves the operation paragraph without wrapping or containment. Impact: records become difficult to scan and text competes with the Details control. Group B, bounded text/layout presentation. Fix: wrap long operation identifiers within the message cell or use deliberate truncation with the complete identifier in selected detail; preserve the table's intentional local horizontal scroll. Acceptance: the observed long identifiers remain inside their own cell, Evidence and Details stay legible/actionable, and complete redacted evidence remains available. This is a current visual defect, not a claim that intentional horizontal table scrolling is broken.
+
+## Current passes and owner complaint disposition
+
+- **Investment detail / everything collapsed / no useful graphs:** current MSFT detail visibly shows its history chart by default, selected quote and Profile. Its history controls include saved/30D/90D/1Y windows, line/candlestick toggles and date inspection; chart axes show dates and price levels with USD stated nearby. This is a working improvement. Candle toggle changed the checkbox and added a canvas in DOM; the background snapshot still showed the line, so final candle pixels/color are not visually accepted here. Price history is separate from saved forecast/uncertainty/harmonic/benchmark/action-range layers implemented in Investment Brief; no saved analysis exists to validate those layers live. Preserve both contexts; a historical price graph alone is not the complete analysis workflow.
+- **Markets versus holdings:** Markets is exploration, with10catalog/market cards and MSFT query results; it does not claim these are owned holdings. Home explicitly says its watchlist does not represent owned investments; Portfolio is a separate account view. That distinction passes. Home's missing account summary is DP-06. The current card universe is not a verified top-mover ranking. Opportunities offers typed discovery but starting it would create work; its estimated-gain ranking and complete/excluded coverage remain unverified, rather than missing by inference. The required Markets gainers/losers/movers and useful comparison controls remain DP-13; a new generic feed or broader provider acquisition is not implied.
+- **Current bid/ask/sizes versus dated price:** MSFT header shows previous close USD512.71 at Oct1,16:00; the separate quote shows493.32bid/545.76ask, unavailable side sizes,519.54mid,517.13last trade/size4, with component times and “not current.” Those meanings are explicitly separate. Post-close/coverage labels and unavailable sizes are not automatically bugs. Live quote authority/entitlement correctness remains the financial lane's acceptance work.
+- **Company financial data:** four tabs now read successfully after the descriptor correction. Facts32items; Statements32groups (many rendered fact rows); Ratios32items including unavailable reasons; Filings32items. Visible facts retain shares/USD/per-share units, duration versus as-of periods and reporting context. Filings Next reachesPage2 and Previous returnsPage1 with the same displayed knowledge date. The saved preparation job remains failed; successful read does not establish successful preparation.
+- **Accessible read controls / bounded data:** financial tables have column/row headers and labeled keyboard-focusable horizontal regions; history has a range input with date/OHLC text. Existing CursorNavigation holds cursor identity, releases immutable handles appropriately, rejects repeated-next and disables busy controls. Financial pages request32items, research detail25; model/job first-page polling is conditional. Default shared QueryClient and publication invalidation exist. DP-03 targets reusable display projections, not uncontrolled whole-history memory or invalid cursor retention. Formal screen-reader/keyboard/contrast acceptance was not performed.
+- **System surfaces:** Settings General and Onboarding both render correctly; Application lock is off and visibly optional. AI Connections shows actual shared service and2client cards. Operations shows existing14attention/1completed jobs, with red failed text and controls. Updates clearly marks the development trust-channel limit; Backup has an honest empty inventory; Logs displays bounded100record reads. These do not prove mutations, installation or recovery.
+
+## Measured route observations and visual evidence
+
+Measurements use monotonic Python observer time from a hash/navigation click through repeated background eval. First content requires the intended route heading (not merely the new URL). Query idle is first observed idle at least200ms later. Observer/network/serialization costs make values upper bounds. Static sweep stops after6seconds; `not idle ≤6s` means only no settled sample, not a failed request. Essential Markets was extended: its first successful10-row projection arrived about3.32seconds into a subsequent extended observation, after it was still pending at6seconds; while live revalidation was already fetching again. MSFT was observed for60seconds with data available but continuously updating. There is no newly invented numeric pass threshold. Several route modules were already loaded during the corrected sweep: this is neither cold-start nor release performance acceptance.
+
+All evidence below is under `.agents/tmp/desktop-product-audit/`. Each route has a JSON observation and a real WKWebView snapshot PNG. No global screenshot or focus was used. The pinned webdriver plugin's macOS implementation uses `WKWebView.takeSnapshotWithConfiguration`, source anchor `tauri-plugin-wdio-webdriver-1.4.0/src/platform/macos.rs:456–497`. All156unique full-scroll PNGs were individually viewed and their route/content checked; the sidebar-only supplement deliberately excludes its pending body navigation from route proof. The initial MSFT snapshot visibly proves a dated price line; later full-scroll snapshots show a black chart area/TradingView logo despite mounted canvases. Actual later chart paint versus background snapshot composition cannot be distinguished without foreground verification, so those later canvas pixels are not accepted and no missing-chart implementation finding is made. Background snapshots captured page text/tables but occasionally retained outgoing active/hover styling (e.g. Facts tab paint while Ratios content and aria-selected are correct); therefore those transient selection/candle pixels are not visual acceptance. The first faulty sweep accepted old headings after hash change and was overwritten by the corrected heading-gated sweep; it is discarded, not evidence.
+
+
+| Route | First matching content ≤ms | First observed idle ≤ms | Warm revisit ≤ms content / idle | Evidence stem |
+|---|---:|---:|---|---|
+| `/home` | 28 | not idle ≤6s | 116 / not idle ≤6s | `home.json/png` |
+| `/markets` | 145 | not idle ≤6s | 114 / not idle ≤6s | `markets.json/png` |
+| `/opportunities` | 110 | 402 | not timed | `opportunities.json/png` |
+| `/portfolio` | 126 | 328 | 216 / 513 | `portfolio.json/png` |
+| `/paper-execution` | 151 | 436 | not timed | `paper-execution.json/png` |
+| `/advanced` | 141 | 574 | not timed | `advanced.json/png` |
+| `/advanced/research-data` | 149 | 1505 | 237 / 1481 | `advanced-research-data.json/png` |
+| `/advanced/models-forecasts` | 112 | 399 | 311 / 601 | `advanced-models-forecasts.json/png` |
+| `/advanced/backtests` | 121 | 408 | not timed | `advanced-backtests.json/png` |
+| `/advanced/valuation-targets` | 115 | 402 | not timed | `advanced-valuation-targets.json/png` |
+| `/advanced/risk-recommendation-policy` | 122 | 398 | not timed | `advanced-risk-recommendation-policy.json/png` |
+| `/system/ai-connections` | 126 | 421 | not timed | `system-ai-connections.json/png` |
+| `/system/operations-jobs` | 199 | 399 | not timed | `system-operations-jobs.json/png` |
+| `/system/updates-repair` | 153 | 449 | not timed | `system-updates-repair.json/png` |
+| `/system/backup-recovery` | 167 | 442 | not timed | `system-backup-recovery.json/png` |
+| `/system/logs-diagnostics` | 120 | 419 | not timed | `system-logs-diagnostics.json/png` |
+| `/system/settings` | 153 | 361 | not timed | `system-settings.json/png` |
+| `/system/settings/onboarding` | common Settings heading only | 4154 | not timed | `system-settings-onboarding.json/png` |
+| `/investments/:selectionToken` MSFT | initial content not separately timed | data present; never all-idle during60s | Instrument6055ms; Facts11866ms after return | `investment-msft`, `investment-warm-revisit` |
+
+
+The four financial section observations include deliberate300ms before/after checks and eval serialization: Facts883ms (already open), Statements5558ms, Ratios9363ms, Filings1546ms. They describe this session, not exact server duration. `financial-tabs.json` contains full states;32refers to top-level response items, including statement groups rather than32total table rows. Each selected tab's DOM `aria-selected` is correct. Cursor next/previous proof is `financial-filings-next.json` and `financial-filings-previous.json`.
+
+## Full-page visual coverage
+
+The retained [capture manifest](../../.agents/tmp/desktop-product-audit/full-page-manifest.json) records each tile’s route, panel, viewport, root and nested scroll coordinates/heights, and final `endReached`. The [visual-review manifest](../../.agents/tmp/desktop-product-audit/visual-review-manifest.json) records156unique inspected PNGs with SHA256. Root steps overlap by about28% of the775px viewport; nested panels also overlap. All19default document ends, the captured nested panels and the lower sidebar end were reached. No150-document/100-nested tile cap was reached. One early Markets-loading manifest entry was superseded by the same filename’s later available-page capture; it is historical metadata, not a second retained image or a second review.
+
+| Default route | Tile prefix / unique count | Maximum captured document height CSSpx | Document end |
+|---|---|---:|---|
+| `/home` | [full-home*](../../.agents/tmp/desktop-product-audit/full-home-000.png) / 4 | 2400 | Reached |
+| `/markets` | [full-markets*](../../.agents/tmp/desktop-product-audit/full-markets-000.png) / 2 | 1080 | Reached |
+| `/investments/:selectionToken (MSFT)` | [full-investment-msft*](../../.agents/tmp/desktop-product-audit/full-investment-msft-000.png) / 7 | 3985 | Reached |
+| `/opportunities` | [full-opportunities*](../../.agents/tmp/desktop-product-audit/full-opportunities-000.png) / 1 | 775 | Reached |
+| `/portfolio` | [full-portfolio*](../../.agents/tmp/desktop-product-audit/full-portfolio-000.png) / 2 | 850 | Reached |
+| `/paper-execution` | [full-paper-execution*](../../.agents/tmp/desktop-product-audit/full-paper-execution-000.png) / 3 | 1704 | Reached |
+| `/advanced` | [full-advanced*](../../.agents/tmp/desktop-product-audit/full-advanced-000.png) / 3 | 1832 | Reached |
+| `/advanced/research-data` | [full-advanced-research-data*](../../.agents/tmp/desktop-product-audit/full-advanced-research-data-000.png) / 8 | 4380 | Reached |
+| `/advanced/models-forecasts` | [full-advanced-models-forecasts*](../../.agents/tmp/desktop-product-audit/full-advanced-models-forecasts-000.png) / 2 | 1038 | Reached |
+| `/advanced/backtests` | [full-advanced-backtests*](../../.agents/tmp/desktop-product-audit/full-advanced-backtests-000.png) / 1 | 775 | Reached |
+| `/advanced/valuation-targets` | [full-advanced-valuation-targets*](../../.agents/tmp/desktop-product-audit/full-advanced-valuation-targets-000.png) / 1 | 775 | Reached |
+| `/advanced/risk-recommendation-policy` | [full-advanced-risk-recommendation-policy*](../../.agents/tmp/desktop-product-audit/full-advanced-risk-recommendation-policy-000.png) / 1 | 775 | Reached |
+| `/system/ai-connections` | [full-system-ai-connections*](../../.agents/tmp/desktop-product-audit/full-system-ai-connections-000.png) / 3 | 1439 | Reached |
+| `/system/operations-jobs` | [full-system-operations-jobs*](../../.agents/tmp/desktop-product-audit/full-system-operations-jobs-000.png) / 8 | 4531 | Reached |
+| `/system/updates-repair` | [full-system-updates-repair*](../../.agents/tmp/desktop-product-audit/full-system-updates-repair-000.png) / 2 | 1268 | Reached |
+| `/system/backup-recovery` | [full-system-backup-recovery*](../../.agents/tmp/desktop-product-audit/full-system-backup-recovery-000.png) / 2 | 1036 | Reached |
+| `/system/logs-diagnostics` | [full-system-logs-diagnostics*](../../.agents/tmp/desktop-product-audit/full-system-logs-diagnostics-000.png) / 14 | 7923 | Reached |
+| `/system/settings` | [full-system-settings*](../../.agents/tmp/desktop-product-audit/full-system-settings-000.png) / 5 | 2819 | Reached |
+| `/system/settings/onboarding` | [full-system-settings-onboarding*](../../.agents/tmp/desktop-product-audit/full-system-settings-onboarding-000.png) / 2 | 933 | Reached |
+
+Default-page proof totals71document tiles plus2Research collection-scroll tiles. Additional selected Research evidence has8document +2collection +20history-panel tiles. MSFT financial Facts7, Statements26, Ratios7 and Filings12 tiles total52. The [lower-sidebar supplement](../../.agents/tmp/desktop-product-audit/full-sidebar-lower-000.png) adds1tile: scroll234/234CSSpx,625px visible height,859px total height, all lower Connections/System destinations legible. Its body was still MSFT during pending Home navigation and is not Home route proof. These counts total156unique inspected tiles.
+
+Every captured tile was checked for alignment, wrapping, out-of-card content, spacing/type hierarchy, data/context legibility and chart visibility. Findings DP-15 and DP-16 record actual overflow; other captured text/tables/cards showed no additional clear containment defect at this width. Intentional horizontally scrollable financial/log regions are not classified as root overflow. Background chart/active-tab paint remains bounded as described above. Captured default pages are complete at their observed scroll extent; unavailable saved-result/account states, unopened reporting envelopes, all chart gestures and other widths are not represented by that claim.
+
+## Nested coverage and explicit limits
+
+| Surface | Proof and limit |
+|---|---|
+| Header command dialog, ticker lookup | Live MSFT yields Models & Forecasts navigation command; local typed investment search selects actual MSFT. DP-01. |
+| Selected stock price/history/profile | Live defaults visible; line chart axes/USD/OHLC/date input and candle control inspected. Pan/zoom, crosshair, all interval windows and original-bar expansion not fully exercised. |
+| Financial tabs/context/cursors | Live4sections and FilingsPage2→1; per-row context exists/source read. All four selected tabs were captured through their document scroll end; reporting-context disclosures were not individually expanded, and that available expanded envelope state remains unverified. |
+| Opportunities/saved Brief/chart/track record; Valuation | No saved analyses/screens in this workspace; source consumers inspected; no new analysis/discovery started. Full probabilities/ranges/harmonics/forecast/calibration unavailable-state handling remains source-only. |
+| Portfolio selected panels/import/preferences; Risk/account guidance |0accounts; selected positions/exposure/cash/risk/stress/attribution/planning calculations not exercised. Import stub proved in source. No preferences or paper account created. |
+| Paper drafts/session/orders/fills | Existing preparations/status rendered,0orders/fills. No draft preview/start/order/pause/stop/transaction issued. |
+| Advanced profiles/financial preferences | Active recommended profile and real controls rendered; no save/validation/activation/mutation. |
+| Research evidence, macro, preparation |14collections and25selected-history rows live; generic identity/value gaps recorded. Additional-information disclosure was opened and showed no matching history; further cursor pages, macro available-series/vintage plotting and prep/export/import mutations were not exercised. Current0/15macro is honest unavailability, not proof of missing macro implementation. |
+| Models/forecast preparation/bundle/outcomes; Backtest builder/result |0saved models/forecasts/activities/backtests and0eligible PIT histories; completed states require existing admissible data. No training/preparation or backtest initiated. Source charts/results exist; full available-state acceptance remains open. |
+| Operations durable jobs/detail | Existing failed/completed cards and sequence/state displayed. No cancel/retry/resume/confirm; exact cause of retained financial job failure remains lead evidence (UnsupportedTransform), not diagnosed from card alone. |
+| AI client connect/verify/repair |2client cards/service evidence; all registration/repair/revoke/rotation/external client actions excluded. Concurrent Desktop/CLI/MCP behavior not reverified here. |
+| Settings General/Onboarding setup/import/status |9settings,1workspace,25providers visible. One `Source.GetStatus` parser error is recorded in `system-settings-onboarding.json`; setup tab hides it. Provider-specific status/import tabs, credentials, native picker/OAuth, lock enable/unlock/Forget and workspace switching not exercised. Tracked as DP-14 with required recheck; no new unsupported global refresh. |
+| Updates, Backup, Logs, recovery | Development trust-channel limit,0backups and100logs rendered. No update/rollback/repair/uninstall/backup/restore/export/preflight issued; log filter/cursor interactions not independently exercised. Page error/disconnect/workspace/secure-storage recovery states are source-only; ordinary initial loading was observed, but no fault was injected and no auditor restart was performed. |
+| Accessibility/visual resizing | Per-screen visible labels/tables/headings/alerts and native1376×775CSS viewport (device-pixel ratio2) captured; Markets label defect confirmed. No formal assistive-tech traversal, AA contrast measurement or narrow-window/mobile visual acceptance. In particular,880px responsive acceptance remains unverified; no additional window resize was performed. Background snapshots carry the transient-paint caveat above. |
+
+The nineteen route surfaces are covered; successful completion of every data-dependent workflow is not claimed. No fabricated data, acquisition, persisted preference, credentials, saved selection or paper transaction was introduced by this audit. Navigation/tabs/filter/search/expansion changed only transient view state. No RAM/backend latency baseline, installer/platform matrix, release review or exact-head approval was run. No auditor-induced restart was performed; financial reads were verified on the lead-restarted service. Complete saved-analysis lifecycle/restart persistence remains unproved. The initial route timing helper flaw was corrected before the accepted sweep; onboarding shares a Settings heading and its first-content column is intentionally not interpreted as body-commit timing.
+
+## Dependency groups and finite resolution sequence
+
+All findings are **Open**. The lead should place remediation in the existing delivery ledger, preserving current quarter checkpoint identifiers and dependency ownership. No new delivery stage or acceptance target is created by this report.
+
+| Sequence/group | Findings | Existing scope and acceptance barrier |
+|---|---|---|
+|1. E/F — complete typed economic consumers and unblock ready choices | DP-07, DP-08, DP-09, DP-14 | Owner-test1–2,5–6; map actual producer support first, reconcile backend/native/strict schemas then render values/units/context. Financial prepare UnsupportedTransform stays with its existing lane. |
+|2. D — establish/import usable accounts and Overview composition | DP-04, DP-06 | Owner-test4–5; native file review → correct account revision → Portfolio performance/risk → bounded same-account Home summary. Read-only emptiness cannot close this barrier. |
+|3. F/A — financial discovery and one persistent search entry | DP-13, DP-01, DP-05 | Owner-test3,5–6; meaningful market universe/rank/filter/coverage and header ticker/object lookup; do not tie universe to owned holdings/watchlist. |
+|4. C — immediate reusable views and localized refresh | DP-03, DP-10, DP-12 | Owner-test5–6; reuse bounded display projections while reacquiring live/immutable authority correctly; preserve cancellation, unmount release, no fake progress/no layout jumps. |
+|5. B/A — semantic values and contained readable controls | DP-02, DP-11, DP-15, DP-16 | Owner-test5; signed/unavailable display matrix, noncolor cues, readable exact-detail values, benchmark containment and log-column wrapping; verify supported widths during remediation. |
+|6. Available-data and recovery acceptance | Explicit unverified matrix above | Complete owner-test2–7 journeys using admitted real data, installed persistence/shared clients/lifecycle, then lead schedules unchanged clean frozen-head review/performance. A screenshot of an empty state cannot close available-result behavior. |
+
+Optional benchmark enhancements, outside this audit's mandatory findings: extra technical indicators/drawings, chart-layout saving, multi-symbol synced workspaces and drag/drop panes. The required forecast/harmonic/action evidence already has an agreed product contract; optional tools cannot substitute for proving that contract. External product examples do not authorize new brokerage execution or competitor-wide parity.
+
+Refresh gate: if production consumers/contracts/theme or the running generation change, refresh affected findings and native evidence before closing them. Source was frozen by the lead during reporting, but this audit itself is diagnostic evidence rather than final acceptance.
+
+## Actual official product-image comparison
+
+Official [Fidelity Trader+ Web guide](https://www.fidelity.com/learning-center/trading-investing/trading-platforms/how-to-use-trader-plus-web) describes a selected symbol updating chart/quote/news together, bid/ask details, timeframe controls and indicator explanations. This supports coherent selected-investment context and purposeful chart tools. [Power E*TRADE](https://us.etrade.com/platforms/power-etrade) describes chart analysis, risk/reward views and virtual practice. [TradingView screener walkthrough](https://www.tradingview.com/support/solutions/43000718885-tradingview-screeners-walkthrough/) describes filters, sortable financial columns, chart/table views, currency and explicit refresh settings. These are UX reference points, not permission to add brokerage trading, every indicator, drag/drop workspaces or parity scope. Required defects must still tie to Market Squawk's approved contract; extra tools remain optional.
+
+The auditor opened and visually inspected all six lead-downloaded image assets in `.agents/tmp/desktop-competitor-reference/`. The [competitor manifest](../../.agents/tmp/desktop-competitor-reference/manifest.json) records official source page, exact asset URL, date and SHA256. These are genuine vendor demonstration screenshots on currently retrieved official pages, not authenticated sessions or verified current competitor software/performance. Fidelity examples show2025dates; ETrade examples contain2019/2021sample text. The comparison does not infer current data quality, latency, entitlement or trading capability.
+
+| Viewed official visual | What is visibly present | Market Squawk comparison / finite implication |
+|---|---|---|
+| [fidelity-dashboard.jpg](../../.agents/tmp/desktop-competitor-reference/fidelity-dashboard.jpg), [fidelity-chart.jpg](../../.agents/tmp/desktop-competitor-reference/fidelity-chart.jpg) — [Fidelity guide](https://www.fidelity.com/learning-center/trading-investing/trading-platforms/how-to-use-trader-plus-web) | Selected symbol quote/OHLC context above a large dated candlestick chart; positions/watchlist and news occupy distinct columns. Chart buttons and time windows have a compact hierarchy. | MSFT now has a real chart and separately dated quote, a useful foundation. Shared benchmark select overflows its narrow card (DP-15); its analytical layers cannot be visually assessed without saved evidence. The reference supports context coherence, not copied brokerage/news scope. |
+| [fidelity-positions.jpg](../../.agents/tmp/desktop-competitor-reference/fidelity-positions.jpg) — same official guide | Account selector/value/day gain and compact symbol/name/last/change rows; explicit signed green/red values and neutral zero. | Home's long watchlist rows correctly identify followed instruments but account summary is absent (DP-06). Financial change styling remains source-confirmed DP-02. Compact purposeful rows would make existing information easier to scan. |
+| [etrade-scans.jpg](../../.agents/tmp/desktop-competitor-reference/etrade-scans.jpg) — [Power E*TRADE](https://us.etrade.com/platforms/power-etrade) | Distinct Markets tab, scan-filter groups (price/volume/capitalization), sort direction/result count and a visible Extended Hours Big Movers table. | Current Markets supports known-name search and starter cards; tracked-universe movers/filter/sort are absent (DP-13). The reference visibly demonstrates the required task organization. |
+| [etrade-charts.png](../../.agents/tmp/desktop-competitor-reference/etrade-charts.png) — same official platform page | Dark chart workspace with quote fields, dated price axis, candle direction, visible chart controls and an analytical overlay. | Market Squawk's restrained near-black/cobalt shell and legible price line fit its approved design. Full evidence overlays belong to saved Brief, unverified here; no claim that another drawing tool is mandatory. |
+| [tradingview-screener.png](../../.agents/tmp/desktop-competitor-reference/tradingview-screener.png) — [official screener walkthrough](https://www.tradingview.com/support/solutions/43000718885-tradingview-screeners-walkthrough/) | Named filter chips and Overview/Performance/Valuation categories above aligned Symbol/Price/Change/Volume/valuation columns; units and signed changes are visible. | Market Squawk's Research generic collection/Observation names lose essential context (DP-07); Markets needs meaningful aligned financial comparisons (DP-13). A table hierarchy is more useful for these required comparisons than isolated price cards. |
+
+Subjective design judgment, based on the viewed images and actual native captures: Market Squawk has a consistent restrained palette, clear type hierarchy and explicit evidence/currentness language. Its available financial comparison content is less compact and less useful for scanning than these demonstrated references. A concrete example is [Filings tile011](../../.agents/tmp/desktop-product-audit/full-financial-filings-011.png):32records require12overlapping tiles across6507CSSpx, with roughly150px per filing repeating Form, Revision, Applies, Published and Known labels. A compact table of form/date/identity with grouped disclosure for retained context would improve the existing filing task. Research likewise repeats unavailable macro cards through several tiles. These are subjective usability recommendations, not additional missing-data findings or authorization for a new financial feature; retain all current evidence and exact dates. The evidence does **not** support saying the overall product currently looks better than these competitors. The target is the approved Obsidian financial composition with coherent compact financial content, stable controls and no clipping; an objective superiority score is not invented.

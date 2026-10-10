@@ -51,6 +51,13 @@ pub(super) fn canonical_record_bytes(
     put_fixed(&mut output, &manifest.schema().fingerprint())?;
     put_fixed(&mut output, &manifest.content_hash().bytes())?;
     put_evidence_digest(&mut output, record.evidence_digest)?;
+    match record.application() {
+        Some(application) => {
+            put_u8(&mut output, 1)?;
+            put_bytes(&mut output, &application.canonical_bytes()?)?;
+        }
+        None => put_u8(&mut output, 0)?,
+    }
     Ok(output)
 }
 
@@ -63,7 +70,7 @@ pub(super) fn content_hash(
     conflicts: &[AdjustmentConflict],
 ) -> Result<Sha256Digest, CorporateActionError> {
     let mut digest = Sha256::new();
-    digest.update(b"market-squawk.corporate-action-plan.v1\0");
+    digest.update(b"market-squawk.corporate-action-plan.v2\0");
     digest.update([policy_tag(policy)]);
     digest.update(policy.version().get().to_be_bytes());
     digest.update(knowledge_cutoff.unix_nanos().to_be_bytes());

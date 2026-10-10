@@ -1,0 +1,381 @@
+{
+  "as_of": "2026-10-01",
+  "batches": [
+    {
+      "category": "docs",
+      "id": "docs-batch-001",
+      "prompt_path": ".agents/tmp/research/market-squawk-embedded-market-data-storage-architecture/prompts/batches/docs/batch-001.md",
+      "report_path": ".agents/tmp/research/market-squawk-embedded-market-data-storage-architecture/reports/docs/batch-001.md",
+      "source_ids": [
+        "DOC-01",
+        "DOC-02",
+        "DOC-03"
+      ]
+    },
+    {
+      "category": "github",
+      "id": "github-batch-001",
+      "prompt_path": ".agents/tmp/research/market-squawk-embedded-market-data-storage-architecture/prompts/batches/github/batch-001.md",
+      "report_path": ".agents/tmp/research/market-squawk-embedded-market-data-storage-architecture/reports/github/batch-001.md",
+      "source_ids": [
+        "GH01",
+        "GH02",
+        "GH03",
+        "GH04"
+      ]
+    },
+    {
+      "category": "papers",
+      "id": "papers-batch-001",
+      "prompt_path": ".agents/tmp/research/market-squawk-embedded-market-data-storage-architecture/prompts/batches/papers/batch-001.md",
+      "report_path": ".agents/tmp/research/market-squawk-embedded-market-data-storage-architecture/reports/papers/batch-001.md",
+      "source_ids": [
+        "PAP-01",
+        "PAP-02",
+        "PAP-03"
+      ]
+    },
+    {
+      "category": "reputable-sources",
+      "id": "reputable-sources-batch-001",
+      "prompt_path": ".agents/tmp/research/market-squawk-embedded-market-data-storage-architecture/prompts/batches/reputable-sources/batch-001.md",
+      "report_path": ".agents/tmp/research/market-squawk-embedded-market-data-storage-architecture/reports/reputable-sources/batch-001.md",
+      "source_ids": [
+        "ENG-01",
+        "ENG-02",
+        "ENG-03",
+        "ENG-04"
+      ]
+    }
+  ],
+  "categories": [
+    "github",
+    "papers",
+    "docs",
+    "reputable-sources"
+  ],
+  "decision_context": "Use the research to support a technical decision.",
+  "sources": [
+    {
+      "assigned_batch": "docs-batch-001",
+      "category": "docs",
+      "credibility_signals": [
+        "SQLite-owned documentation",
+        "Direct transaction and checkpoint semantics"
+      ],
+      "freshness_signals": [
+        "Accessed 2026-10-01",
+        "Transaction page updated 2026-02-18",
+        "WAL page includes dated 2026 fixes; moving unversioned page"
+      ],
+      "id": "DOC-01",
+      "notes": "Discovery only. Lead reports bundled SQLite3.53.2, WAL, synchronousFULL, wal_autocheckpoint1000 and independent read connections. This is newer than the documented WAL-reset fix3.51.3; no upgrade need established. Application locks and metadata design require separate analysis. No throughput claim.",
+      "priority": "high",
+      "selection_rationale": "Establish concurrent reader/single-writer ownership, durable ingestion and checkpoint lifecycle for the existing catalog and potential indexed hot history.",
+      "source_type": "official_documentation",
+      "status": "assigned",
+      "title": "SQLite WAL and transaction documentation",
+      "url": "https://www.sqlite.org/wal.html"
+    },
+    {
+      "assigned_batch": "docs-batch-001",
+      "category": "docs",
+      "credibility_signals": [
+        "DuckDB Foundation documentation",
+        "Explicit process/thread ownership and storage compatibility"
+      ],
+      "freshness_signals": [
+        "Accessed 2026-10-01",
+        "Opened page selector identifies 1.5 current and 1.4 LTS",
+        "Stable URLs redirect to moving current pages; beta/future statements require version verification"
+      ],
+      "id": "DOC-02",
+      "notes": "Discovery only. No DuckDB adoption recommendation; lead reports no existing DuckDB dependency. Storage compression, row groups, footprint, partition writes and Parquet tips await batch reading.",
+      "priority": "high",
+      "selection_rationale": "Compare an embedded analytical database and direct multi-file Parquet scans against the shared-service model and the existing DataFusion engine.",
+      "source_type": "official_documentation",
+      "status": "assigned",
+      "title": "DuckDB concurrency, native storage and Parquet documentation",
+      "url": "https://duckdb.org/docs/current/connect/concurrency"
+    },
+    {
+      "assigned_batch": "docs-batch-001",
+      "category": "docs",
+      "credibility_signals": [
+        "Apache project-owned documentation",
+        "Direct Rust/Arrow engine capability and Parquet file-format specification"
+      ],
+      "freshness_signals": [
+        "Accessed 2026-10-01",
+        "Live DataFusion configuration identifies 55.1.0, newer than lead-reported local 54",
+        "Parquet File Format updated 2024-07-07; Concepts updated 2024-03-08"
+      ],
+      "id": "DOC-03",
+      "notes": "Discovery only. Lead reports DataFusion54/Arrow-Parquet58.3 and a streaming writer disabling compression/dictionary/statistics; persist local evidence and verify settings against locked versions before applying current docs. Pruning benefits depend on actual file statistics.",
+      "priority": "high",
+      "selection_rationale": "Test reuse of the installed analytical engine before adding another runtime, and establish the file/row-group structure underlying bounded immutable partitions.",
+      "source_type": "official_documentation_and_specification",
+      "status": "assigned",
+      "title": "Apache DataFusion and Apache Parquet documentation",
+      "url": "https://datafusion.apache.org/"
+    },
+    {
+      "assigned_batch": "github-batch-001",
+      "category": "github",
+      "credibility_signals": [
+        "README documents bundled SQLite, examples, tests and MIT license.",
+        "GitHub license metadata MIT; not archived or disabled"
+      ],
+      "freshness_signals": [
+        "API pushed_at=2026-09-25T11:09:39Z",
+        "Latest eligible stable GitHub release v0.40.2 published 2026-08-08T14:20:24Z"
+      ],
+      "id": "GH01",
+      "notes": "",
+      "priority": "high",
+      "selection_rationale": "Inference: Existing SQLite integration; investigate transactional indexed hot storage and WAL connection ownership.",
+      "source_type": "github_repository",
+      "status": "assigned",
+      "title": "rusqlite/rusqlite",
+      "url": "https://github.com/rusqlite/rusqlite"
+    },
+    {
+      "assigned_batch": "github-batch-001",
+      "category": "github",
+      "credibility_signals": [
+        "Apache-governed Rust query engine; repository documents streaming vectorized execution and partitioned sources.",
+        "GitHub license metadata Apache-2.0; not archived or disabled"
+      ],
+      "freshness_signals": [
+        "API pushed_at=2026-10-01T05:57:06Z",
+        "GitHub releases endpoint returned no entries; push activity is the maintenance signal, not a fabricated release date."
+      ],
+      "id": "GH02",
+      "notes": "",
+      "priority": "high",
+      "selection_rationale": "Inference: Existing Rust/Arrow/Parquet query engine; test managed partitions and pruning before introducing another analytical runtime.",
+      "source_type": "github_repository",
+      "status": "assigned",
+      "title": "apache/datafusion",
+      "url": "https://github.com/apache/datafusion"
+    },
+    {
+      "assigned_batch": "github-batch-001",
+      "category": "github",
+      "credibility_signals": [
+        "Primary DuckDB engine repository; in-process analytical SQL, tests and release links.",
+        "GitHub license metadata MIT; not archived or disabled"
+      ],
+      "freshness_signals": [
+        "API pushed_at=2026-09-30T18:04:43Z",
+        "Latest eligible stable GitHub release v1.5.6 published 2026-09-28T13:35:11Z"
+      ],
+      "id": "GH03",
+      "notes": "",
+      "priority": "high",
+      "selection_rationale": "Inference: Embedded analytical SQL database alternative or conditional complement for Parquet scans, historical tables and aggregates.",
+      "source_type": "github_repository",
+      "status": "assigned",
+      "title": "duckdb/duckdb",
+      "url": "https://github.com/duckdb/duckdb"
+    },
+    {
+      "assigned_batch": "github-batch-001",
+      "category": "github",
+      "credibility_signals": [
+        "Bindings maintained under duckdb organization; appender/Arrow/Parquet examples, CI and MIT license.",
+        "GitHub license metadata MIT; not archived or disabled"
+      ],
+      "freshness_signals": [
+        "API pushed_at=2026-09-30T15:35:11Z",
+        "Latest eligible stable GitHub release v1.10506.0 published 2026-09-30T13:24:36Z"
+      ],
+      "id": "GH04",
+      "notes": "",
+      "priority": "high",
+      "selection_rationale": "Inference: Actual Rust integration, Arrow conversion, appender ingestion and packaging costs for the DuckDB alternative.",
+      "source_type": "github_repository",
+      "status": "assigned",
+      "title": "duckdb/duckdb-rs",
+      "url": "https://github.com/duckdb/duckdb-rs"
+    },
+    {
+      "assigned_batch": "papers-batch-001",
+      "category": "papers",
+      "credibility_signals": [
+        "SIGMOD 2019",
+        "Official project full text",
+        "CWI system authors"
+      ],
+      "freshness_signals": [
+        "Published 2019-06-30; historical architecture",
+        "Accessed 2026-10-01; not current release documentation"
+      ],
+      "id": "PAP-01",
+      "notes": {
+        "authors": [
+          "Mark Raasveldt",
+          "Hannes M\u00fchleisen"
+        ],
+        "limitations": "Historical demo; buffer manager and storage completion were future work. No current semantics or workload guarantee.",
+        "method": "Architecture exposition and proposed interactive TPC-H demonstration.",
+        "publication_date": "2019-06-30",
+        "review_depth": "Discovery; actual PDF opened; full batch awaits assignment."
+      },
+      "priority": "high",
+      "selection_rationale": "Embedded analytical execution and concurrent ingestion/visualization fit the application decision.",
+      "source_type": "primary_conference_demonstration_paper",
+      "status": "assigned",
+      "title": "DuckDB: an Embeddable Analytical Database",
+      "url": "https://duckdb.org/pdf/SIGMOD2019-demo-duckdb.pdf"
+    },
+    {
+      "assigned_batch": "papers-batch-001",
+      "category": "papers",
+      "credibility_signals": [
+        "SIGMOD 2008",
+        "Author-hosted full text",
+        "C-Store experiment figures received repeatability assessment"
+      ],
+      "freshness_signals": [
+        "Published June 2008; foundational experiment",
+        "Accessed 2026-10-01; historical products and hardware"
+      ],
+      "id": "PAP-02",
+      "notes": {
+        "authors": [
+          "Daniel J. Abadi",
+          "Samuel R. Madden",
+          "Nabil Hachem"
+        ],
+        "limitations": "Prototype and commercial-system artifacts; warehouse workload, not current SQLite/DuckDB comparison.",
+        "method": "Star Schema Benchmark and C-Store optimization removal.",
+        "publication_date": "2008-06",
+        "review_depth": "Discovery; actual PDF opened; full batch awaits assignment."
+      },
+      "priority": "high",
+      "selection_rationale": "Separates column layout from execution optimizations relevant to analytical scan design.",
+      "source_type": "primary_conference_research_paper",
+      "status": "assigned",
+      "title": "Column-Stores vs. Row-Stores: How Different Are They Really?",
+      "url": "https://www.cs.umd.edu/~abadi/papers/abadi-sigmod08.pdf"
+    },
+    {
+      "assigned_batch": "papers-batch-001",
+      "category": "papers",
+      "credibility_signals": [
+        "EDBT 2016 official proceedings",
+        "Harvard, IBM Research, EPFL and Facebook authors"
+      ],
+      "freshness_signals": [
+        "Published March 2016; conceptual framework",
+        "Accessed 2026-10-01; publication date verified inside PDF"
+      ],
+      "id": "PAP-03",
+      "notes": {
+        "authors": [
+          "Manos Athanassoulis",
+          "Michael S. Kester",
+          "Lukas M. Maas",
+          "Radu Stoica",
+          "Stratos Idreos",
+          "Anastasia Ailamaki",
+          "Mark Callaghan"
+        ],
+        "limitations": "Conjecture, not universal proof or implementation benchmark; simplified hierarchy.",
+        "method": "Simplified access-cost models and existing-structure examples.",
+        "publication_date": "2016-03",
+        "review_depth": "Discovery; official PDF opened after Harvard duplicate timeout; full batch awaits assignment."
+      },
+      "priority": "high",
+      "selection_rationale": "Read/write/space amplification framework makes B-tree and LSM tradeoffs explicit.",
+      "source_type": "primary_conference_visionary_paper",
+      "status": "assigned",
+      "title": "Designing Access Methods: The RUM Conjecture",
+      "url": "https://www.openproceedings.org/2016/conf/edbt/paper-12.pdf"
+    },
+    {
+      "assigned_batch": "reputable-sources-batch-001",
+      "category": "reputable-sources",
+      "credibility_signals": [
+        "Named authors Mark Raasveldt and Hannes Muhleisen",
+        "Engine publisher explains implementation and crash experiments"
+      ],
+      "freshness_signals": [
+        "Published 2024-10-30",
+        "Accessed 2026-10-01",
+        "Historical defaults require current-documentation refresh"
+      ],
+      "id": "ENG-01",
+      "notes": "",
+      "priority": "high",
+      "selection_rationale": "Embedded analytical MVCC, commit durability and bulk-write amplification",
+      "source_type": "primary engineering account",
+      "status": "assigned",
+      "title": "Analytics-Optimized Concurrent Transactions",
+      "url": "https://duckdb.org/2024/10/30/analytics-optimized-concurrent-transactions"
+    },
+    {
+      "assigned_batch": "reputable-sources-batch-001",
+      "category": "reputable-sources",
+      "credibility_signals": [
+        "Named author Guillermo Sanchez on engine publisher site",
+        "Worked SQL and linked implementation pipelines"
+      ],
+      "freshness_signals": [
+        "Published 2025-10-13",
+        "Accessed 2026-10-01"
+      ],
+      "id": "ENG-02",
+      "notes": "",
+      "priority": "high",
+      "selection_rationale": "Incremental analytics and database-backed small writes with separately owned Parquet flushing",
+      "source_type": "primary engineering implementation account",
+      "status": "assigned",
+      "title": "Streaming Patterns with DuckDB",
+      "url": "https://duckdb.org/2025/10/13/duckdb-streaming-patterns"
+    },
+    {
+      "assigned_batch": "reputable-sources-batch-001",
+      "category": "reputable-sources",
+      "credibility_signals": [
+        "Named authors Tom Schreiber and Tony Bonuccelli",
+        "Publisher account with buffer mechanics and reproducible application"
+      ],
+      "freshness_signals": [
+        "Published 2023-08-01",
+        "Later 24.2 amendment visible",
+        "Accessed 2026-10-01"
+      ],
+      "id": "ENG-03",
+      "notes": "",
+      "priority": "high",
+      "selection_rationale": "Buffer acknowledgement versus durable flush, error handling, small-part write amplification; comparison only",
+      "source_type": "primary engineering experiment",
+      "status": "assigned",
+      "title": "Asynchronous Data Inserts in ClickHouse",
+      "url": "https://clickhouse.com/blog/asynchronous-data-inserts-in-clickhouse"
+    },
+    {
+      "assigned_batch": "reputable-sources-batch-001",
+      "category": "reputable-sources",
+      "credibility_signals": [
+        "Named author Manveer Chawla on engine publisher engineering site",
+        "Links engine settings and distinguishes physical rewrite from query correctness"
+      ],
+      "freshness_signals": [
+        "Last updated 2026-06-15",
+        "Accessed 2026-10-01"
+      ],
+      "id": "ENG-04",
+      "notes": "",
+      "priority": "high",
+      "selection_rationale": "Bounded partition compaction versus forced single-part rewrites; direct relevance to current whole-generation compactor",
+      "source_type": "primary engineering operational account",
+      "status": "assigned",
+      "title": "OPTIMIZE TABLE ... FINAL in ClickHouse: when to use it, when to avoid it, and how merges work",
+      "url": "https://clickhouse.com/resources/engineering/clickhouse-optimize-table-final"
+    }
+  ],
+  "topic": "Market Squawk embedded market-data storage architecture"
+}

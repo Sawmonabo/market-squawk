@@ -5,11 +5,19 @@ use std::num::NonZeroU64;
 
 use market_squawk_analytics::{FeatureInputSchemaDigest, FeatureKey, FeatureSemanticDigest};
 use market_squawk_data::{
-    CatalogEndpointIdentity, ComponentKind, DatasetBuildSpecDigest, DatasetManifestRef,
-    FeatureLabelComponentSpec, Sha256Digest, UniverseId,
+    CatalogEndpointIdentity, ChronologicalSplitPolicy, ComponentKind, DatasetBuildSpecDigest,
+    DatasetManifestRef, DatasetStudyPolicy, FeatureLabelComponentSpec, Sha256Digest, UniverseId,
 };
-use market_squawk_domain::{ModelId, Timestamp};
+use market_squawk_domain::{CalendarDate, ModelId, ResearchTemporalCoordinate, Timestamp};
 use thiserror::Error;
+
+use crate::{
+    CalibrationBand, CalibrationCoverageEvaluation, CalibrationMethod, CalibrationWindow,
+    ForecastOutputBinding,
+};
+
+mod study;
+pub(crate) use study::{TrainingPeriodWire, TrainingSplitWire, TrainingStudyWire, study_matches};
 
 /// Maximum features consumed by one native model.
 pub const MAX_MODEL_FEATURES: usize = 1_024;
@@ -17,6 +25,110 @@ pub const MAX_MODEL_FEATURES: usize = 1_024;
 pub const MAX_BUNDLE_ID_BYTES: usize = 128;
 /// Maximum bytes in a training-code revision.
 pub const MAX_TRAINING_CODE_REVISION_BYTES: usize = 128;
+
+/// Immutable admitted calibration members and decoded interval policy.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ForecastCalibrationArtifacts {
+    method: CalibrationMethod,
+    window: CalibrationWindow,
+    policy_hash: Sha256Digest,
+    policy_size_bytes: u64,
+    residuals_hash: Sha256Digest,
+    residuals_size_bytes: u64,
+    bands: [CalibrationBand; 3],
+    coverage_evaluation: Option<CalibrationCoverageEvaluation>,
+    dependence_assumptions: Box<str>,
+}
+
+impl ForecastCalibrationArtifacts {
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "decoded policy and both immutable bundle members remain explicit"
+    )]
+    pub(crate) fn new(
+        method: CalibrationMethod,
+        window: CalibrationWindow,
+        policy_hash: Sha256Digest,
+        policy_size_bytes: u64,
+        residuals_hash: Sha256Digest,
+        residuals_size_bytes: u64,
+        bands: [CalibrationBand; 3],
+        coverage_evaluation: Option<CalibrationCoverageEvaluation>,
+        dependence_assumptions: String,
+    ) -> Self {
+        Self {
+            method,
+            window,
+            policy_hash,
+            policy_size_bytes,
+            residuals_hash,
+            residuals_size_bytes,
+            bands,
+            coverage_evaluation,
+            dependence_assumptions: dependence_assumptions.into_boxed_str(),
+        }
+    }
+
+    /// Closed admitted interval method.
+    #[must_use]
+    pub const fn method(&self) -> CalibrationMethod {
+        self.method
+    }
+
+    /// Exact decoded calibration window.
+    #[must_use]
+    pub const fn window(&self) -> CalibrationWindow {
+        self.window
+    }
+
+    /// Exact interval-policy member digest.
+    #[must_use]
+    pub const fn policy_hash(&self) -> Sha256Digest {
+        self.policy_hash
+    }
+
+    /// Exact interval-policy member size.
+    #[must_use]
+    pub const fn policy_size_bytes(&self) -> u64 {
+        self.policy_size_bytes
+    }
+
+    /// Exact retained-residual member digest.
+    #[must_use]
+    pub const fn residuals_hash(&self) -> Sha256Digest {
+        self.residuals_hash
+    }
+
+    /// Exact retained-residual member size.
+    #[must_use]
+    pub const fn residuals_size_bytes(&self) -> u64 {
+        self.residuals_size_bytes
+    }
+
+    /// Ordered decoded 50/80/95 policy bands.
+    #[must_use]
+    pub const fn bands(&self) -> &[CalibrationBand; 3] {
+        &self.bands
+    }
+
+    /// Returns untouched coverage only after the actual evaluation window ends.
+    #[must_use]
+    pub fn coverage_evaluation(&self, as_of: Timestamp) -> Option<&CalibrationCoverageEvaluation> {
+        self.coverage_evaluation
+            .as_ref()
+            .filter(|evaluation| evaluation.window().ends_by(as_of))
+    }
+
+    /// Bounded dependence and coverage interpretation.
+    #[must_use]
+    pub fn dependence_assumptions(&self) -> &str {
+        &self.dependence_assumptions
+    }
+
+    fn retained_bytes(&self) -> usize {
+        size_of::<Self>().saturating_add(self.dependence_assumptions.len())
+    }
+}
 
 /// Stable model-bundle series identity; a version selects one immutable generation.
 #[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
@@ -154,6 +266,9 @@ pub struct TrainingDatasetIdentity {
     selection_digest: Sha256Digest,
     selection_as_of: Timestamp,
     selected_component_rows: NonZeroU64,
+    split_policy: ChronologicalSplitPolicy,
+    study_policy: Option<DatasetStudyPolicy>,
+    source_snapshot_digest: Option<Sha256Digest>,
 }
 
 impl TrainingDatasetIdentity {
@@ -176,12 +291,18 @@ impl TrainingDatasetIdentity {
         selection_digest: Sha256Digest,
         selection_as_of: Timestamp,
         selected_component_rows: NonZeroU64,
+        split_policy: ChronologicalSplitPolicy,
+        study_policy: Option<DatasetStudyPolicy>,
+        source_snapshot_digest: Option<Sha256Digest>,
     ) -> Result<Self, ModelMetadataError> {
         if manifest.content_hash().bytes() == [0; 32]
             || universe_digest.bytes() == [0; 32]
             || policy_digest.bytes() == [0; 32]
             || export_digest.bytes() == [0; 32]
             || selection_digest.bytes() == [0; 32]
+            || study_policy.is_some() != source_snapshot_digest.is_some()
+            || source_snapshot_digest.is_some_and(|digest| digest.bytes() == [0; 32])
+            || study_policy.is_some_and(|policy| policy.snapshot_as_of() > selection_as_of)
         {
             return Err(ModelMetadataError::ReservedDigest);
         }
@@ -195,6 +316,9 @@ impl TrainingDatasetIdentity {
             selection_digest,
             selection_as_of,
             selected_component_rows,
+            split_policy,
+            study_policy,
+            source_snapshot_digest,
         })
     }
 
@@ -252,6 +376,24 @@ impl TrainingDatasetIdentity {
         self.selected_component_rows
     }
 
+    /// Native-revalidated partition boundaries in the declared study basis.
+    #[must_use]
+    pub const fn split_policy(&self) -> ChronologicalSplitPolicy {
+        self.split_policy
+    }
+
+    /// Exact admitted source-clock qualification, absent only for generic data.
+    #[must_use]
+    pub const fn study_policy(&self) -> Option<&DatasetStudyPolicy> {
+        self.study_policy.as_ref()
+    }
+
+    /// Exact retained parent generations and actual source snapshot cutoff.
+    #[must_use]
+    pub const fn source_snapshot_digest(&self) -> Option<Sha256Digest> {
+        self.source_snapshot_digest
+    }
+
     pub(crate) fn retained_bytes(&self) -> Option<usize> {
         size_of::<Self>()
             .checked_add(self.manifest.dataset_id().as_str().len())?
@@ -259,11 +401,16 @@ impl TrainingDatasetIdentity {
     }
 }
 
-/// Closed-open training observation interval represented by exact UTC nanoseconds.
+/// Closed-open training observation interval retaining its original temporal precision.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TrainingPeriod {
-    start: Timestamp,
-    end: Timestamp,
+    bounds: TrainingPeriodBounds,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TrainingPeriodBounds {
+    ExactTime(Timestamp, Timestamp),
+    FiscalDates(CalendarDate, CalendarDate),
 }
 
 impl TrainingPeriod {
@@ -276,23 +423,90 @@ impl TrainingPeriod {
         if end <= start {
             return Err(ModelMetadataError::InvalidTrainingPeriod);
         }
-        Ok(Self { start, end })
+        Ok(Self {
+            bounds: TrainingPeriodBounds::ExactTime(start, end),
+        })
+    }
+
+    /// Constructs a native fiscal date interval without assigning a time of day.
+    pub fn try_fiscal(start: CalendarDate, end: CalendarDate) -> Result<Self, ModelMetadataError> {
+        if end <= start {
+            return Err(ModelMetadataError::InvalidTrainingPeriod);
+        }
+        Ok(Self {
+            bounds: TrainingPeriodBounds::FiscalDates(start, end),
+        })
     }
 
     /// Returns the inclusive training start.
     #[must_use]
-    pub const fn start(self) -> Timestamp {
-        self.start
+    pub const fn start(self) -> Option<Timestamp> {
+        match self.bounds {
+            TrainingPeriodBounds::ExactTime(start, _) => Some(start),
+            _ => None,
+        }
     }
 
     /// Returns the exclusive training end.
     #[must_use]
-    pub const fn end(self) -> Timestamp {
-        self.end
+    pub const fn end(self) -> Option<Timestamp> {
+        match self.bounds {
+            TrainingPeriodBounds::ExactTime(_, end) => Some(end),
+            _ => None,
+        }
+    }
+
+    /// Original calendar-date bounds only for a native fiscal interval.
+    pub const fn fiscal_bounds(self) -> Option<[CalendarDate; 2]> {
+        match self.bounds {
+            TrainingPeriodBounds::FiscalDates(start, end) => Some([start, end]),
+            _ => None,
+        }
+    }
+
+    /// Inclusive start with its source precision.
+    pub fn start_coordinate(self) -> ResearchTemporalCoordinate {
+        match self.bounds {
+            TrainingPeriodBounds::ExactTime(start, _) => ResearchTemporalCoordinate::exact(start),
+            TrainingPeriodBounds::FiscalDates(start, _) => {
+                ResearchTemporalCoordinate::calendar_date(start)
+            }
+        }
+    }
+
+    /// Exclusive end with its source precision.
+    pub fn end_coordinate(self) -> ResearchTemporalCoordinate {
+        match self.bounds {
+            TrainingPeriodBounds::ExactTime(_, end) => ResearchTemporalCoordinate::exact(end),
+            TrainingPeriodBounds::FiscalDates(_, end) => {
+                ResearchTemporalCoordinate::calendar_date(end)
+            }
+        }
+    }
+
+    /// Whether the interval has ended by an actual clock instant.
+    pub fn ends_by(self, as_of: Timestamp) -> bool {
+        match self.bounds {
+            TrainingPeriodBounds::ExactTime(_, end) => end <= as_of,
+            TrainingPeriodBounds::FiscalDates(_, end) => {
+                as_of.utc_calendar_date().is_ok_and(|date| end <= date)
+            }
+        }
+    }
+
+    /// Compares retained precision; an actual instant may be projected to its real UTC date.
+    pub fn ends_before_coordinate(self, cutoff: &ResearchTemporalCoordinate) -> bool {
+        if let Some(timestamp) = cutoff.exact_timestamp() {
+            return self.ends_by(timestamp);
+        }
+        match (self.fiscal_bounds(), cutoff.calendar_date_value()) {
+            (Some([_, end]), Some(date)) => end <= date,
+            _ => false,
+        }
     }
 }
 
-/// Trusted, caller-supplied relationships against which untrusted bundle bytes are admitted.
+/// Admission-owned relationships against which untrusted bundle bytes are admitted.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BundleExpectations {
     model_id: ModelId,
@@ -307,20 +521,15 @@ pub struct BundleExpectations {
     bundle_metadata_hash: Sha256Digest,
     artifact_hash: Sha256Digest,
     training_run_hash: Sha256Digest,
-    output_semantics: Option<ModelOutputSemantics>,
+    output_binding: ForecastOutputBinding,
 }
 
 impl BundleExpectations {
-    /// Constructs complete independent admission expectations.
-    ///
-    /// # Errors
-    ///
-    /// Rejects a non-label component or invalid code revision.
     #[allow(
         clippy::too_many_arguments,
         reason = "independent reproducibility identities remain explicit"
     )]
-    pub fn try_new(
+    pub(crate) fn try_new_with_output_binding(
         model_id: ModelId,
         bundle_id: BundleId,
         bundle_version: NonZeroU64,
@@ -333,79 +542,7 @@ impl BundleExpectations {
         bundle_metadata_hash: Sha256Digest,
         artifact_hash: Sha256Digest,
         training_run_hash: Sha256Digest,
-    ) -> Result<Self, ModelMetadataError> {
-        Self::try_new_internal(
-            model_id,
-            bundle_id,
-            bundle_version,
-            dataset,
-            universe_id,
-            training_period,
-            label,
-            training_code_revision,
-            training_environment_hash,
-            bundle_metadata_hash,
-            artifact_hash,
-            training_run_hash,
-            None,
-        )
-    }
-
-    /// Constructs expectations that independently bind the model output interpretation.
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "independent reproducibility identities remain explicit"
-    )]
-    pub fn try_new_with_output_semantics(
-        model_id: ModelId,
-        bundle_id: BundleId,
-        bundle_version: NonZeroU64,
-        dataset: TrainingDatasetIdentity,
-        universe_id: UniverseId,
-        training_period: TrainingPeriod,
-        label: FeatureLabelComponentSpec,
-        training_code_revision: impl AsRef<str>,
-        training_environment_hash: Sha256Digest,
-        bundle_metadata_hash: Sha256Digest,
-        artifact_hash: Sha256Digest,
-        training_run_hash: Sha256Digest,
-        output_semantics: ModelOutputSemantics,
-    ) -> Result<Self, ModelMetadataError> {
-        Self::try_new_internal(
-            model_id,
-            bundle_id,
-            bundle_version,
-            dataset,
-            universe_id,
-            training_period,
-            label,
-            training_code_revision,
-            training_environment_hash,
-            bundle_metadata_hash,
-            artifact_hash,
-            training_run_hash,
-            Some(output_semantics),
-        )
-    }
-
-    #[allow(
-        clippy::too_many_arguments,
-        reason = "independent reproducibility identities remain explicit"
-    )]
-    fn try_new_internal(
-        model_id: ModelId,
-        bundle_id: BundleId,
-        bundle_version: NonZeroU64,
-        dataset: TrainingDatasetIdentity,
-        universe_id: UniverseId,
-        training_period: TrainingPeriod,
-        label: FeatureLabelComponentSpec,
-        training_code_revision: impl AsRef<str>,
-        training_environment_hash: Sha256Digest,
-        bundle_metadata_hash: Sha256Digest,
-        artifact_hash: Sha256Digest,
-        training_run_hash: Sha256Digest,
-        output_semantics: Option<ModelOutputSemantics>,
+        output_binding: ForecastOutputBinding,
     ) -> Result<Self, ModelMetadataError> {
         let training_code_revision = training_code_revision.as_ref();
         if label.kind() != ComponentKind::Label
@@ -414,6 +551,7 @@ impl BundleExpectations {
             || bundle_metadata_hash.bytes() == [0; 32]
             || artifact_hash.bytes() == [0; 32]
             || training_run_hash.bytes() == [0; 32]
+            || output_binding.label() != &label
         {
             return Err(ModelMetadataError::InvalidExpectations);
         }
@@ -430,7 +568,7 @@ impl BundleExpectations {
             bundle_metadata_hash,
             artifact_hash,
             training_run_hash,
-            output_semantics,
+            output_binding,
         })
     }
 
@@ -506,10 +644,16 @@ impl BundleExpectations {
         self.training_run_hash
     }
 
-    /// Returns the independently approved output interpretation when the authority schema binds it.
+    /// Returns the independently admitted output interpretation.
     #[must_use]
-    pub const fn output_semantics(&self) -> Option<ModelOutputSemantics> {
-        self.output_semantics
+    pub const fn output_semantics(&self) -> ModelOutputSemantics {
+        self.output_binding.output_semantics()
+    }
+
+    /// Returns the model-admission-owned output measurement binding.
+    #[must_use]
+    pub const fn output_binding(&self) -> &ForecastOutputBinding {
+        &self.output_binding
     }
 }
 
@@ -596,10 +740,11 @@ pub struct ModelMetadata {
     metadata_hash: Sha256Digest,
     artifact_hash: Sha256Digest,
     training_run_hash: Sha256Digest,
+    forecast_calibration: Option<ForecastCalibrationArtifacts>,
+    probability_calibration: Option<crate::ProbabilityCalibrationArtifacts>,
     format: ModelFormat,
     format_version: u32,
-    output_semantics: ModelOutputSemantics,
-    output_semantics_bound: bool,
+    output_binding: ForecastOutputBinding,
     features: Box<[ModelFeatureBinding]>,
     feature_semantic_digests: Box<[FeatureSemanticDigest]>,
     dataset: TrainingDatasetIdentity,
@@ -626,8 +771,6 @@ impl ModelMetadata {
         artifact_hash: Sha256Digest,
         format: ModelFormat,
         format_version: u32,
-        output_semantics: ModelOutputSemantics,
-        output_semantics_bound: bool,
         features: Vec<ModelFeatureBinding>,
         validation_metrics: Vec<ValidationMetric>,
         decision_thresholds: DecisionThresholds,
@@ -647,10 +790,11 @@ impl ModelMetadata {
             metadata_hash,
             artifact_hash,
             training_run_hash: expectations.training_run_hash,
+            forecast_calibration: None,
+            probability_calibration: None,
             format,
             format_version,
-            output_semantics,
-            output_semantics_bound,
+            output_binding: expectations.output_binding.clone(),
             features: features.into_boxed_slice(),
             feature_semantic_digests,
             dataset: expectations.dataset.clone(),
@@ -669,6 +813,27 @@ impl ModelMetadata {
                 .into_boxed_slice(),
             fallback_reason: fallback_reason.into_boxed_str(),
         }
+    }
+
+    pub(crate) fn with_forecast_calibration(
+        mut self,
+        calibration: Option<ForecastCalibrationArtifacts>,
+    ) -> Self {
+        self.forecast_calibration = calibration;
+        self
+    }
+
+    pub(crate) fn with_probability_calibration(
+        mut self,
+        calibration: Option<crate::ProbabilityCalibrationArtifacts>,
+    ) -> Self {
+        self.probability_calibration = calibration;
+        self
+    }
+
+    /// Original held-out binary calibration and untouched evaluation evidence.
+    pub const fn probability_calibration(&self) -> Option<&crate::ProbabilityCalibrationArtifacts> {
+        self.probability_calibration.as_ref()
     }
 
     /// Returns the stable model identity.
@@ -707,6 +872,12 @@ impl ModelMetadata {
         self.training_run_hash
     }
 
+    /// First-class admitted calibration members, absent on non-forecast bundles.
+    #[must_use]
+    pub const fn forecast_calibration(&self) -> Option<&ForecastCalibrationArtifacts> {
+        self.forecast_calibration.as_ref()
+    }
+
     /// Returns the closed native format.
     #[must_use]
     pub const fn format(&self) -> ModelFormat {
@@ -722,12 +893,19 @@ impl ModelMetadata {
     /// Returns the authority-bound interpretation of the single model output.
     #[must_use]
     pub const fn output_semantics(&self) -> ModelOutputSemantics {
-        self.output_semantics
+        self.output_binding.output_semantics()
+    }
+
+    /// Returns the admitted output measurement and exact label identity.
+    ///
+    #[must_use]
+    pub const fn output_binding(&self) -> &ForecastOutputBinding {
+        &self.output_binding
     }
 
     #[cfg(feature = "onnx-tract")]
     pub(crate) const fn output_semantics_bound(&self) -> bool {
-        self.output_semantics_bound
+        true
     }
 
     /// Returns coefficient-ordered Task 12 feature bindings.
@@ -814,6 +992,7 @@ impl ModelMetadata {
             .checked_add(self.dataset.retained_bytes()?)?
             .checked_add(self.universe_id.as_str().len())?
             .checked_add(self.label.name().len())?
+            .checked_add(self.output_binding.label().name().len())?
             .checked_add(self.training_code_revision.len())?
             .checked_add(self.intended_use.len())?
             .checked_add(self.fallback_reason.len())?
@@ -828,6 +1007,9 @@ impl ModelMetadata {
         }
         for limitation in &self.limitations {
             retained = retained.checked_add(limitation.len())?;
+        }
+        if let Some(calibration) = &self.forecast_calibration {
+            retained = retained.checked_add(calibration.retained_bytes())?;
         }
         Some(retained)
     }

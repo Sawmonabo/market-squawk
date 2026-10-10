@@ -7,6 +7,7 @@
 mod accounting;
 mod analytics_evidence;
 mod attribution;
+mod entitlement;
 mod evidence;
 mod exposure;
 mod ledger;
@@ -29,6 +30,7 @@ use thiserror::Error;
 
 pub use analytics_evidence::{AnalyticsPolicyBinding, PortfolioAnalyticsEvidence};
 pub use attribution::{AttributionInput, AttributionLine, AttributionReport};
+pub use entitlement::CashEntitlement;
 pub use evidence::{
     BasisMeasurement, CashBalance, CorporateActionBinding, FeatureBinding, FxRateEvidence,
     PortfolioRevision, PortfolioRevisionId, PortfolioRevisionToken, Position, PriceEvidence,
@@ -41,8 +43,8 @@ pub use performance::{
     CashFlowTiming, MoneyWeightedMethod, PerformancePeriod, PerformancePolicy, PerformanceReport,
 };
 pub use rebalance::{
-    ProposedTrade, RebalanceConstraintInput, RebalanceConstraints, RebalanceProposal,
-    RebalanceTarget,
+    ProposedTrade, RebalanceCalculation, RebalanceConstraintInput, RebalanceConstraints,
+    RebalanceProposal, RebalanceTarget,
 };
 pub use reconcile::{
     ReconciliationDiscrepancy, ReconciliationField, ReconciliationTolerance, SourcePortfolioTotals,
@@ -56,7 +58,6 @@ pub use transaction::{
 const HARD_MAX_ACCOUNTS: usize = 16_384;
 const HARD_MAX_INSTRUMENTS: usize = 1_000_000;
 const HARD_MAX_LOTS: usize = 4_000_000;
-const HARD_MAX_TRANSACTIONS: usize = 4_000_000;
 const HARD_MAX_FACTORS: usize = 16_384;
 const HARD_MAX_SCENARIOS: usize = 16_384;
 const HARD_MAX_HISTORY: usize = 65_536;
@@ -101,7 +102,7 @@ pub struct PortfolioLimits {
 }
 
 impl PortfolioLimits {
-    /// Validates positive caller limits against fixed process ceilings.
+    /// Validates positive caller work limits and fixed resident-state ceilings.
     ///
     /// # Errors
     ///
@@ -111,7 +112,7 @@ impl PortfolioLimits {
             (input.max_accounts, HARD_MAX_ACCOUNTS),
             (input.max_instruments, HARD_MAX_INSTRUMENTS),
             (input.max_lots, HARD_MAX_LOTS),
-            (input.max_transactions, HARD_MAX_TRANSACTIONS),
+            (input.max_transactions, usize::MAX),
             (input.max_factors, HARD_MAX_FACTORS),
             (input.max_scenarios, HARD_MAX_SCENARIOS),
             (input.max_history, HARD_MAX_HISTORY),
@@ -165,6 +166,15 @@ impl PortfolioLimits {
 /// Typed portfolio construction, accounting, evidence, and analytics failures.
 #[derive(Clone, Debug, Error, PartialEq)]
 pub enum PortfolioError {
+    /// Private immutable transaction storage is unavailable or corrupt.
+    #[error("portfolio transaction snapshot storage failed")]
+    Storage,
+    /// The independent temporary disk allowance or available disk space is exhausted.
+    #[error("portfolio transaction snapshot disk capacity is exhausted")]
+    StorageCapacity,
+    /// The current portfolio operation was cancelled before publication.
+    #[error("portfolio operation was cancelled")]
+    Cancelled,
     /// A caller-selected bound is zero or above its fixed ceiling.
     #[error("portfolio limits are invalid")]
     InvalidLimits,
@@ -336,7 +346,7 @@ pub struct PortfolioRiskProjection {
     marked_equity: Money,
     peak_marked_equity: Money,
     unrealized_pnl: BasisMeasurement,
-    realized_loss: Money,
+    realized_loss: BasisMeasurement,
     drawdown: Money,
 }
 
@@ -351,7 +361,7 @@ impl PortfolioRiskProjection {
         self.gross_exposure
     }
 
-    /// Returns cash plus signed current position market value.
+    /// Returns spendable cash, unpaid cash entitlements, and signed position market value.
     pub const fn marked_equity(self) -> Money {
         self.marked_equity
     }
@@ -367,7 +377,7 @@ impl PortfolioRiskProjection {
     }
 
     /// Returns cumulative loss magnitude from negative realized outcomes.
-    pub const fn realized_loss(self) -> Money {
+    pub const fn realized_loss(self) -> BasisMeasurement {
         self.realized_loss
     }
 
@@ -384,6 +394,8 @@ pub struct PortfolioSnapshot {
     account_id: AccountId,
     base_currency: Currency,
     cash: Money,
+    receivable_value: Money,
+    cash_entitlements: Vec<CashEntitlement>,
     risk: PortfolioRiskProjection,
     holdings: Vec<Position>,
     retained_bytes: usize,
@@ -408,6 +420,16 @@ impl PortfolioSnapshot {
     /// Returns base-currency cash, including explicit FX valuation.
     pub const fn cash(&self) -> Money {
         self.cash
+    }
+
+    /// Returns unpaid entitlement value without treating it as spendable cash.
+    pub const fn receivable_value(&self) -> Money {
+        self.receivable_value
+    }
+
+    /// Returns every cash entitlement and its explicit simulated settlement status.
+    pub fn cash_entitlements(&self) -> &[CashEntitlement] {
+        &self.cash_entitlements
     }
 
     /// Returns the complete immutable-revision projection used by portfolio-wide risk limits.
@@ -568,13 +590,19 @@ impl PortfolioService {
             return Err(PortfolioServiceError::StaleRevision);
         }
         let limit = query.max_results.min(self.limits.max_results);
-        if revision.positions().len() > limit {
+        let result_count = revision
+            .positions()
+            .len()
+            .checked_add(revision.cash_entitlements().len())
+            .ok_or(PortfolioServiceError::Arithmetic)?;
+        if result_count > limit {
             return Err(PortfolioServiceError::ResultLimitExceeded {
-                observed: revision.positions().len(),
+                observed: result_count,
                 limit,
             });
         }
-        let retained_bytes = snapshot_retained_bytes(revision.positions())?;
+        let retained_bytes =
+            snapshot_retained_bytes(revision.positions(), revision.cash_entitlements())?;
         let byte_limit = query.max_retained_bytes.min(self.limits.max_retained_bytes);
         if retained_bytes > byte_limit {
             return Err(PortfolioServiceError::RetainedBytesExceeded);
@@ -584,11 +612,18 @@ impl PortfolioService {
             .try_reserve_exact(revision.positions().len())
             .map_err(|_| PortfolioServiceError::AllocationFailed)?;
         holdings.extend_from_slice(revision.positions());
+        let mut cash_entitlements = Vec::new();
+        cash_entitlements
+            .try_reserve_exact(revision.cash_entitlements().len())
+            .map_err(|_| PortfolioServiceError::AllocationFailed)?;
+        cash_entitlements.extend_from_slice(revision.cash_entitlements());
         Ok(PortfolioSnapshot {
             revision: revision.token(),
             account_id: revision.account_id(),
             base_currency: revision.base_currency(),
             cash: revision.cash(),
+            receivable_value: revision.receivable_value(),
+            cash_entitlements,
             risk: PortfolioRiskProjection {
                 settlement_available_cash: revision
                     .cash_balances()
@@ -609,7 +644,10 @@ impl PortfolioService {
     }
 }
 
-fn snapshot_retained_bytes(positions: &[Position]) -> Result<usize, PortfolioServiceError> {
+fn snapshot_retained_bytes(
+    positions: &[Position],
+    cash_entitlements: &[CashEntitlement],
+) -> Result<usize, PortfolioServiceError> {
     let position_bytes = positions
         .len()
         .checked_mul(std::mem::size_of::<Position>())
@@ -617,6 +655,13 @@ fn snapshot_retained_bytes(positions: &[Position]) -> Result<usize, PortfolioSer
     positions.iter().try_fold(
         std::mem::size_of::<PortfolioSnapshot>()
             .checked_add(position_bytes)
+            .and_then(|value| {
+                value.checked_add(
+                    cash_entitlements
+                        .len()
+                        .checked_mul(std::mem::size_of::<CashEntitlement>())?,
+                )
+            })
             .ok_or(PortfolioServiceError::Arithmetic)?,
         |retained, position| {
             let lot_bytes = position

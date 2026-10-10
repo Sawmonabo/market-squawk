@@ -1,11 +1,11 @@
-//! Immutable, manifest-pinned analytical inputs and feature-dataset registrations.
+//! Immutable, manifest-pinned analytical inputs and feature contracts.
 
 use market_squawk_analytics::{
     AnalyticsError, BatchFeatureCatalog, DatedMoney, DatedStatisticalInput, DecimalPolicy,
     FactorObservation, PortfolioAllocation, ScenarioShock, ShockComposition, factor_regression,
     scenario_impact, simple_returns, total_returns, valuation_multiple,
 };
-use market_squawk_data::{FeatureLabelDataset, PinnedDataset};
+use market_squawk_data::PinnedDataset;
 use market_squawk_domain::{
     DataQuality, InstrumentId, Money, SourceId, SourceIdentifier, Timestamp,
 };
@@ -316,35 +316,11 @@ impl AnalysisDataset {
     }
 }
 
-/// One immutable feature/label generation and its explicit source evidence.
-#[derive(Clone, Debug)]
-pub struct FeatureDatasetRegistration {
-    dataset: FeatureLabelDataset,
-    scope: AnalysisDatasetScope,
-}
-
-impl FeatureDatasetRegistration {
-    /// Binds a built point-in-time feature/label generation to requestable source evidence.
-    #[must_use]
-    pub const fn new(dataset: FeatureLabelDataset, scope: AnalysisDatasetScope) -> Self {
-        Self { dataset, scope }
-    }
-
-    pub(super) const fn dataset(&self) -> &FeatureLabelDataset {
-        &self.dataset
-    }
-
-    pub(super) const fn scope(&self) -> &AnalysisDatasetScope {
-        &self.scope
-    }
-}
-
 /// Immutable application catalog used by all read-only analysis operations.
 #[derive(Clone, Debug)]
 pub struct AnalysisCatalog {
     datasets: Box<[AnalysisDataset]>,
     feature_catalog: BatchFeatureCatalog,
-    feature_datasets: Box<[FeatureDatasetRegistration]>,
 }
 
 impl AnalysisCatalog {
@@ -352,11 +328,8 @@ impl AnalysisCatalog {
     pub fn try_new(
         mut datasets: Vec<AnalysisDataset>,
         feature_catalog: BatchFeatureCatalog,
-        mut feature_datasets: Vec<FeatureDatasetRegistration>,
     ) -> Result<Self, AnalysisCatalogError> {
-        if datasets.len() > MAXIMUM_REGISTERED_ANALYSIS_DATASETS
-            || feature_datasets.len() > MAXIMUM_REGISTERED_ANALYSIS_DATASETS
-        {
+        if datasets.len() > MAXIMUM_REGISTERED_ANALYSIS_DATASETS {
             return Err(AnalysisCatalogError::Capacity);
         }
         datasets.sort_unstable_by(|left, right| {
@@ -366,24 +339,14 @@ impl AnalysisCatalog {
                 .as_str()
                 .cmp(right.pinned().manifest().dataset_id().as_str())
         });
-        feature_datasets.sort_unstable_by(|left, right| {
-            left.dataset()
-                .manifest()
-                .dataset_id()
-                .as_str()
-                .cmp(right.dataset().manifest().dataset_id().as_str())
-        });
         if datasets.windows(2).any(|pair| {
             pair[0].pinned().manifest().dataset_id() == pair[1].pinned().manifest().dataset_id()
-        }) || feature_datasets.windows(2).any(|pair| {
-            pair[0].dataset().manifest().dataset_id() == pair[1].dataset().manifest().dataset_id()
         }) {
             return Err(AnalysisCatalogError::DuplicateDataset);
         }
         Ok(Self {
             datasets: datasets.into_boxed_slice(),
             feature_catalog,
-            feature_datasets: feature_datasets.into_boxed_slice(),
         })
     }
 
@@ -398,10 +361,6 @@ impl AnalysisCatalog {
 
     pub(super) const fn feature_catalog(&self) -> &BatchFeatureCatalog {
         &self.feature_catalog
-    }
-
-    pub(super) fn feature_datasets(&self) -> &[FeatureDatasetRegistration] {
-        &self.feature_datasets
     }
 }
 

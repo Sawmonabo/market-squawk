@@ -17,10 +17,19 @@ use crate::{
     BacktestStrategyClass, BacktestStrategyFactory, BacktestStrategyInstance,
     BacktestStrategyRegistry, BacktestTrialPlan, ExperimentError, ExperimentInventory,
     ExperimentLimits, ExperimentLimitsInput, HistoricalUniverseStatus,
-    MAX_COHORT_CANDIDATES_PER_FOLD, PortfolioSeed, RESEARCH_EXECUTION_POLICY_VERSION,
-    ResearchExecutionAssumptions, ResearchExecutionAssumptionsInput, ResearchLiquidityPriority,
-    TrialComponentBinding, TrialDatasetPartition, TrialId, TrialMetric, TrialParameter,
-    TrialSearchDimension, TrialSpec, TrialSpecInput, TrialStatus,
+    MAX_COHORT_CANDIDATES_PER_FOLD, PortfolioSeed, RECOMMENDATION_TARGET_HORIZON_NANOS_V1,
+    RESEARCH_EXECUTION_POLICY_VERSION, RecommendationAggregateEvidenceV1,
+    RecommendationBacktestKernelV1, RecommendationBacktestLimits,
+    RecommendationBacktestLimitsInput, RecommendationBacktestPolicyV1,
+    RecommendationBacktestPolicyV1Input, RecommendationBacktestPublicationV1,
+    RecommendationBenchmarkAggregateV1, RecommendationBenchmarkPolicyV1, RecommendationOosFoldV1,
+    RecommendationSignalDispositionV1, RecommendationSignalInstructionV1,
+    RecommendationSignalIssuanceV1, RecommendationSignalIssuerIdentityV1,
+    RecommendationSignalPlanCompletenessV1, RecommendationSignalPlanMaterializerV1,
+    RecommendationSignalPlanV1, RecommendationSignalV1, ResearchExecutionAssumptions,
+    ResearchExecutionAssumptionsInput, ResearchLiquidityPriority, TrialComponentBinding,
+    TrialDatasetPartition, TrialId, TrialMetric, TrialParameter, TrialSearchDimension, TrialSpec,
+    TrialSpecInput, TrialStatus, recommendation_conservative_execution_assumptions_v1,
 };
 use market_squawk_data::{
     CorporateActionAdjustment, CorporateActionLimits, CorporateActionPlan, CorporateActionPolicy,
@@ -196,8 +205,8 @@ fn signal_executes_only_on_next_eligible_snapshot_and_reconciles_partial_fill() 
 
     let result = BacktestEngine::run(&request, &mut strategy, &CancellationToken::new())?;
 
-    assert_eq!(result.fills().len(), 2);
-    let fill = &result.fills()[0];
+    assert_eq!(result.fills()?.len(), 2);
+    let fill = &result.fills()?[0];
     assert_eq!(fill.signal_at(), Timestamp::from_unix_nanos(10));
     assert_eq!(fill.executed_at(), Timestamp::from_unix_nanos(20));
     assert_eq!(fill.quantity(), QuantityLots::new(2)?);
@@ -212,7 +221,7 @@ fn signal_executes_only_on_next_eligible_snapshot_and_reconciles_partial_fill() 
     assert_eq!(
         result.portfolio().fees().amount(),
         result
-            .fills()
+            .fills()?
             .iter()
             .map(|fill| fill.fee().amount())
             .sum::<Decimal>()
@@ -220,6 +229,10 @@ fn signal_executes_only_on_next_eligible_snapshot_and_reconciles_partial_fill() 
     assert_eq!(
         result.accounting_reconciliation(),
         AccountingReconciliation::Independent
+    );
+    assert_eq!(
+        result.performance().maximum_drawdown,
+        Decimal::new(2_222, 6)
     );
     Ok(())
 }
@@ -236,8 +249,8 @@ fn competing_intents_share_one_observation_liquidity_budget() -> TestResult {
     let result = BacktestEngine::run(&request, &mut strategy, &CancellationToken::new())?;
 
     let contested_fills = result
-        .fills()
-        .iter()
+        .fills()?
+        .into_iter()
         .filter(|fill| fill.executed_at() == Timestamp::from_unix_nanos(20))
         .collect::<Vec<_>>();
     assert_eq!(contested_fills.len(), 1);
@@ -257,7 +270,7 @@ fn immediate_time_in_force_is_terminal_while_gtc_survives_an_unfilled_attempt() 
     let terms = execution_terms()?;
     assert!(
         run_with_time_in_force(account_id, dataset(terms)?, TimeInForce::FillOrKill)?
-            .fills()
+            .fills()?
             .is_empty()
     );
     let delayed_liquidity = dataset_with_depths(terms, [10, 0, 10])?;
@@ -267,24 +280,24 @@ fn immediate_time_in_force_is_terminal_while_gtc_survives_an_unfilled_attempt() 
             delayed_liquidity.clone(),
             TimeInForce::ImmediateOrCancel,
         )?
-        .fills()
+        .fills()?
         .is_empty()
     );
     let good_til_cancelled_result =
         run_with_time_in_force(account_id, delayed_liquidity, TimeInForce::GoodTilCancelled)?;
-    assert_eq!(good_til_cancelled_result.fills().len(), 1);
+    assert_eq!(good_til_cancelled_result.fills()?.len(), 1);
     assert_eq!(
-        good_til_cancelled_result.fills()[0].executed_at(),
+        good_til_cancelled_result.fills()?[0].executed_at(),
         Timestamp::from_unix_nanos(30)
     );
 
     let partial_liquidity = dataset_with_depths(terms, [10, 2, 2])?;
     for time_in_force in [TimeInForce::Day, TimeInForce::GoodTilCancelled] {
         let result = run_with_time_in_force(account_id, partial_liquidity.clone(), time_in_force)?;
-        assert_eq!(result.fills().len(), 2);
+        assert_eq!(result.fills()?.len(), 2);
         assert_eq!(
             result
-                .fills()
+                .fills()?
                 .iter()
                 .map(|fill| fill.quantity().get())
                 .sum::<i64>(),
@@ -296,11 +309,11 @@ fn immediate_time_in_force_is_terminal_while_gtc_survives_an_unfilled_attempt() 
         partial_liquidity.clone(),
         TimeInForce::ImmediateOrCancel,
     )?;
-    assert_eq!(immediate.fills().len(), 1);
-    assert_eq!(immediate.fills()[0].quantity(), QuantityLots::new(2)?);
+    assert_eq!(immediate.fills()?.len(), 1);
+    assert_eq!(immediate.fills()?[0].quantity(), QuantityLots::new(2)?);
     assert!(
         run_with_time_in_force(account_id, partial_liquidity, TimeInForce::FillOrKill)?
-            .fills()
+            .fills()?
             .is_empty()
     );
     Ok(())
@@ -328,28 +341,31 @@ fn run_with_time_in_force(
 fn governed_service_reserves_before_run_and_publishes_one_immutable_terminal() -> TestResult {
     let temporary = tempfile::tempdir()?;
     let root = Dir::open_ambient_dir(temporary.path(), ambient_authority())?;
-    let inventory = ExperimentInventory::try_new(
-        root,
-        ExperimentLimits::try_new(ExperimentLimitsInput {
-            max_trials: 8,
-            max_record_bytes: 64 * 1024,
-            max_artifact_bytes: 64 * 1024,
-            max_metrics: 8,
-        })?,
-    )?;
+    let limits = ExperimentLimits::try_new(ExperimentLimitsInput {
+        max_trials: 8,
+        max_record_bytes: 64 * 1024,
+        max_artifact_bytes: 64 * 1024,
+        max_metrics: 8,
+    })?;
+    let inventory = ExperimentInventory::try_new(root, limits)?;
     let service = BacktestService::new(inventory);
     let account_id: AccountId = "00000000-0000-0000-0000-000000000030".parse()?;
     let request = request(account_id, dataset(execution_terms()?)?, None)?;
-    let (registry, build_id) = strategy_registry(account_id)?;
+    let (registry, build_id) = strategy_registry(account_id, b"buy-once-build-metadata-v1")?;
     let mut strategy = registry.admit(&build_id)?;
+    assert_eq!(
+        strategy.identity().code().name().as_str(),
+        "buy-once-v1-build-metadata"
+    );
+    let plan = BacktestTrialPlan::new(
+        Vec::new(),
+        Vec::new(),
+        SourceIdentifier::try_from("cost-adjusted-total-return")?,
+    );
     let outcome = service.run(
-        request,
+        request.clone(),
         &mut strategy,
-        BacktestTrialPlan::new(
-            Vec::new(),
-            Vec::new(),
-            SourceIdentifier::try_from("total-return")?,
-        ),
+        plan.clone(),
         &CancellationToken::new(),
     )?;
     let BacktestOutcome::Completed(result) = outcome else {
@@ -358,13 +374,26 @@ fn governed_service_reserves_before_run_and_publishes_one_immutable_terminal() -
     let TrialStatus::Completed(completion) = result.trial().status() else {
         return Err("expected completed terminal".into());
     };
-    assert_eq!(result.run().fills().len(), 2);
-    assert_eq!(completion.metrics().len(), 7);
+    assert_eq!(result.run().fills()?.len(), 2);
+    assert_eq!(completion.metrics().len(), 8);
     assert_eq!(
         completion
-            .dataset_partition()
-            .ok_or("missing dataset partition")?
-            .ends_at(),
+            .metrics()
+            .iter()
+            .find(|metric| metric.name().as_str() == "cost-adjusted-total-return")
+            .map(TrialMetric::value),
+        rust_decimal::prelude::ToPrimitive::to_f64(&Decimal::new(15_536, 6))
+    );
+    assert_eq!(
+        completion
+            .metrics()
+            .iter()
+            .find(|metric| metric.name().as_str() == "maximum-drawdown")
+            .map(TrialMetric::value),
+        rust_decimal::prelude::ToPrimitive::to_f64(&Decimal::new(2_222, 6))
+    );
+    assert_eq!(
+        completion.dataset_partition().ends_at(),
         Timestamp::from_unix_nanos(30)
     );
     assert!(
@@ -372,6 +401,954 @@ fn governed_service_reserves_before_run_and_publishes_one_immutable_terminal() -
             .path()
             .join(completion.artifact().reference())
             .is_file()
+    );
+    let report: serde_json::Value = serde_json::from_slice(&std::fs::read(
+        temporary.path().join(completion.artifact().reference()),
+    )?)?;
+    let expected_marks = result
+        .run()
+        .equity_marks()
+        .map(|mark| mark.map(|value| value.to_string()))
+        .collect::<Result<Vec<_>, _>>()?;
+    assert_eq!(
+        report["equity_marks"],
+        serde_json::to_value(expected_marks)?
+    );
+    assert_eq!(
+        report["fills"]
+            .as_array()
+            .ok_or("missing complete fills")?
+            .len(),
+        result.run().fill_count()
+    );
+    let (changed_registry, changed_build_id) =
+        strategy_registry(account_id, b"buy-once-build-metadata-v2")?;
+    assert_eq!(changed_build_id, build_id);
+    let mut changed_strategy = changed_registry.admit(&changed_build_id)?;
+    assert_eq!(
+        strategy.identity().strategy(),
+        changed_strategy.identity().strategy()
+    );
+    assert_eq!(
+        strategy.identity().configuration_digest(),
+        changed_strategy.identity().configuration_digest()
+    );
+    assert_ne!(strategy.identity().code(), changed_strategy.identity().code());
+    let changed_outcome = service.run(
+        request,
+        &mut changed_strategy,
+        plan,
+        &CancellationToken::new(),
+    )?;
+    let BacktestOutcome::Completed(changed_result) = changed_outcome else {
+        return Err("expected completed trial with changed build metadata".into());
+    };
+    assert_ne!(result.trial().spec().id(), changed_result.trial().spec().id());
+
+    drop(service);
+    let reopened_root = Dir::open_ambient_dir(temporary.path(), ambient_authority())?;
+    let reopened = ExperimentInventory::try_new(reopened_root, limits)?;
+    assert_eq!(reopened.trial(result.trial().spec().id())?, *result.trial());
+    Ok(())
+}
+
+#[test]
+fn recommendation_kernel_retains_exact_365_day_oos_outcomes_and_completeness() -> TestResult {
+    const DAY: i64 = 24 * 60 * 60 * 1_000_000_000;
+    let subject_terms = execution_terms()?;
+    let benchmark_terms = InstrumentExecutionTerms::try_new(
+        "00000000-0000-0000-0000-000000000021".parse()?,
+        InstrumentDefinitionRevision::try_from(1)?,
+        TickSize::try_from_decimal(Decimal::ONE)?,
+        LotSize::try_from_decimal(Decimal::ONE)?,
+        Currency::try_from("USD")?,
+        Denomination::Currency(Currency::try_from("USD")?),
+        Decimal::ONE,
+    )?;
+    let signal_times = [DAY, 401 * DAY, 801 * DAY];
+    let cutoff = signal_times[2] + RECOMMENDATION_TARGET_HORIZON_NANOS_V1 + 10;
+    let qualification = crate::dataset::BacktestStudyQualification::try_new(
+        market_squawk_domain::HistoricalStudyBasis::HistoricalAsKnown,
+        Timestamp::from_unix_nanos(cutoff + 1),
+        Sha256Digest::new([76; 32]),
+        None,
+        &[market_squawk_domain::HistoricalStudyLimitation::PresentDayFixedCohort],
+    )?;
+    let accompanying_terms = InstrumentExecutionTerms::try_new(
+        "00000000-0000-0000-0000-000000000022".parse()?,
+        InstrumentDefinitionRevision::try_from(1)?,
+        TickSize::try_from_decimal(Decimal::ONE)?,
+        LotSize::try_from_decimal(Decimal::ONE)?,
+        Currency::try_from("USD")?,
+        Denomination::Currency(Currency::try_from("USD")?),
+        Decimal::ONE,
+    )?;
+    let mut observations = Vec::new();
+    let mut lineage = 20_u8;
+    for signal_at in signal_times {
+        for (offset, subject_price, benchmark_price) in [
+            (10, 100, 100),
+            (180 * DAY, 90, 100),
+            (RECOMMENDATION_TARGET_HORIZON_NANOS_V1 + 10, 120, 105),
+        ] {
+            observations.push(recommendation_observation(
+                subject_terms,
+                signal_at + offset,
+                if signal_at == signal_times[0] && offset >= 180 * DAY {
+                    subject_price / 2
+                } else {
+                    subject_price
+                },
+                lineage,
+                10,
+            )?);
+            lineage = lineage.checked_add(1).ok_or("lineage overflow")?;
+            observations.push(recommendation_observation(
+                benchmark_terms,
+                signal_at + offset,
+                benchmark_price,
+                lineage,
+                10,
+            )?);
+            lineage = lineage.checked_add(1).ok_or("lineage overflow")?;
+            observations.push(recommendation_observation(
+                accompanying_terms,
+                signal_at + offset,
+                if offset > RECOMMENDATION_TARGET_HORIZON_NANOS_V1 {
+                    140
+                } else {
+                    100
+                },
+                lineage,
+                10,
+            )?);
+            lineage = lineage.checked_add(1).ok_or("lineage overflow")?;
+        }
+    }
+    let mut dataset = BacktestDataset::try_new(BacktestDatasetInput {
+        manifest: feature_manifest()?,
+        object_graph_digest: Sha256Digest::new([42; 32]),
+        point_in_time_content: Sha256Digest::new([43; 32]),
+        point_in_time_audit: Sha256Digest::new([44; 32]),
+        instrument_definition_content: Sha256Digest::new([45; 32]),
+        instrument_definition_audit: Sha256Digest::new([46; 32]),
+        observations,
+    })?;
+    dataset.study_qualification = Some(qualification);
+    let folds = signal_times
+        .iter()
+        .enumerate()
+        .map(|(index, signal_at)| -> Result<_, Box<dyn Error>> {
+            Ok(RecommendationOosFoldV1::try_new(
+                SourceIdentifier::try_from(format!("oos-fold-{index}"))?,
+                Timestamp::from_unix_nanos(*signal_at),
+                Timestamp::from_unix_nanos(signal_at + RECOMMENDATION_TARGET_HORIZON_NANOS_V1 + 21),
+            )?)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    let mut signals = signal_times
+        .iter()
+        .enumerate()
+        .map(|(fold_index, signal_at)| -> Result<_, Box<dyn Error>> {
+            Ok(RecommendationSignalV1::try_new(
+                SourceIdentifier::try_from(format!("entry-{fold_index}"))?,
+                fold_index,
+                Timestamp::from_unix_nanos(*signal_at),
+                Timestamp::from_unix_nanos(*signal_at),
+                Timestamp::from_unix_nanos(*signal_at),
+                qualification,
+                Timestamp::from_unix_nanos(*signal_at - 7),
+                Timestamp::from_unix_nanos(*signal_at - 7 + RECOMMENDATION_TARGET_HORIZON_NANOS_V1),
+                Sha256Digest::new([u8::try_from(fold_index + 1)?; 32]),
+                RecommendationSignalInstructionV1::Entry,
+            )?)
+        })
+        .collect::<Result<Vec<_>, Box<dyn Error>>>()?;
+    signals.push(RecommendationSignalV1::try_new(
+        SourceIdentifier::try_from("no-action-0")?,
+        0,
+        Timestamp::from_unix_nanos(signal_times[0] + 1),
+        Timestamp::from_unix_nanos(signal_times[0] + 1),
+        Timestamp::from_unix_nanos(signal_times[0] + 1),
+        qualification,
+        Timestamp::from_unix_nanos(signal_times[0] - 7),
+        Timestamp::from_unix_nanos(signal_times[0] - 7 + RECOMMENDATION_TARGET_HORIZON_NANOS_V1),
+        Sha256Digest::new([9; 32]),
+        RecommendationSignalInstructionV1::NoAction,
+    )?);
+    let mut actions = Vec::new();
+    for (day, kind) in [
+        (
+            100,
+            CorporateActionKind::Split {
+                numerator: NonZeroU32::new(2).ok_or("split ratio")?,
+                denominator: NonZeroU32::MIN,
+            },
+        ),
+        (
+            200,
+            CorporateActionKind::CashDividend {
+                amount: Money::new(Decimal::ONE, Currency::try_from("USD")?),
+            },
+        ),
+    ] {
+        let at = Timestamp::from_unix_nanos(day * DAY);
+        let identifier = SourceIdentifier::try_from(format!("recommendation-action-{day}"))?;
+        let observation = CorporateActionObservation::new(
+            ResearchContext::new(
+                ResearchProvenance::try_new(ResearchProvenanceInput {
+                    source_id: SourceId::try_from("official-actions")?,
+                    instrument_id: Some(subject_terms.instrument_id()),
+                    venue_id: Some(VenueId::try_from("XNAS")?),
+                    source_identifier: identifier.clone(),
+                    source_timestamp: Some(at),
+                    received_at: Timestamp::from_unix_nanos(cutoff + 1),
+                    ingested_at: Timestamp::from_unix_nanos(cutoff + 1),
+                    quality: DataQuality::OfficialDelayed,
+                    payload_reference: PayloadReference::SourceReference(identifier.clone()),
+                    availability: AvailabilityEvidence::evidenced(
+                        Timestamp::from_unix_nanos(cutoff + 1),
+                        identifier,
+                    ),
+                })?,
+                ResearchTime::new(at, None, RevisionNumber::new(1)?, None)?,
+            )?,
+            kind,
+        )?;
+        actions.push(CorporateActionRecord::new(
+            observation,
+            DatasetManifestRef::try_new_with_schema(
+                DatasetId::try_from("recommendation-actions")?,
+                1,
+                DatasetSchemaRegistry::local().canonical_research_observations()?,
+                Sha256Digest::new([61; 32]),
+            )?,
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [62; 32]),
+        ));
+    }
+    let corporate_actions = CorporateActionPlan::try_build(
+        CorporateActionPolicy::new(CorporateActionAdjustment::TotalReturn, NonZeroU32::MIN),
+        Timestamp::from_unix_nanos(cutoff + 1),
+        Timestamp::from_unix_nanos(cutoff),
+        actions,
+        CorporateActionLimits::try_new(
+            NonZeroUsize::new(2).ok_or("action count")?,
+            NonZeroUsize::new(64 * 1024).ok_or("action bound")?,
+        )?,
+    )?;
+    let policy_input = RecommendationBacktestPolicyV1Input {
+        study_qualification: qualification,
+        subject_instrument_id: subject_terms.instrument_id(),
+        benchmark: RecommendationBenchmarkPolicyV1::try_new(
+            benchmark_terms.instrument_id(),
+            Sha256Digest::new([10; 32]),
+        )?,
+        accompanying_benchmark: RecommendationBenchmarkPolicyV1::try_new(
+            "00000000-0000-0000-0000-000000000022".parse()?,
+            Sha256Digest::new([12; 32]),
+        )?,
+        raw_price_evidence_digest: dataset.identity(),
+        corporate_action_content_digest: corporate_actions.content_hash(),
+        corporate_action_audit_digest: corporate_actions.audit_hash(),
+        corporate_action_coverage_starts_at: Timestamp::from_unix_nanos(0),
+        execution_basis: crate::dataset::BacktestExecutionBasis::ObservedQuoteDepth,
+        reporting_currency: Currency::try_from("USD")?,
+        subject_quantity: QuantityLots::new(1)?,
+        benchmark_quantity: QuantityLots::new(1)?,
+        maximum_entry_lag_nanos: 20,
+        maximum_exit_lag_nanos: 20,
+        execution_assumptions: research_assumptions()?,
+        seed: 7,
+    };
+    let policy = RecommendationBacktestPolicyV1::try_new(policy_input)?;
+    let limits = RecommendationBacktestLimits::try_new(RecommendationBacktestLimitsInput {
+        max_folds: 3,
+        max_signals: 8,
+        max_equity_points_per_outcome: 8,
+        max_total_equity_points: 64,
+        max_observation_visits: 1_000,
+    })?;
+    let publication = RecommendationBacktestPublicationV1::try_new(
+        Timestamp::from_unix_nanos(cutoff),
+        Timestamp::from_unix_nanos(cutoff + 1),
+        Timestamp::from_unix_nanos(cutoff + 2),
+        Timestamp::from_unix_nanos(cutoff + 3),
+        Timestamp::from_unix_nanos(cutoff + 4),
+    )?;
+    let complete = RecommendationSignalPlanV1::try_new(
+        Sha256Digest::new([11; 32]),
+        RecommendationSignalPlanCompletenessV1::Complete,
+        folds.clone(),
+        signals.clone(),
+    )?;
+    let evidence = RecommendationBacktestKernelV1::run_study(
+        &dataset,
+        policy,
+        &corporate_actions,
+        &complete,
+        publication,
+        limits,
+        &CancellationToken::new(),
+    )?;
+    assert_eq!(evidence.results().len(), signals.len());
+    let RecommendationSignalDispositionV1::Completed { subject, .. } =
+        evidence.results()[0].disposition()
+    else {
+        return Err("expected split and dividend outcome".into());
+    };
+    assert_eq!(subject.entry_fill().quantity(), QuantityLots::new(1)?);
+    assert_eq!(subject.exit_fill().quantity(), QuantityLots::new(2)?);
+    let raw_exit = subject
+        .exit_fill()
+        .price()
+        .checked_mul_quantity(
+            subject.exit_fill().quantity(),
+            subject_terms.price_tick(),
+            subject_terms.lot_size(),
+            Currency::try_from("USD")?,
+        )?
+        .checked_sub(subject.exit_fill().fee())?
+        .amount();
+    // The source has no payable-session evidence. Income contributes to wealth, not cash.
+    assert_eq!(subject.exit_proceeds(), raw_exit);
+    assert_eq!(subject.unpaid_entitlement_value(), Decimal::from(2));
+    assert_eq!(
+        evidence
+            .results()
+            .iter()
+            .filter(|result| matches!(
+                result.disposition(),
+                RecommendationSignalDispositionV1::Completed { .. }
+            ))
+            .count(),
+        3
+    );
+    assert!(evidence.results().iter().any(|result| matches!(
+        result.disposition(),
+        RecommendationSignalDispositionV1::NoAction
+    )));
+    assert_eq!(
+        evidence.results()[0].target_at().unix_nanos()
+            - evidence.results()[0].target_origin().unix_nanos(),
+        RECOMMENDATION_TARGET_HORIZON_NANOS_V1
+    );
+    assert_eq!(
+        evidence.results()[0].signal_at().unix_nanos()
+            - evidence.results()[0].target_origin().unix_nanos(),
+        7,
+    );
+    let RecommendationAggregateEvidenceV1::Available(aggregate) = evidence.aggregate() else {
+        return Err("expected complete recommendation aggregate".into());
+    };
+    assert_eq!(aggregate.observation_count(), 3);
+    assert_eq!(aggregate.trial_count(), 3);
+    assert!(aggregate.worst_maximum_drawdown() > Decimal::ZERO);
+    assert!(aggregate.positive_fold_stability() > Decimal::ZERO);
+    assert_eq!(aggregate.positive_fold_stability_ppm(), 1_000_000);
+    assert!(
+        matches!(aggregate.benchmark(), RecommendationBenchmarkAggregateV1::Available {
+        mean_excess_return, ..
+    } if mean_excess_return > Decimal::ZERO)
+    );
+    assert!(
+        matches!(aggregate.accompanying_benchmark(), RecommendationBenchmarkAggregateV1::Available {
+        mean_excess_return, ..
+    } if mean_excess_return < Decimal::ZERO)
+    );
+    assert_eq!(
+        evidence.digest(),
+        RecommendationBacktestKernelV1::run_study(
+            &dataset,
+            policy,
+            &corporate_actions,
+            &complete,
+            publication,
+            limits,
+            &CancellationToken::new(),
+        )?
+        .digest()
+    );
+
+    let truncated = RecommendationSignalPlanV1::try_new(
+        Sha256Digest::new([11; 32]),
+        RecommendationSignalPlanCompletenessV1::Truncated {
+            total_signal_count: signals.len() + 1,
+        },
+        folds,
+        signals,
+    )?;
+    let truncated_evidence = RecommendationBacktestKernelV1::run_study(
+        &dataset,
+        policy,
+        &corporate_actions,
+        &truncated,
+        publication,
+        limits,
+        &CancellationToken::new(),
+    )?;
+    assert!(matches!(
+        truncated_evidence.aggregate(),
+        RecommendationAggregateEvidenceV1::Unavailable(_)
+    ));
+    assert_ne!(evidence.digest(), truncated_evidence.digest());
+    // Missing accompanying history must not replace or invalidate the retained primary result.
+    let mut without_accompanying = BacktestDataset::try_new(BacktestDatasetInput {
+        manifest: feature_manifest()?,
+        object_graph_digest: Sha256Digest::new([42; 32]),
+        point_in_time_content: Sha256Digest::new([43; 32]),
+        point_in_time_audit: Sha256Digest::new([44; 32]),
+        instrument_definition_content: Sha256Digest::new([45; 32]),
+        instrument_definition_audit: Sha256Digest::new([46; 32]),
+        observations: dataset
+            .observations
+            .iter()
+            .filter(|row| {
+                row.as_ref().map_or(true, |row| {
+                    row.instrument_id() != accompanying_terms.instrument_id()
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    })?;
+    without_accompanying.study_qualification = Some(qualification);
+    let missing = RecommendationBacktestKernelV1::run_study(
+        &without_accompanying,
+        policy,
+        &corporate_actions,
+        &complete,
+        publication,
+        limits,
+        &CancellationToken::new(),
+    )?;
+    let RecommendationAggregateEvidenceV1::Available(missing_aggregate) = missing.aggregate()
+    else {
+        return Err("missing accompanying comparison changed subject availability".into());
+    };
+    assert_eq!(missing_aggregate.benchmark(), aggregate.benchmark());
+    assert_eq!(
+        missing_aggregate.accompanying_benchmark(),
+        RecommendationBenchmarkAggregateV1::Unavailable
+    );
+    assert_ne!(missing.digest(), evidence.digest());
+
+    // Realized bars are a separate fixture stream. A bar already in progress at the signal
+    // cannot fill that signal, even when its later close and volume appear attractive.
+    let mut daily_dataset = dataset.clone();
+    let mut daily_bars = dataset
+        .observations
+        .iter()
+        .map(|observation| -> Result<_, Box<dyn Error>> {
+            let observation = observation?;
+            Ok(crate::dataset::BacktestDailyBar {
+                execution_terms: observation.execution_terms,
+                starts_at: observation.decision_at().checked_sub_nanos(5)?,
+                ends_at: observation.decision_at(),
+                available_at: Timestamp::from_unix_nanos(cutoff + 1),
+                close: Money::new(
+                    observation
+                        .mid_price
+                        .ok_or("fixture close")?
+                        .checked_to_decimal(observation.execution_terms.price_tick())?
+                        + if observation.instrument_id() == subject_terms.instrument_id()
+                            && observation.decision_at().unix_nanos() == signal_times[0] + 10
+                        {
+                            Decimal::new(95, 2)
+                        } else {
+                            Decimal::ZERO
+                        },
+                    observation.execution_terms.quote_currency(),
+                ),
+                traded_volume: Decimal::TEN,
+                lineage_digest: observation.lineage_digest,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    daily_bars.push(crate::dataset::BacktestDailyBar {
+        execution_terms: subject_terms,
+        starts_at: Timestamp::from_unix_nanos(signal_times[0] - 1),
+        ends_at: Timestamp::from_unix_nanos(signal_times[0] + 2),
+        available_at: Timestamp::from_unix_nanos(cutoff + 1),
+        close: Money::new(Decimal::from(999), subject_terms.quote_currency()),
+        traded_volume: Decimal::from(999),
+        lineage_digest: Sha256Digest::new([70; 32]),
+    });
+    daily_bars.sort_unstable_by_key(|bar| (bar.ends_at, bar.execution_terms.instrument_id()));
+    daily_dataset.daily_history = Some(crate::dataset::BacktestDailyHistory {
+        nominal_sources: Box::new([]),
+        bars: crate::dataset::history_store::DailyBarStore::from_bars(daily_bars)?,
+        digest: Sha256Digest::new([71; 32]),
+        available_at: Timestamp::from_unix_nanos(cutoff + 1),
+    });
+    daily_dataset.identity = Sha256Digest::new([72; 32]);
+    let daily_policy =
+        RecommendationBacktestPolicyV1::try_new(RecommendationBacktestPolicyV1Input {
+            execution_basis: crate::dataset::BacktestExecutionBasis::CompletedDailyBar,
+            raw_price_evidence_digest: Sha256Digest::new([71; 32]),
+            ..policy_input
+        })?;
+    let daily = RecommendationBacktestKernelV1::run_study(
+        &daily_dataset,
+        daily_policy,
+        &corporate_actions,
+        &complete,
+        publication,
+        limits,
+        &CancellationToken::new(),
+    )?;
+    let RecommendationSignalDispositionV1::Completed {
+        subject: daily_subject,
+        ..
+    } = daily.results()[0].disposition()
+    else {
+        return Err("expected isolated completed-daily-bar outcome".into());
+    };
+    assert_eq!(
+        daily_subject.entry_fill().executed_at(),
+        Timestamp::from_unix_nanos(signal_times[0] + 10)
+    );
+    assert_eq!(daily_subject.exit_proceeds(), subject.exit_proceeds());
+    // Native100.95 is retained until costs are applied; rounding the source close first
+    // would produce a different adverse execution tick.
+    assert_eq!(daily_subject.entry_fill().price().get(), 102);
+    assert!(daily_subject.entry_fill().price() > subject.entry_fill().price());
+    // An insufficient realized-volume cap cannot fall back to the unrelated quote depth.
+    let history = daily_dataset
+        .daily_history
+        .as_mut()
+        .ok_or("daily fixture")?;
+    let mut bars = history
+        .bars
+        .from(Timestamp::from_unix_nanos(i64::MIN))
+        .collect::<Result<Vec<_>, _>>()?;
+    let first_bar = bars
+        .iter_mut()
+        .find(|bar| {
+            bar.execution_terms.instrument_id() == subject_terms.instrument_id()
+                && bar.ends_at.unix_nanos() == signal_times[0] + 10
+        })
+        .ok_or("first eligible daily fixture")?;
+    first_bar.traded_volume = Decimal::new(5, 1);
+    history.bars = crate::dataset::history_store::DailyBarStore::from_bars(bars)?;
+    let insufficient = RecommendationBacktestKernelV1::run_study(
+        &daily_dataset,
+        daily_policy,
+        &corporate_actions,
+        &complete,
+        publication,
+        limits,
+        &CancellationToken::new(),
+    )?;
+    assert!(matches!(
+        insufficient.results()[0].disposition(),
+        RecommendationSignalDispositionV1::EntryUnfilled { .. }
+    ));
+    // The first otherwise eligible completed bar lands exactly at the original forecast target.
+    // It cannot become an entry merely because decision+maximum lag extends past that target.
+    let mut target_signals = complete.signals().to_vec();
+    target_signals[0] = RecommendationSignalV1::try_new(
+        SourceIdentifier::try_from("entry-at-financial-target")?,
+        0,
+        Timestamp::from_unix_nanos(signal_times[0]),
+        Timestamp::from_unix_nanos(signal_times[0]),
+        Timestamp::from_unix_nanos(signal_times[0]),
+        qualification,
+        Timestamp::from_unix_nanos(signal_times[0] + 10 - RECOMMENDATION_TARGET_HORIZON_NANOS_V1),
+        Timestamp::from_unix_nanos(signal_times[0] + 10),
+        Sha256Digest::new([75; 32]),
+        RecommendationSignalInstructionV1::Entry,
+    )?;
+    let entry_at_target = RecommendationSignalPlanV1::try_new(
+        Sha256Digest::new([74; 32]),
+        RecommendationSignalPlanCompletenessV1::Complete,
+        complete.folds().to_vec(),
+        target_signals,
+    )?;
+    let expired_entry = RecommendationBacktestKernelV1::run_study(
+        &daily_dataset,
+        daily_policy,
+        &corporate_actions,
+        &entry_at_target,
+        publication,
+        limits,
+        &CancellationToken::new(),
+    )?;
+    assert!(matches!(
+        expired_entry.results()[0].disposition(),
+        RecommendationSignalDispositionV1::EntryUnfilled {
+            gap: crate::RecommendationExecutionGapV1::NoEligibleObservation,
+            ..
+        },
+    ));
+    Ok(())
+}
+
+#[test]
+fn recommendation_materialization_issues_sequentially_from_coordinate_local_pit_evidence()
+-> TestResult {
+    const DAY: i64 = 24 * 60 * 60 * 1_000_000_000;
+    const FOLD_DAYS: i64 = 730;
+    const EVALUATION_DAYS: i64 = 3 * FOLD_DAYS;
+    let subject_terms = execution_terms()?;
+    let benchmark_terms = InstrumentExecutionTerms::try_new(
+        "00000000-0000-0000-0000-000000000021".parse()?,
+        InstrumentDefinitionRevision::try_from(1)?,
+        TickSize::try_from_decimal(Decimal::ONE)?,
+        LotSize::try_from_decimal(Decimal::ONE)?,
+        Currency::try_from("USD")?,
+        Denomination::Currency(Currency::try_from("USD")?),
+        Decimal::ONE,
+    )?;
+    let mut observations = Vec::new();
+    let mut lineage = 1_u8;
+    for day in (0..EVALUATION_DAYS).step_by(20) {
+        for terms in [subject_terms, benchmark_terms] {
+            observations.push(recommendation_observation(
+                terms,
+                day.checked_mul(DAY).ok_or("test time overflow")?,
+                100 + day / 20,
+                lineage,
+                20,
+            )?);
+            lineage = lineage.checked_add(1).ok_or("lineage overflow")?;
+        }
+    }
+    let mut dataset = BacktestDataset::try_new(BacktestDatasetInput {
+        manifest: feature_manifest()?,
+        object_graph_digest: Sha256Digest::new([51; 32]),
+        point_in_time_content: Sha256Digest::new([52; 32]),
+        point_in_time_audit: Sha256Digest::new([53; 32]),
+        instrument_definition_content: Sha256Digest::new([54; 32]),
+        instrument_definition_audit: Sha256Digest::new([55; 32]),
+        observations,
+    })?;
+    let qualification = crate::dataset::BacktestStudyQualification::try_new(
+        market_squawk_domain::HistoricalStudyBasis::HistoricalAsKnown,
+        Timestamp::from_unix_nanos(EVALUATION_DAYS * DAY),
+        Sha256Digest::new([76; 32]),
+        None,
+        &[market_squawk_domain::HistoricalStudyLimitation::PresentDayFixedCohort],
+    )?;
+    dataset.study_qualification = Some(qualification);
+    let corporate_actions = CorporateActionPlan::try_build(
+        CorporateActionPolicy::new(CorporateActionAdjustment::TotalReturn, NonZeroU32::MIN),
+        Timestamp::from_unix_nanos(EVALUATION_DAYS * DAY),
+        Timestamp::from_unix_nanos(EVALUATION_DAYS * DAY),
+        Vec::new(),
+        CorporateActionLimits::try_new(
+            NonZeroUsize::MIN,
+            NonZeroUsize::new(64 * 1024).ok_or("action bound")?,
+        )?,
+    )?;
+    let policy = RecommendationBacktestPolicyV1::try_new(RecommendationBacktestPolicyV1Input {
+        study_qualification: qualification,
+        subject_instrument_id: subject_terms.instrument_id(),
+        benchmark: RecommendationBenchmarkPolicyV1::try_new(
+            benchmark_terms.instrument_id(),
+            Sha256Digest::new([56; 32]),
+        )?,
+        accompanying_benchmark: RecommendationBenchmarkPolicyV1::try_new(
+            "00000000-0000-0000-0000-000000000022".parse()?,
+            Sha256Digest::new([60; 32]),
+        )?,
+        raw_price_evidence_digest: dataset.identity(),
+        corporate_action_content_digest: corporate_actions.content_hash(),
+        corporate_action_audit_digest: corporate_actions.audit_hash(),
+        corporate_action_coverage_starts_at: Timestamp::from_unix_nanos(0),
+        execution_basis: crate::dataset::BacktestExecutionBasis::ObservedQuoteDepth,
+        reporting_currency: Currency::try_from("USD")?,
+        subject_quantity: QuantityLots::new(1)?,
+        benchmark_quantity: QuantityLots::new(1)?,
+        maximum_entry_lag_nanos: 30 * DAY,
+        maximum_exit_lag_nanos: 30 * DAY,
+        execution_assumptions: recommendation_conservative_execution_assumptions_v1()?,
+        seed: 57,
+    })?;
+    let limits = RecommendationBacktestLimits::try_new(RecommendationBacktestLimitsInput {
+        max_folds: 3,
+        max_signals: 128,
+        max_equity_points_per_outcome: 64,
+        max_total_equity_points: 512,
+        max_observation_visits: 100_000,
+    })?;
+    let issuer_identity = RecommendationSignalIssuerIdentityV1::try_new(
+        SourceIdentifier::try_from("test-sequential-recommendation-issuer")?,
+        SourceIdentifier::try_from("test-sequential-recommendation-issuer-v1")?,
+        Sha256Digest::new([58; 32]),
+    )?;
+    let mut prior_signal_at = None;
+    let mut issued_count = 0_usize;
+    let materialized = RecommendationSignalPlanMaterializerV1::materialize_sequentially(
+        &dataset,
+        policy,
+        Timestamp::from_unix_nanos(0),
+        issuer_identity.clone(),
+        limits,
+        |information| {
+            let current = information.current();
+            let signal_at = information.signal_at();
+            assert_eq!(current.signal_at(), signal_at);
+            assert_eq!(current.subject().decision_at(), signal_at);
+            assert_eq!(current.benchmark().decision_at(), signal_at);
+            assert_eq!(
+                current.subject().instrument_id(),
+                subject_terms.instrument_id()
+            );
+            assert_eq!(
+                current.benchmark().instrument_id(),
+                benchmark_terms.instrument_id()
+            );
+            assert!(prior_signal_at.is_none_or(|prior| prior < signal_at));
+            prior_signal_at = Some(signal_at);
+            issued_count = issued_count
+                .checked_add(1)
+                .ok_or(crate::RecommendationSignalPlanMaterializationErrorV1::LimitExceeded)?;
+            let day = signal_at.unix_nanos() / DAY;
+            assert_eq!(
+                information.target_origin().unix_nanos(),
+                signal_at.unix_nanos() - 2
+            );
+            assert_eq!(
+                information.target_at().unix_nanos() - information.target_origin().unix_nanos(),
+                RECOMMENDATION_TARGET_HORIZON_NANOS_V1,
+            );
+            RecommendationSignalIssuanceV1::try_new(
+                SourceIdentifier::try_from(format!("sequential-signal-{issued_count}")).map_err(
+                    |_| crate::RecommendationSignalPlanMaterializationErrorV1::InvalidInstruction,
+                )?,
+                information.study_qualification(),
+                information.source_selection_as_of(),
+                information.target_origin(),
+                information.target_at(),
+                Sha256Digest::new([59; 32]),
+                if matches!(day, 0 | 500 | 740 | 1_200 | 1_460 | 2_000) {
+                    RecommendationSignalInstructionV1::Entry
+                } else {
+                    RecommendationSignalInstructionV1::NoAction
+                },
+            )
+        },
+    )?;
+    assert_eq!(issued_count, 110);
+    assert_eq!(materialized.paired_observation_count(), issued_count);
+    assert_eq!(materialized.issuer_identity(), &issuer_identity);
+    assert_ne!(materialized.digest().bytes(), [0; 32]);
+    assert_ne!(
+        materialized
+            .signal_plan()
+            .preauthorized_signal_plan_digest(),
+        issuer_identity.bindings_digest()
+    );
+    let retained = materialized.encode_persisted(128 * 1024)?;
+    let restored = crate::MaterializedRecommendationSignalPlanV1::restore_persisted(
+        &retained,
+        128 * 1024,
+        &dataset,
+        policy,
+        limits,
+    )?;
+    assert_eq!(restored, materialized);
+    // A forecast producer using the later decision clock preserves a nominal 365-day horizon,
+    // but still names the wrong financial target. It must fail before any outcome is observed.
+    let shifted = RecommendationSignalPlanMaterializerV1::materialize_sequentially(
+        &dataset,
+        policy,
+        Timestamp::from_unix_nanos(0),
+        issuer_identity.clone(),
+        limits,
+        |information| {
+            RecommendationSignalIssuanceV1::try_new(
+                SourceIdentifier::try_from("decision-shifted-target").map_err(|_| {
+                    crate::RecommendationSignalPlanMaterializationErrorV1::InvalidInstruction
+                })?,
+                information.study_qualification(),
+                information.source_selection_as_of(),
+                information.signal_at(),
+                information
+                    .signal_at()
+                    .checked_add_nanos(RECOMMENDATION_TARGET_HORIZON_NANOS_V1)
+                    .map_err(|_| {
+                        crate::RecommendationSignalPlanMaterializationErrorV1::InvalidInstruction
+                    })?,
+                Sha256Digest::new([59; 32]),
+                RecommendationSignalInstructionV1::Entry,
+            )
+        },
+    );
+    assert!(matches!(
+        shifted,
+        Err(crate::RecommendationSignalPlanMaterializationErrorV1::InvalidInstruction)
+    ));
+    let retrospective = crate::dataset::BacktestStudyQualification::try_new(
+        market_squawk_domain::HistoricalStudyBasis::RetrospectiveFrozenSnapshot,
+        qualification.snapshot_as_of(),
+        Sha256Digest::new([77; 32]),
+        Some(2),
+        &[
+            market_squawk_domain::HistoricalStudyLimitation::HistoricalRevisionCoverageUnproven,
+            market_squawk_domain::HistoricalStudyLimitation::LaterVintageInputs,
+            market_squawk_domain::HistoricalStudyLimitation::PresentDayFixedCohort,
+            market_squawk_domain::HistoricalStudyLimitation::SimulatedAvailability,
+        ],
+    )?;
+    let first = &materialized.signal_plan().signals()[0];
+    let later_known = RecommendationSignalV1::try_new(
+        SourceIdentifier::try_from("retrospective-original-availability")?,
+        0,
+        first.signal_at(),
+        retrospective.snapshot_as_of(),
+        retrospective.snapshot_as_of(),
+        retrospective,
+        first.target_origin(),
+        first.target_at(),
+        Sha256Digest::new([78; 32]),
+        RecommendationSignalInstructionV1::NoAction,
+    )?;
+    assert!(later_known.available_at() > later_known.signal_at());
+    assert_eq!(later_known.available_at(), retrospective.snapshot_as_of());
+    assert!(
+        RecommendationSignalV1::try_new(
+            SourceIdentifier::try_from("must-not-relabel-historical-availability")?,
+            0,
+            first.signal_at(),
+            retrospective.snapshot_as_of(),
+            retrospective.snapshot_as_of(),
+            qualification,
+            first.target_origin(),
+            first.target_at(),
+            Sha256Digest::new([78; 32]),
+            RecommendationSignalInstructionV1::NoAction,
+        )
+        .is_err()
+    );
+    let mut retrospective_dataset = dataset.clone();
+    retrospective_dataset.study_qualification = Some(retrospective);
+    let observations = retrospective_dataset
+        .observations
+        .iter()
+        .map(|value| {
+            let mut value = value?;
+            value.source_selection_as_of = retrospective.snapshot_as_of();
+            Ok::<_, BacktestError>(value)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    retrospective_dataset.observations =
+        crate::dataset::observation_store::ObservationStore::from_observations(observations)?;
+    let retrospective_policy =
+        RecommendationBacktestPolicyV1::try_new(RecommendationBacktestPolicyV1Input {
+            study_qualification: retrospective,
+            subject_instrument_id: policy.subject_instrument_id(),
+            benchmark: policy.benchmark(),
+            accompanying_benchmark: policy.accompanying_benchmark(),
+            raw_price_evidence_digest: policy.raw_price_evidence_digest(),
+            corporate_action_content_digest: policy.corporate_action_content_digest(),
+            corporate_action_audit_digest: policy.corporate_action_audit_digest(),
+            corporate_action_coverage_starts_at: policy.corporate_action_coverage_starts_at(),
+            execution_basis: policy.execution_basis(),
+            reporting_currency: policy.reporting_currency(),
+            subject_quantity: policy.subject_quantity(),
+            benchmark_quantity: policy.benchmark_quantity(),
+            maximum_entry_lag_nanos: policy.maximum_entry_lag_nanos(),
+            maximum_exit_lag_nanos: policy.maximum_exit_lag_nanos(),
+            execution_assumptions: policy.execution_assumptions(),
+            seed: policy.seed(),
+        })?;
+    let retrospective_plan = RecommendationSignalPlanMaterializerV1::materialize_sequentially(
+        &retrospective_dataset,
+        retrospective_policy,
+        Timestamp::from_unix_nanos(0),
+        issuer_identity.clone(),
+        limits,
+        |information| {
+            RecommendationSignalIssuanceV1::try_new(
+                SourceIdentifier::try_from(format!(
+                    "retrospective-{}",
+                    information.signal_at().unix_nanos()
+                ))
+                .map_err(|_| {
+                    crate::RecommendationSignalPlanMaterializationErrorV1::InvalidInstruction
+                })?,
+                information.study_qualification(),
+                information.source_selection_as_of(),
+                information.target_origin(),
+                information.target_at(),
+                Sha256Digest::new([79; 32]),
+                RecommendationSignalInstructionV1::NoAction,
+            )
+        },
+    )?;
+    assert_eq!(
+        retrospective_plan.paired_observation_count(),
+        materialized.paired_observation_count()
+    );
+    let retrospective_bytes = retrospective_plan.encode_persisted(256 * 1024)?;
+    let restored_retrospective = crate::MaterializedRecommendationSignalPlanV1::restore_persisted(
+        &retrospective_bytes,
+        256 * 1024,
+        &retrospective_dataset,
+        retrospective_policy,
+        limits,
+    )?;
+    assert_eq!(restored_retrospective, retrospective_plan);
+    assert_ne!(retrospective_plan.digest(), materialized.digest());
+    let tampered = std::str::from_utf8(&retained)?.replacen(
+        "\"instruction\":\"Entry\"",
+        "\"instruction\":\"NoAction\"",
+        1,
+    );
+    assert_ne!(tampered.as_bytes(), retained);
+    assert!(
+        crate::MaterializedRecommendationSignalPlanV1::restore_persisted(
+            tampered.as_bytes(),
+            128 * 1024,
+            &dataset,
+            policy,
+            limits,
+        )
+        .is_err()
+    );
+    let simulation_cutoff = Timestamp::from_unix_nanos(EVALUATION_DAYS * DAY);
+    let publication = RecommendationBacktestPublicationV1::try_new(
+        simulation_cutoff,
+        simulation_cutoff.checked_add_nanos(1)?,
+        simulation_cutoff.checked_add_nanos(2)?,
+        simulation_cutoff.checked_add_nanos(3)?,
+        simulation_cutoff.checked_add_nanos(4)?,
+    )?;
+    let study = RecommendationBacktestKernelV1::run_materialized_study(
+        &dataset,
+        policy,
+        &corporate_actions,
+        &materialized,
+        publication,
+        limits,
+        &CancellationToken::new(),
+    )?;
+    let RecommendationAggregateEvidenceV1::Available(aggregate) = study.aggregate() else {
+        return Err("expected complete sequential recommendation study".into());
+    };
+    assert_eq!(aggregate.observation_count(), 3);
+    assert_eq!(study.results().len(), 110);
+    assert_eq!(
+        study
+            .results()
+            .iter()
+            .filter(|result| matches!(
+                result.disposition(),
+                crate::RecommendationSignalDispositionV1::Censored(_),
+            ))
+            .count(),
+        3
+    );
+    assert_eq!(
+        materialized
+            .signal_plan()
+            .signals()
+            .iter()
+            .filter(|signal| matches!(
+                signal.instruction(),
+                RecommendationSignalInstructionV1::Entry,
+            ))
+            .count(),
+        6
     );
     Ok(())
 }
@@ -437,7 +1414,7 @@ fn governed_trial_identity_binds_every_immutable_request_input() -> TestResult {
                 seed: request.seed(),
                 parameters: Vec::new(),
                 search_space: Vec::new(),
-                selection_criterion: SourceIdentifier::try_from("total-return")?,
+                selection_criterion: SourceIdentifier::try_from("cost-adjusted-total-return")?,
             })?
             .id(),
         );
@@ -485,7 +1462,7 @@ fn post_reservation_validation_fails_terminally_before_artifact_publication() ->
         })?,
     )?;
     let service = BacktestService::new(inventory);
-    let (registry, build_id) = strategy_registry(account_id)?;
+    let (registry, build_id) = strategy_registry(account_id, b"buy-once-build-metadata-v1")?;
     let mut strategy = registry.admit(&build_id)?;
     assert!(matches!(
         service.run(
@@ -494,7 +1471,7 @@ fn post_reservation_validation_fails_terminally_before_artifact_publication() ->
             BacktestTrialPlan::new(
                 Vec::new(),
                 Vec::new(),
-                SourceIdentifier::try_from("total-return")?,
+                SourceIdentifier::try_from("cost-adjusted-total-return")?,
             ),
             &CancellationToken::new(),
         ),
@@ -503,16 +1480,16 @@ fn post_reservation_validation_fails_terminally_before_artifact_publication() ->
         ))
     ));
     assert_eq!(
-        std::fs::read_dir(temporary.path().join("backtesting/v1/reservations"))?.count(),
+        std::fs::read_dir(temporary.path().join("backtesting/v3/reservations"))?.count(),
         1
     );
-    let terminal_directory = std::fs::read_dir(temporary.path().join("backtesting/v1/terminals"))?
+    let terminal_directory = std::fs::read_dir(temporary.path().join("backtesting/v3/terminals"))?
         .next()
         .ok_or("missing failed terminal directory")??
         .path();
     assert_eq!(std::fs::read_dir(terminal_directory)?.count(), 1);
     assert_eq!(
-        std::fs::read_dir(temporary.path().join("backtesting/v1/artifacts/sha256"))?.count(),
+        std::fs::read_dir(temporary.path().join("backtesting/v3/artifacts/sha256"))?.count(),
         0
     );
     Ok(())
@@ -560,7 +1537,7 @@ fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record()
     let inventory = ExperimentInventory::try_new(root, limits)?;
     let service = BacktestService::new(inventory);
     let account_id: AccountId = "00000000-0000-0000-0000-000000000030".parse()?;
-    let (registry, build_id) = strategy_registry(account_id)?;
+    let (registry, build_id) = strategy_registry(account_id, b"buy-once-build-metadata-v1")?;
     let parameters = &["fast", "medium", "slow"];
     let universe = cohort_universe(&[(10, 40), (70, 100)], 40)?;
     let differently_bounded_universe = BacktestCohortUniverse::try_new(
@@ -611,7 +1588,7 @@ fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record()
                         SourceIdentifier::try_from("slow")?,
                     ],
                 )?],
-                SourceIdentifier::try_from("total-return")?,
+                SourceIdentifier::try_from("cost-adjusted-total-return")?,
             )
             .with_cohort_universe(universe.clone()),
             &CancellationToken::new(),
@@ -619,7 +1596,7 @@ fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record()
         Err(BacktestServiceError::InvalidCohort)
     ));
     assert_eq!(
-        std::fs::read_dir(temporary.path().join("backtesting/v1/reservations"))?.count(),
+        std::fs::read_dir(temporary.path().join("backtesting/v3/reservations"))?.count(),
         0
     );
     let (first_fold, selection_candidates, first_candidates) = completed_cohort_fold(
@@ -636,7 +1613,7 @@ fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record()
                 BacktestCohortFold::try_new(second_candidates[..2].to_vec())?,
             ],
             selection_candidates[..2].to_vec(),
-            SourceIdentifier::try_from("total-return")?,
+            SourceIdentifier::try_from("cost-adjusted-total-return")?,
         ),
         Err(ExperimentError::InvalidDiagnostic)
     ));
@@ -645,7 +1622,7 @@ fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record()
             cohort_universe(&[(10, 40), (70, 100), (130, 160)], 40)?,
             vec![first_fold.clone(), second_fold.clone()],
             selection_candidates.clone(),
-            SourceIdentifier::try_from("total-return")?,
+            SourceIdentifier::try_from("cost-adjusted-total-return")?,
         ),
         Err(ExperimentError::InvalidDiagnostic)
     ));
@@ -658,7 +1635,7 @@ fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record()
                 .chain(&second_selection)
                 .copied()
                 .collect(),
-            SourceIdentifier::try_from("total-return")?,
+            SourceIdentifier::try_from("cost-adjusted-total-return")?,
         ),
         Err(ExperimentError::InvalidDiagnostic)
     ));
@@ -689,21 +1666,21 @@ fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record()
             second_fold.clone(),
         ],
         authority_selection,
-        SourceIdentifier::try_from("total-return")?,
+        SourceIdentifier::try_from("cost-adjusted-total-return")?,
     )?;
     assert!(matches!(
         service.evaluate_cohort(authority_plan),
         Err(BacktestServiceError::InvalidCohort)
     ));
     assert_eq!(
-        std::fs::read_dir(temporary.path().join("backtesting/v1/cohorts"))?.count(),
+        std::fs::read_dir(temporary.path().join("backtesting/v3/cohorts"))?.count(),
         0
     );
     let plan = BacktestCohortPlan::try_new(
         universe,
         vec![first_fold, second_fold],
         selection_candidates.clone(),
-        SourceIdentifier::try_from("total-return")?,
+        SourceIdentifier::try_from("cost-adjusted-total-return")?,
     )?;
     let constrained_plan = plan.clone();
 
@@ -722,7 +1699,7 @@ fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record()
     );
     assert!((0.0..=1.0).contains(&evaluation.deflated_performance().probability()));
     assert_eq!(
-        std::fs::read_dir(temporary.path().join("backtesting/v1/cohorts"))?.count(),
+        std::fs::read_dir(temporary.path().join("backtesting/v3/cohorts"))?.count(),
         1
     );
     let evaluation_id = evaluation.id();
@@ -752,7 +1729,7 @@ fn cohort_evaluation_uses_completed_metrics_and_publishes_one_immutable_record()
         .collect::<String>();
     let evaluation_path = temporary
         .path()
-        .join("backtesting/v1/cohorts")
+        .join("backtesting/v3/cohorts")
         .join(format!("{evaluation_hex}.json"));
     let original_evaluation = std::fs::read(&evaluation_path)?;
     let mut cardinality_mismatch: serde_json::Value = serde_json::from_slice(&original_evaluation)?;
@@ -808,118 +1785,6 @@ fn expired_trial_attempt_can_be_recovered_without_overlapping_an_active_lease() 
         Err(ExperimentError::Unavailable)
     ));
 
-    const V1_TRIAL_ID: [u8; 32] = [
-        204, 192, 179, 164, 28, 112, 23, 169, 97, 98, 112, 138, 90, 51, 232, 124, 231, 70, 161,
-        146, 67, 140, 231, 172, 104, 88, 18, 93, 39, 92, 71, 221,
-    ];
-    const V1_RESERVATION: &str = r#"{"schema_version":1,"trial_id":"ccc0b3a41c7017a96162708a5a33e87ce746a192438ce7ac6858125d275c47dd","spec":{"dataset_identity":"0101010101010101010101010101010101010101010101010101010101010101","object_graph_digest":"0202020202020202020202020202020202020202020202020202020202020202","execution_assumption_digest":"0303030303030303030303030303030303030303030303030303030303030303","model":null,"strategy":{"name":"strategy-v1","digest":"0505050505050505050505050505050505050505050505050505050505050505"},"code":{"name":"code-revision","digest":"0606060606060606060606060606060606060606060606060606060606060606"},"configuration_digest":"0707070707070707070707070707070707070707070707070707070707070707","seed":7,"parameters":[],"search_space":[],"selection_criterion":"total-return"}}"#;
-    std::fs::write(
-        temporary
-            .path()
-            .join("backtesting/v1/reservations/ccc0b3a41c7017a96162708a5a33e87ce746a192438ce7ac6858125d275c47dd.json"),
-        V1_RESERVATION,
-    )?;
-    let legacy_id = TrialId::from_digest(Sha256Digest::new(V1_TRIAL_ID));
-    assert_eq!(inventory.trial(legacy_id)?.spec().id(), legacy_id);
-
-    let legacy_attempt_terminal_parent = temporary.path().join(
-        "backtesting/v1/terminals/ccc0b3a41c7017a96162708a5a33e87ce746a192438ce7ac6858125d275c47dd",
-    );
-    std::fs::create_dir(&legacy_attempt_terminal_parent)?;
-    let legacy_attempt_terminal = legacy_attempt_terminal_parent.join("00000000000000000001.json");
-    std::fs::write(&legacy_attempt_terminal, b"{}")?;
-    assert!(matches!(
-        inventory.trial(legacy_id),
-        Err(ExperimentError::CorruptRecord)
-    ));
-    std::fs::remove_file(legacy_attempt_terminal)?;
-
-    let legacy_artifact = br#"{"legacy":true}"#;
-    let legacy_artifact_reference = "backtesting/v1/artifacts/sha256/60/600bfa81b1561fa6281505a8630327ec94da208976f36c142c781b0b46a95725.json";
-    let legacy_terminal_path = temporary
-        .path()
-        .join("backtesting/v1/terminals/ccc0b3a41c7017a96162708a5a33e87ce746a192438ce7ac6858125d275c47dd.json");
-    std::fs::write(
-        &legacy_terminal_path,
-        serde_json::to_vec(&serde_json::json!({
-            "schema_version": 1,
-            "trial_id": "ccc0b3a41c7017a96162708a5a33e87ce746a192438ce7ac6858125d275c47dd",
-            "status": "completed",
-            "completed": {
-                "result_digest": "0909090909090909090909090909090909090909090909090909090909090909",
-                "artifact_reference": legacy_artifact_reference,
-                "artifact_digest": "600bfa81b1561fa6281505a8630327ec94da208976f36c142c781b0b46a95725",
-                "artifact_bytes": legacy_artifact.len(),
-                "metrics": [],
-                "probability_of_backtest_overfitting": 0.25,
-                "probability_fold_count": 2,
-                "deflated_performance_probability": 0.75,
-                "expected_maximum_sharpe": 0.5,
-                "selected": true
-            },
-            "failed": null
-        }))?,
-    )?;
-    assert!(matches!(
-        inventory.trial(legacy_id),
-        Err(ExperimentError::CorruptRecord)
-    ));
-    let legacy_artifact_path = temporary.path().join(legacy_artifact_reference);
-    std::fs::create_dir_all(
-        legacy_artifact_path
-            .parent()
-            .ok_or("missing legacy artifact parent")?,
-    )?;
-    std::fs::write(&legacy_artifact_path, legacy_artifact)?;
-    assert!(matches!(
-        inventory.trial(legacy_id)?.status(),
-        TrialStatus::Completed(_)
-    ));
-    std::fs::write(&legacy_artifact_path, b"xxxxxxxxxxxxxxx")?;
-    assert!(matches!(
-        inventory.trial(legacy_id),
-        Err(ExperimentError::CorruptRecord)
-    ));
-
-    const V2_TRIAL_ID: [u8; 32] = [
-        62, 253, 167, 147, 117, 60, 225, 151, 9, 248, 210, 184, 142, 210, 23, 180, 136, 19, 17,
-        215, 191, 201, 233, 214, 201, 33, 9, 47, 49, 121, 83, 50,
-    ];
-    const V2_TRIAL_HEX: &str = "3efda793753ce19709f8d2b88ed217b4881311d7bfc9e9d6c921092f31795332";
-    const V2_RESERVATION: &str = r#"{"schema_version":2,"trial_id":"3efda793753ce19709f8d2b88ed217b4881311d7bfc9e9d6c921092f31795332","spec":{"dataset_identity":"0101010101010101010101010101010101010101010101010101010101010101","object_graph_digest":"0202020202020202020202020202020202020202020202020202020202020202","execution_assumption_digest":"0303030303030303030303030303030303030303030303030303030303030303","run_input_digest":"0404040404040404040404040404040404040404040404040404040404040404","model":null,"strategy":{"name":"strategy-v1","digest":"0505050505050505050505050505050505050505050505050505050505050505"},"code":{"name":"code-revision","digest":"0606060606060606060606060606060606060606060606060606060606060606"},"configuration_digest":"0707070707070707070707070707070707070707070707070707070707070707","seed":7,"parameters":[],"search_space":[],"selection_criterion":"total-return"}}"#;
-    std::fs::write(
-        temporary
-            .path()
-            .join(format!("backtesting/v1/reservations/{V2_TRIAL_HEX}.json")),
-        V2_RESERVATION,
-    )?;
-    let v2_terminal_path = temporary
-        .path()
-        .join(format!("backtesting/v1/terminals/{V2_TRIAL_HEX}.json"));
-    let failed_terminal = |schema_version| {
-        serde_json::to_vec(&serde_json::json!({
-            "schema_version": schema_version,
-            "trial_id": V2_TRIAL_HEX,
-            "status": "failed",
-            "completed": null,
-            "failed": {
-                "code": "legacy-failure",
-                "evidence_digest": "0808080808080808080808080808080808080808080808080808080808080808"
-            }
-        }))
-    };
-    std::fs::write(&v2_terminal_path, failed_terminal(1)?)?;
-    let v2_id = TrialId::from_digest(Sha256Digest::new(V2_TRIAL_ID));
-    assert!(matches!(
-        inventory.trial(v2_id),
-        Err(ExperimentError::CorruptRecord)
-    ));
-    std::fs::write(&v2_terminal_path, failed_terminal(2)?)?;
-    assert!(matches!(
-        inventory.trial(v2_id)?.status(),
-        TrialStatus::Failed(_)
-    ));
-
     let spec = test_trial_spec()?;
 
     let _first = inventory.reserve_at(spec.clone(), Timestamp::from_unix_nanos(100), 10)?;
@@ -932,7 +1797,7 @@ fn expired_trial_attempt_can_be_recovered_without_overlapping_an_active_lease() 
         .collect::<String>();
     let current_attempt_terminals = temporary
         .path()
-        .join("backtesting/v1/terminals")
+        .join("backtesting/v3/terminals")
         .join(&current_trial_hex);
     std::fs::create_dir(&current_attempt_terminals)?;
     let orphan_terminal = current_attempt_terminals.join("00000000000000000003.json");
@@ -942,27 +1807,6 @@ fn expired_trial_attempt_can_be_recovered_without_overlapping_an_active_lease() 
         Err(ExperimentError::CorruptRecord)
     ));
     std::fs::remove_file(orphan_terminal)?;
-    let current_legacy_terminal = temporary
-        .path()
-        .join(format!("backtesting/v1/terminals/{current_trial_hex}.json"));
-    std::fs::write(
-        &current_legacy_terminal,
-        serde_json::to_vec(&serde_json::json!({
-            "schema_version": 2,
-            "trial_id": current_trial_hex,
-            "status": "failed",
-            "completed": null,
-            "failed": {
-                "code": "wrong-path",
-                "evidence_digest": "0808080808080808080808080808080808080808080808080808080808080808"
-            }
-        }))?,
-    )?;
-    assert!(matches!(
-        inventory.trial(spec.id()),
-        Err(ExperimentError::CorruptRecord)
-    ));
-    std::fs::remove_file(current_legacy_terminal)?;
     assert!(matches!(
         inventory.reserve_at(spec.clone(), Timestamp::from_unix_nanos(110), 10),
         Err(ExperimentError::TrialInProgress)
@@ -984,13 +1828,13 @@ fn expired_trial_attempt_can_be_recovered_without_overlapping_an_active_lease() 
             result_digest: Sha256Digest::new([9; 32]),
             artifact: artifact.clone(),
             metrics: vec![TrialMetric::try_new(
-                SourceIdentifier::try_from("total-return")?,
+                SourceIdentifier::try_from("cost-adjusted-total-return")?,
                 0.1,
             )?],
-            dataset_partition: Some(TrialDatasetPartition::try_new(
+            dataset_partition: TrialDatasetPartition::try_new(
                 Timestamp::from_unix_nanos(10),
                 Timestamp::from_unix_nanos(30),
-            )?),
+            )?,
         },
     )?;
     inventory.complete(recovered, completion, artifact_bytes)?;
@@ -998,7 +1842,7 @@ fn expired_trial_attempt_can_be_recovered_without_overlapping_an_active_lease() 
     let final_path = temporary.path().join(artifact.reference());
     let pending_path = temporary
         .path()
-        .join("backtesting/v1/pending")
+        .join("backtesting/v3/pending")
         .join(current_trial_hex)
         .join("00000000000000000002.json");
     std::fs::create_dir_all(pending_path.parent().ok_or("missing pending parent")?)?;
@@ -1043,7 +1887,7 @@ fn attempt_recovery_rejects_noncanonical_unbound_or_gapped_namespace() -> TestRe
         .collect::<String>();
     let attempts = temporary
         .path()
-        .join("backtesting/v1/attempts")
+        .join("backtesting/v3/attempts")
         .join(trial_hex);
     let first_path = attempts.join("00000000000000000001.json");
     let first_bytes = std::fs::read(&first_path)?;
@@ -1082,8 +1926,52 @@ fn attempt_recovery_rejects_noncanonical_unbound_or_gapped_namespace() -> TestRe
 fn corporate_action_state_is_visible_at_event_time_and_independently_reconciled() -> TestResult {
     let account_id: AccountId = "00000000-0000-0000-0000-000000000030".parse()?;
     let terms = execution_terms()?;
-    let plan = split_plan(terms.instrument_id())?;
-    let request = request(account_id, dataset(terms)?, Some(plan))?;
+    let original = split_plan(terms.instrument_id())?;
+    let make_split = |at, numerator, denominator| -> Result<_, Box<dyn Error>> {
+        let effective = Timestamp::from_unix_nanos(at);
+        let source = SourceIdentifier::try_from(format!("round-trip-split-{at}"))?;
+        let observation = CorporateActionObservation::new(
+            ResearchContext::new(
+                ResearchProvenance::try_new(ResearchProvenanceInput {
+                    source_id: SourceId::try_from("official-actions")?,
+                    instrument_id: Some(terms.instrument_id()),
+                    venue_id: Some(VenueId::try_from("XNAS")?),
+                    source_identifier: source.clone(),
+                    source_timestamp: Some(effective),
+                    received_at: effective,
+                    ingested_at: effective,
+                    quality: DataQuality::OfficialDelayed,
+                    payload_reference: PayloadReference::SourceReference(source.clone()),
+                    availability: AvailabilityEvidence::evidenced(effective, source),
+                })?,
+                ResearchTime::new(effective, None, RevisionNumber::new(1)?, None)?,
+            )?,
+            CorporateActionKind::Split {
+                numerator: NonZeroU32::new(numerator).ok_or("numerator")?,
+                denominator: NonZeroU32::new(denominator).ok_or("denominator")?,
+            },
+        )?;
+        Ok(CorporateActionRecord::new(
+            observation,
+            original.admitted()[0].source_manifest().clone(),
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [u8::try_from(at)?; 32]),
+        ))
+    };
+    let plan = CorporateActionPlan::try_build(
+        original.policy(),
+        original.knowledge_cutoff(),
+        original.valuation_cutoff(),
+        vec![make_split(25, 3, 1)?, make_split(28, 1, 3)?],
+        CorporateActionLimits::try_new(
+            NonZeroUsize::new(2).ok_or("actions")?,
+            NonZeroUsize::new(64 * 1024).ok_or("bytes")?,
+        )?,
+    )?;
+    let request = request(
+        account_id,
+        dataset_with_depths(terms, [10, 3, 10])?,
+        Some(plan),
+    )?;
     let mut strategy = BuyOnce {
         account_id,
         time_in_force: TimeInForce::Day,
@@ -1097,13 +1985,16 @@ fn corporate_action_state_is_visible_at_event_time_and_independently_reconciled(
         result.accounting_reconciliation(),
         AccountingReconciliation::Independent
     );
-    assert_eq!(strategy.last_position, Decimal::from(4));
+    assert_eq!(result.fills()?.len(), 1);
+    assert_eq!(result.fills()?[0].quantity().get(), 3);
+    // Three units become nine, then exactly three. Dividing 1 by 3 first loses decimal units.
+    assert_eq!(strategy.last_position, Decimal::from(3));
     assert_eq!(
         result
             .portfolio()
             .position(terms.instrument_id())
             .map(|position| position.quantity()),
-        Some(Decimal::from(4))
+        Some(Decimal::from(3))
     );
     Ok(())
 }
@@ -1119,7 +2010,7 @@ fn typed_model_failure_is_audited_no_action() -> TestResult {
 
     let result = BacktestEngine::run(&request, &mut strategy, &CancellationToken::new())?;
 
-    assert!(result.fills().is_empty());
+    assert!(result.fills()?.is_empty());
     assert_eq!(result.no_action_count(), 3);
     assert!(result.portfolio().positions().is_empty());
     Ok(())
@@ -1127,6 +2018,7 @@ fn typed_model_failure_is_audited_no_action() -> TestResult {
 
 fn strategy_registry(
     account_id: AccountId,
+    build_metadata: &[u8],
 ) -> Result<(BacktestStrategyRegistry, SourceIdentifier), Box<dyn Error>> {
     let build_id = SourceIdentifier::try_from("buy-once-v1")?;
     let receipt = BacktestBuildReceipt::try_from_evidence(
@@ -1134,7 +2026,7 @@ fn strategy_registry(
         BacktestStrategyClass::RuleBased,
         SourceIdentifier::try_from("buy-once")?,
         b"buy-once-source-closure-v1",
-        b"buy-once-executable-v1",
+        build_metadata,
         b"{\"quantity_lots\":4}",
     )?;
     let registry = BacktestStrategyRegistry::try_new(vec![BacktestBuildRegistration::new(
@@ -1244,7 +2136,7 @@ fn run_governed_request(
                     SourceIdentifier::try_from("slow")?,
                 ],
             )?],
-            SourceIdentifier::try_from("total-return")?,
+            SourceIdentifier::try_from("cost-adjusted-total-return")?,
         )
         .with_cohort_universe(universe.clone()),
         &CancellationToken::new(),
@@ -1320,7 +2212,7 @@ fn test_trial_spec() -> Result<TrialSpec, Box<dyn Error>> {
         seed: request.seed(),
         parameters: Vec::new(),
         search_space: Vec::new(),
-        selection_criterion: SourceIdentifier::try_from("total-return")?,
+        selection_criterion: SourceIdentifier::try_from("cost-adjusted-total-return")?,
     })?)
 }
 
@@ -1475,6 +2367,28 @@ fn observation(
         universe: HistoricalUniverseStatus::Eligible,
         features: Vec::new(),
         lineage_digest: Sha256Digest::new([u8::try_from(at)?; 32]),
+    })?)
+}
+
+fn recommendation_observation(
+    execution_terms: InstrumentExecutionTerms,
+    at: i64,
+    mid_price_ticks: i64,
+    lineage: u8,
+    depth_lots: i64,
+) -> Result<BacktestObservation, Box<dyn Error>> {
+    Ok(BacktestObservation::try_new(BacktestObservationInput {
+        execution_terms,
+        event_at: Timestamp::from_unix_nanos(at - 2),
+        available_at: Timestamp::from_unix_nanos(at - 1),
+        decision_at: Timestamp::from_unix_nanos(at),
+        stale_at: Timestamp::from_unix_nanos(at + 5),
+        mid_price: Some(PriceTicks::new(mid_price_ticks)),
+        spread_basis_points: BasisPoints::new(20),
+        executable_depth: QuantityLots::new(depth_lots)?,
+        universe: HistoricalUniverseStatus::Eligible,
+        features: Vec::new(),
+        lineage_digest: Sha256Digest::new([lineage; 32]),
     })?)
 }
 

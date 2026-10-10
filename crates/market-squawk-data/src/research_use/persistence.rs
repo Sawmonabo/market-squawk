@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 use std::time::Instant;
 
-use market_squawk_domain::Timestamp;
+use market_squawk_domain::{EvidenceDigest, Timestamp};
 use rusqlite::{OptionalExtension as _, Transaction, params};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
@@ -235,6 +235,26 @@ pub(super) fn authorize(
         .checked_add(request.limits.traversal_deadline())
         .ok_or(ResearchUseCatalogError::DeadlineExceeded)?;
     let graph = super::traversal::load_graph(transaction, &request, cancellation, deadline)?;
+    authorize_resolved(
+        transaction,
+        session_id,
+        now,
+        request,
+        graph,
+        cancellation,
+        deadline,
+    )
+}
+
+pub(super) fn authorize_resolved(
+    transaction: &Transaction<'_>,
+    session_id: Uuid,
+    now: Timestamp,
+    request: ResearchUseRequest,
+    graph: ResearchUseGraph,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<AuthorizationTransactionOutcome, ResearchUseCatalogError> {
     super::traversal::check_control(cancellation, deadline)?;
     let (authorities, selections, frontier, denial) = select_authorities(
         transaction,
@@ -370,33 +390,27 @@ pub(super) fn publish_derived(
 }
 
 #[derive(Clone)]
-enum SourceSelection {
+pub(super) enum SourceSelection {
     Selected(Box<ResearchUseAuthorityEvidence>),
     Missing,
 }
 
-type AuthoritySelections = (
+pub(super) type AuthoritySelections = (
     Vec<ResearchUseAuthorityEvidence>,
     BTreeMap<u64, SourceSelection>,
     u64,
     Option<ResearchUseDenialReason>,
 );
 
-fn select_authorities(
-    transaction: &Transaction<'_>,
+pub(super) fn select_authorities(
+    transaction: &rusqlite::Connection,
     graph: &ResearchUseGraph,
     requested_use: super::ResearchUse,
     now: Timestamp,
     cancellation: &CancellationToken,
     deadline: Instant,
 ) -> Result<AuthoritySelections, ResearchUseCatalogError> {
-    let frontier: i64 = transaction.query_row(
-        "SELECT COALESCE(MAX(revocation_sequence), 0)
-         FROM source_research_use_revocations WHERE recorded_at_ns<=?1",
-        [now.unix_nanos()],
-        |row| row.get(0),
-    )?;
-    let frontier = u64::try_from(frontier).map_err(|_| ResearchUseCatalogError::CorruptCatalog)?;
+    let frontier = source_use_frontier(transaction, now)?;
     let mut authorities = Vec::new();
     authorities
         .try_reserve_exact(graph.sources().len())
@@ -405,7 +419,16 @@ fn select_authorities(
     let mut denial = None;
     for source in graph.sources() {
         super::traversal::check_control(cancellation, deadline)?;
-        match select_source_authority(transaction, source, requested_use, now, frontier)? {
+        match select_source_authority(
+            transaction,
+            source,
+            requested_use,
+            now,
+            frontier,
+            None,
+            cancellation,
+            deadline,
+        )? {
             SourceAuthority::Selected(authority) => {
                 authorities.push(authority.as_ref().clone());
                 selections.insert(
@@ -422,116 +445,194 @@ fn select_authorities(
     Ok((authorities, selections, frontier, denial))
 }
 
-enum SourceAuthority {
+pub(super) enum SourceAuthority {
     Selected(Box<ResearchUseAuthorityEvidence>),
     Denied(ResearchUseDenialReason),
 }
 
-fn select_source_authority(
-    transaction: &Transaction<'_>,
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct RetainedSourceUseGrant {
+    pub(crate) selected_rights_id: [u8; 32],
+    pub(crate) rights_basis_digest: [u8; 32],
+    pub(crate) authorization_evidence: EvidenceDigest,
+    pub(crate) rights_expires_at: Option<Timestamp>,
+    pub(crate) research_grant_id: [u8; 32],
+    pub(crate) grant_evidence: EvidenceDigest,
+    pub(crate) grant_expires_at: Option<Timestamp>,
+}
+pub(crate) enum SourceGrantSelection {
+    Selected(RetainedSourceUseGrant),
+    Denied(ResearchUseDenialReason),
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the exact source and optional selected grant share one authority evaluator"
+)]
+pub(super) fn select_source_authority(
+    transaction: &rusqlite::Connection,
     source: &ResearchUseSourceInput,
     requested_use: super::ResearchUse,
     now: Timestamp,
     frontier: u64,
+    expected_grant: Option<[u8; 32]>,
+    cancellation: &CancellationToken,
+    deadline: Instant,
 ) -> Result<SourceAuthority, ResearchUseCatalogError> {
-    let rights = transaction
+    match select_source_use_grant(
+        transaction,
+        source.rights_id(),
+        source.source_id(),
+        requested_use,
+        now,
+        frontier,
+        expected_grant,
+        cancellation,
+        deadline,
+    )? {
+        SourceGrantSelection::Denied(reason) => Ok(SourceAuthority::Denied(reason)),
+        SourceGrantSelection::Selected(grant) => Ok(SourceAuthority::Selected(Box::new(
+            ResearchUseAuthorityEvidence::try_new(
+                source.clone(),
+                grant.selected_rights_id,
+                grant.rights_basis_digest,
+                grant.authorization_evidence,
+                grant.rights_expires_at,
+                grant.research_grant_id,
+                grant.grant_evidence,
+                grant.grant_expires_at,
+                frontier,
+            )
+            .map_err(|_| ResearchUseCatalogError::CorruptCatalog)?,
+        ))),
+    }
+}
+
+// A current authorization may cover an original payload only under the same exact policy.
+// Observation/doctor clocks do not identify that payload or policy; all other evidence does.
+pub(super) const EXACT_RIGHTS_FAMILY: &str = "current.source_id=original.source_id
+ AND current.payload_algorithm=original.payload_algorithm AND current.payload_digest=original.payload_digest
+ AND current.basis_kind=original.basis_kind AND current.basis_reference=original.basis_reference
+ AND current.basis_algorithm=original.basis_algorithm AND current.basis_digest=original.basis_digest
+ AND current.basis_root_algorithm IS original.basis_root_algorithm
+ AND current.basis_root_digest IS original.basis_root_digest
+ AND current.authorization_algorithm=original.authorization_algorithm
+ AND current.authorization_digest=original.authorization_digest";
+
+pub(super) fn source_use_revoked(
+    connection: &rusqlite::Connection,
+    original_rights: [u8; 32],
+    requested_use: super::ResearchUse,
+    now: Timestamp,
+    frontier: u64,
+) -> Result<bool, ResearchUseCatalogError> {
+    Ok(connection.query_row(
+        &format!("SELECT EXISTS(SELECT 1 FROM source_rights AS original
+         JOIN source_rights AS current ON {EXACT_RIGHTS_FAMILY}
+         JOIN source_research_use_grants AS grant ON grant.rights_id=current.rights_id
+         JOIN source_research_use_revocations AS revoked ON revoked.research_grant_id=grant.research_grant_id
+         WHERE original.rights_id=?1 AND revoked.revocation_sequence<=?2
+           AND revoked.effective_at_ns<=?3 AND revoked.recorded_at_ns<=?3
+           AND (revoked.use_mask & ?4)<>0)"),
+        params![original_rights, to_i64(frontier)?, now.unix_nanos(), research_use_mask(requested_use)],
+        |row| row.get(0),
+    )?)
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "original source grant coordinates and control remain exact"
+)]
+pub(crate) fn select_source_use_grant(
+    transaction: &rusqlite::Connection,
+    rights_id: [u8; 32],
+    source_id: &market_squawk_domain::SourceId,
+    requested_use: super::ResearchUse,
+    now: Timestamp,
+    frontier: u64,
+    expected_grant: Option<[u8; 32]>,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<SourceGrantSelection, ResearchUseCatalogError> {
+    super::traversal::check_control(cancellation, deadline)?;
+    let original: (i64, Option<i64>) = transaction
         .query_row(
-            "SELECT basis_digest, authorization_algorithm, authorization_digest,
-                    authorization_expires_at_ns
-             FROM source_rights WHERE rights_id=?1 AND source_id=?2",
-            params![source.rights_id(), source.source_id().as_str()],
-            |row| {
-                Ok((
-                    row.get::<_, Vec<u8>>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Vec<u8>>(2)?,
-                    row.get::<_, Option<i64>>(3)?,
-                ))
-            },
+            "SELECT operation_mask, authorization_expires_at_ns FROM source_rights
+         WHERE rights_id=?1 AND source_id=?2 AND admitted_at_ns<=?3",
+            params![rights_id, source_id.as_str(), now.unix_nanos()],
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )
         .optional()?
         .ok_or(ResearchUseCatalogError::CorruptCatalog)?;
-    if rights.3.is_some_and(|expiry| now.unix_nanos() >= expiry) {
-        return Ok(SourceAuthority::Denied(ResearchUseDenialReason::Expired));
+    let required = i64::from(
+        super::ResearchUseSet::try_new(vec![requested_use])?.required_source_operation_mask(),
+    );
+    if original.0 & required != required {
+        return Ok(SourceGrantSelection::Denied(
+            ResearchUseDenialReason::MissingGrant,
+        ));
     }
-    let mut statement = transaction.prepare(
-        "SELECT research_grant_id, evidence_algorithm, evidence_digest,
-                authorization_expires_at_ns
-         FROM source_research_use_grants
-         WHERE rights_id=?1 AND source_id=?2 AND admitted_at_ns<=?3
-           AND (use_mask & ?4)<>0
-         ORDER BY authorization_expires_at_ns IS NOT NULL,
-                  authorization_expires_at_ns DESC, research_grant_id",
-    )?;
-    let rows = statement.query_map(
-        params![
-            source.rights_id(),
-            source.source_id().as_str(),
-            now.unix_nanos(),
-            research_use_mask(requested_use),
-        ],
-        |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-            ))
-        },
-    )?;
-    let mut saw_expired = false;
-    let mut saw_revoked = false;
-    for row in rows {
-        let grant = row?;
-        let grant_id = parse_digest(grant.0)?;
-        if grant.3.is_some_and(|expiry| now.unix_nanos() >= expiry) {
+    // Reissuing an equivalent policy must never undo an explicit withdrawal, including when
+    // the selected handle predates the revocation or another equivalent grant remains live.
+    if source_use_revoked(transaction, rights_id, requested_use, now, frontier)? {
+        return Ok(SourceGrantSelection::Denied(
+            ResearchUseDenialReason::Revoked,
+        ));
+    }
+    let mut statement = transaction.prepare(&format!(
+        "SELECT grant.research_grant_id,grant.evidence_algorithm,grant.evidence_digest,
+                grant.authorization_expires_at_ns,current.rights_id,current.basis_digest,
+                current.authorization_algorithm,current.authorization_digest,current.authorization_expires_at_ns
+         FROM source_rights AS original JOIN source_rights AS current ON {EXACT_RIGHTS_FAMILY}
+         JOIN source_research_use_grants AS grant ON grant.rights_id=current.rights_id
+          AND grant.source_id=current.source_id
+         WHERE original.rights_id=?1 AND current.admitted_at_ns<=?2
+           AND grant.admitted_at_ns<=?2 AND (current.operation_mask & ?3)=?3
+           AND (grant.use_mask & ?4)<>0 AND (?5 IS NULL OR grant.research_grant_id=?5)
+         ORDER BY current.authorization_expires_at_ns IS NOT NULL,
+                  current.authorization_expires_at_ns DESC,
+                  grant.authorization_expires_at_ns IS NOT NULL,
+                  grant.authorization_expires_at_ns DESC,grant.research_grant_id"
+    ))?;
+    let mut rows = statement.query(params![
+        rights_id,
+        now.unix_nanos(),
+        required,
+        research_use_mask(requested_use),
+        expected_grant
+    ])?;
+    let mut saw_expired = original.1.is_some_and(|expiry| now.unix_nanos() >= expiry);
+    while let Some(row) = rows.next()? {
+        super::traversal::check_control(cancellation, deadline)?;
+        let grant_expiry: Option<i64> = row.get(3)?;
+        let rights_expiry: Option<i64> = row.get(8)?;
+        if grant_expiry
+            .into_iter()
+            .chain(rights_expiry)
+            .any(|expiry| now.unix_nanos() >= expiry)
+        {
             saw_expired = true;
             continue;
         }
-        let revoked: bool = transaction.query_row(
-            "SELECT EXISTS(
-                SELECT 1 FROM source_research_use_revocations
-                WHERE research_grant_id=?1 AND revocation_sequence<=?2
-                  AND effective_at_ns<=?3 AND recorded_at_ns<=?3
-                  AND (use_mask & ?4)<>0
-             )",
-            params![
-                grant_id,
-                to_i64(frontier)?,
-                now.unix_nanos(),
-                research_use_mask(requested_use),
-            ],
-            |row| row.get(0),
-        )?;
-        if revoked {
-            saw_revoked = true;
-            continue;
-        }
-        let authority = ResearchUseAuthorityEvidence::try_new(
-            source.clone(),
-            source.rights_id(),
-            parse_digest(rights.0)?,
-            parse_evidence(rights.1, rights.2)?,
-            rights.3.map(Timestamp::from_unix_nanos),
-            grant_id,
-            parse_evidence(grant.1, grant.2)?,
-            grant.3.map(Timestamp::from_unix_nanos),
-            frontier,
-        )
-        .map_err(|_| ResearchUseCatalogError::CorruptCatalog)?;
-        return Ok(SourceAuthority::Selected(Box::new(authority)));
+        return Ok(SourceGrantSelection::Selected(RetainedSourceUseGrant {
+            selected_rights_id: parse_digest(row.get(4)?)?,
+            rights_basis_digest: parse_digest(row.get(5)?)?,
+            authorization_evidence: parse_evidence(row.get(6)?, row.get(7)?)?,
+            rights_expires_at: rights_expiry.map(Timestamp::from_unix_nanos),
+            research_grant_id: parse_digest(row.get(0)?)?,
+            grant_evidence: parse_evidence(row.get(1)?, row.get(2)?)?,
+            grant_expires_at: grant_expiry.map(Timestamp::from_unix_nanos),
+        }));
     }
-    let reason = if saw_revoked {
-        ResearchUseDenialReason::Revoked
-    } else if saw_expired {
+    Ok(SourceGrantSelection::Denied(if saw_expired {
         ResearchUseDenialReason::Expired
     } else {
         ResearchUseDenialReason::MissingGrant
-    };
-    Ok(SourceAuthority::Denied(reason))
+    }))
 }
 
-fn decision_expiry(
+pub(super) fn decision_expiry(
     now: Timestamp,
     limits: super::ResearchUseLimits,
     authorities: &[ResearchUseAuthorityEvidence],
@@ -718,4 +819,14 @@ fn denial_name(reason: ResearchUseDenialReason) -> &'static str {
         ResearchUseDenialReason::Cancelled => "cancelled",
         ResearchUseDenialReason::DeadlineExceeded => "deadline_exceeded",
     }
+}
+
+pub(crate) fn source_use_frontier(
+    connection: &rusqlite::Connection,
+    now: Timestamp,
+) -> Result<u64, ResearchUseCatalogError> {
+    let frontier:i64=connection.query_row(
+        "SELECT COALESCE(MAX(revocation_sequence), 0) FROM source_research_use_revocations WHERE recorded_at_ns<=?1",
+        [now.unix_nanos()],|row|row.get(0))?;
+    u64::try_from(frontier).map_err(|_| ResearchUseCatalogError::CorruptCatalog)
 }

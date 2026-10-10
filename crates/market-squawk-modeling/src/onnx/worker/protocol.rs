@@ -9,8 +9,8 @@ use sha2::{Digest, Sha256};
 
 use super::{OnnxWorkerProcessError, WorkerError};
 
-const WORKER_MAGIC: &[u8; 8] = b"MSQONX01";
-const PROTOCOL_REVISION: u32 = 1;
+const WORKER_MAGIC: &[u8; 8] = b"MSQONX02";
+const PROTOCOL_REVISION: u32 = 2;
 const BACKEND_TRACT: u8 = 1;
 #[cfg(feature = "onnx-runtime")]
 const BACKEND_EXTERNAL: u8 = 2;
@@ -27,6 +27,7 @@ const MAX_INPUT_RANK: usize = 8;
 pub(super) struct WorkerInitialization {
     pub(super) bytes: Vec<u8>,
     pub(super) input_elements: usize,
+    pub(super) output_elements: usize,
 }
 
 impl WorkerInitialization {
@@ -34,8 +35,16 @@ impl WorkerInitialization {
         model: &[u8],
         input_shape: &[usize],
         input_elements: usize,
+        output_elements: usize,
     ) -> Result<Self, WorkerError> {
-        Self::new(BACKEND_TRACT, model, input_shape, input_elements, None)
+        Self::new(
+            BACKEND_TRACT,
+            model,
+            input_shape,
+            input_elements,
+            output_elements,
+            None,
+        )
     }
 
     #[cfg(feature = "onnx-runtime")]
@@ -47,6 +56,7 @@ impl WorkerInitialization {
         model: &[u8],
         input_shape: &[usize],
         input_elements: usize,
+        output_elements: usize,
         runtime_path: &Path,
         runtime_digest: [u8; 32],
         runtime_version: &str,
@@ -64,6 +74,7 @@ impl WorkerInitialization {
             model,
             input_shape,
             input_elements,
+            output_elements,
             Some(ExternalInitialization {
                 path: runtime_path,
                 digest: runtime_digest,
@@ -78,12 +89,15 @@ impl WorkerInitialization {
         model: &[u8],
         input_shape: &[usize],
         input_elements: usize,
+        output_elements: usize,
         external: Option<ExternalInitialization<'_>>,
     ) -> Result<Self, WorkerError> {
         if model.is_empty()
             || model.len() > super::super::MAX_ONNX_MODEL_BYTES
             || input_shape.is_empty()
             || input_shape.len() > MAX_INPUT_RANK
+            || output_elements == 0
+            || output_elements > super::super::MAX_ONNX_REQUEST_ELEMENTS
             || input_elements == 0
             || input_elements > super::super::MAX_ONNX_REQUEST_ELEMENTS
         {
@@ -92,7 +106,7 @@ impl WorkerInitialization {
         let (path, digest, version, platform) = external.map_or(("", [0; 32], "", 0), |value| {
             (value.path, value.digest, value.version, value.platform)
         });
-        let capacity = 54_usize
+        let capacity = 60_usize
             .checked_add(input_shape.len().saturating_mul(4))
             .and_then(|value| value.checked_add(path.len()))
             .and_then(|value| value.checked_add(version.len()))
@@ -109,6 +123,11 @@ impl WorkerInitialization {
         bytes.push(0);
         bytes.extend_from_slice(
             &u32::try_from(input_elements)
+                .map_err(|_| WorkerError::Resource)?
+                .to_be_bytes(),
+        );
+        bytes.extend_from_slice(
+            &u32::try_from(output_elements)
                 .map_err(|_| WorkerError::Resource)?
                 .to_be_bytes(),
         );
@@ -141,6 +160,7 @@ impl WorkerInitialization {
         Ok(Self {
             bytes,
             input_elements,
+            output_elements,
         })
     }
 }
@@ -158,6 +178,7 @@ pub(super) struct DecodedInitialization {
     pub(super) backend: u8,
     pub(super) input_shape: Box<[usize]>,
     pub(super) input_elements: usize,
+    pub(super) output_elements: usize,
     pub(super) model: Vec<u8>,
     pub(super) runtime_path: Box<str>,
     pub(super) runtime_digest: [u8; 32],
@@ -197,6 +218,7 @@ pub(super) fn read_initialization(
         return Err(OnnxWorkerProcessError::Protocol);
     }
     let input_elements = read_u32(reader)? as usize;
+    let output_elements = read_u32(reader)? as usize;
     let model_len = read_u32(reader)? as usize;
     let path_len = usize::from(read_u16(reader)?);
     let version_len = usize::from(read_u16(reader)?);
@@ -204,7 +226,9 @@ pub(super) fn read_initialization(
     reader
         .read_exact(&mut runtime_digest)
         .map_err(|_| OnnxWorkerProcessError::Protocol)?;
-    if input_elements == 0
+    if output_elements == 0
+        || output_elements > super::super::MAX_ONNX_REQUEST_ELEMENTS
+        || input_elements == 0
         || input_elements > super::super::MAX_ONNX_REQUEST_ELEMENTS
         || model_len == 0
         || model_len > super::super::MAX_ONNX_MODEL_BYTES
@@ -244,6 +268,7 @@ pub(super) fn read_initialization(
         backend,
         input_shape: input_shape.into_boxed_slice(),
         input_elements,
+        output_elements,
         model,
         runtime_path: runtime_path.into_boxed_str(),
         runtime_digest,
@@ -252,16 +277,16 @@ pub(super) fn read_initialization(
     })
 }
 
-pub(super) fn response_loop(stdout: impl Read, sender: SyncSender<Result<f32, WorkerError>>) {
+pub(super) fn response_loop(
+    stdout: impl Read,
+    sender: SyncSender<Result<Vec<f32>, WorkerError>>,
+    output_elements: usize,
+) {
     let mut reader = BufReader::new(stdout);
     loop {
-        let mut response = [0_u8; 5];
-        if reader.read_exact(&mut response).is_err() {
-            let _ = sender.try_send(Err(WorkerError::Unavailable));
-            break;
-        }
-        let result = decode_response(response);
-        if sender.send(result).is_err() || result.is_err() {
+        let result = read_response(&mut reader, output_elements);
+        let failed = result.is_err();
+        if sender.send(result).is_err() || failed {
             break;
         }
     }
@@ -269,25 +294,60 @@ pub(super) fn response_loop(stdout: impl Read, sender: SyncSender<Result<f32, Wo
 
 pub(super) fn write_response(
     writer: &mut impl Write,
-    result: Result<f32, WorkerError>,
+    result: Result<&[f32], WorkerError>,
 ) -> Result<(), OnnxWorkerProcessError> {
-    let (status, value) = match result {
-        Ok(value) if value.is_finite() => (RESPONSE_OK, value),
-        Err(WorkerError::Load) => (RESPONSE_LOAD, 0.0),
-        Err(WorkerError::Resource) => (RESPONSE_RESOURCE, 0.0),
-        Err(
-            WorkerError::Unavailable
-            | WorkerError::Deadline
-            | WorkerError::Runtime
-            | WorkerError::TerminationUncertain,
-        )
-        | Ok(_) => (RESPONSE_RUNTIME, 0.0),
+    let (status, values) = match result {
+        Ok(values)
+            if !values.is_empty()
+                && values.len() <= super::super::MAX_ONNX_REQUEST_ELEMENTS
+                && values.iter().all(|value| value.is_finite()) =>
+        {
+            (RESPONSE_OK, values)
+        }
+        Err(WorkerError::Load) => (RESPONSE_LOAD, &[][..]),
+        Err(WorkerError::Resource) => (RESPONSE_RESOURCE, &[][..]),
+        _ => (RESPONSE_RUNTIME, &[][..]),
     };
-    let value = value.to_bits().to_be_bytes();
     writer
-        .write_all(&[status, value[0], value[1], value[2], value[3]])
-        .and_then(|()| writer.flush())
-        .map_err(|_| OnnxWorkerProcessError::Protocol)
+        .write_all(&[status])
+        .map_err(|_| OnnxWorkerProcessError::Protocol)?;
+    let count = u32::try_from(values.len()).map_err(|_| OnnxWorkerProcessError::Protocol)?;
+    writer
+        .write_all(&count.to_be_bytes())
+        .map_err(|_| OnnxWorkerProcessError::Protocol)?;
+    for value in values {
+        writer
+            .write_all(&value.to_bits().to_be_bytes())
+            .map_err(|_| OnnxWorkerProcessError::Protocol)?;
+    }
+    writer.flush().map_err(|_| OnnxWorkerProcessError::Protocol)
+}
+
+fn read_response(reader: &mut impl Read, output_elements: usize) -> Result<Vec<f32>, WorkerError> {
+    let status = read_u8(reader).map_err(|_| WorkerError::Unavailable)?;
+    let count = read_u32(reader).map_err(|_| WorkerError::Unavailable)? as usize;
+    if status != RESPONSE_OK {
+        return Err(match (status, count) {
+            (RESPONSE_LOAD, 0) => WorkerError::Load,
+            (RESPONSE_RESOURCE, 0) => WorkerError::Resource,
+            _ => WorkerError::Runtime,
+        });
+    }
+    if count != output_elements || count == 0 || count > super::super::MAX_ONNX_REQUEST_ELEMENTS {
+        return Err(WorkerError::Runtime);
+    }
+    let mut values = Vec::new();
+    values
+        .try_reserve_exact(count)
+        .map_err(|_| WorkerError::Resource)?;
+    for _ in 0..count {
+        let value = f32::from_bits(read_u32(reader).map_err(|_| WorkerError::Unavailable)?);
+        if !value.is_finite() {
+            return Err(WorkerError::Runtime);
+        }
+        values.push(value);
+    }
+    Ok(values)
 }
 
 pub(super) fn read_u32(reader: &mut impl Read) -> Result<u32, OnnxWorkerProcessError> {
@@ -322,28 +382,12 @@ fn read_utf8(reader: &mut impl Read, length: usize) -> Result<String, OnnxWorker
     String::from_utf8(bytes).map_err(|_| OnnxWorkerProcessError::Protocol)
 }
 
-fn decode_response(response: [u8; 5]) -> Result<f32, WorkerError> {
-    let value = f32::from_bits(u32::from_be_bytes([
-        response[1],
-        response[2],
-        response[3],
-        response[4],
-    ]));
-    match response[0] {
-        RESPONSE_OK if value.is_finite() => Ok(value),
-        RESPONSE_LOAD => Err(WorkerError::Load),
-        RESPONSE_RESOURCE => Err(WorkerError::Resource),
-        RESPONSE_RUNTIME | RESPONSE_OK => Err(WorkerError::Runtime),
-        _ => Err(WorkerError::Unavailable),
-    }
-}
-
 pub(super) fn semantics_digest() -> [u8; 32] {
     let mut digest = Sha256::new();
     bind_bytes(
         &mut digest,
         b"namespace",
-        b"market-squawk/onnx-worker-protocol/v1",
+        b"market-squawk/onnx-worker-protocol/v2",
     );
     bind_bytes(&mut digest, b"magic", WORKER_MAGIC);
     bind_u128(
@@ -388,7 +432,7 @@ pub(super) fn semantics_digest() -> [u8; 32] {
     bind_bytes(
         &mut digest,
         b"framing",
-        b"big-endian/fixed-init-header/u32-shape-and-f32-bits/fixed-five-byte-response",
+        b"big-endian/fixed-init-header/u32-shape-and-f32-bits/u32-counted-f32-response/exact-admitted-output-count",
     );
     digest.finalize().into()
 }

@@ -1,3 +1,8 @@
+// A source may carry several exact channels in one original transport frame. This is a
+// declaration bound, never a wildcard or permission to pick an arbitrary channel.
+const MAX_LIVE_COVERAGE_CHANNELS: usize = 32;
+const MAX_LIVE_SOURCE_COHORTS: usize = 32;
+
 /// Research/live coverage domain without fabricating instrument asset classes for macro data.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -10,6 +15,8 @@ pub enum CoverageDomain {
     RegulatoryFilings,
     /// Portfolio holdings, transactions, and account exports.
     Portfolio,
+    /// Source-native market calendar ranges and session hours.
+    MarketCalendar,
     /// Corporate action reference datasets.
     CorporateActions,
     /// User-owned or licensed alternative datasets.
@@ -23,6 +30,7 @@ pub struct LiveCoverageRule {
     event_class: LiveEventClass,
     depth: Option<MarketDepth>,
     snapshot_applicability: SnapshotApplicability,
+    source_cohorts: BoundedVec<SourceIdentifier, MAX_LIVE_SOURCE_COHORTS>,
 }
 
 impl LiveCoverageRule {
@@ -37,6 +45,9 @@ impl LiveCoverageRule {
         depth: Option<MarketDepth>,
         snapshot_applicability: SnapshotApplicability,
     ) -> Result<Self, SourceMetadataError> {
+        if event_class == LiveEventClass::Screener {
+            return Err(SourceMetadataError::InvalidLiveCoverageRule);
+        }
         let valid = if event_class.requires_book_state() {
             depth.is_some() && matches!(snapshot_applicability, SnapshotApplicability::Required)
         } else {
@@ -53,7 +64,54 @@ impl LiveCoverageRule {
             event_class,
             depth,
             snapshot_applicability,
+            source_cohorts: BoundedVec::empty(),
         })
+    }
+
+    /// Declares bounded exact source cohorts for ranked source observations only.
+    ///
+    /// # Errors
+    /// Rejects missing/duplicate cohorts, excessive keys, or a snapshot requirement.
+    pub fn try_source_cohorts(
+        mut cohorts: Vec<SourceIdentifier>,
+        snapshot_applicability: SnapshotApplicability,
+    ) -> Result<Self, SourceMetadataError> {
+        if cohorts.is_empty() {
+            return Err(SourceMetadataError::EmptyCollection {
+                field: "live_source_cohorts",
+            });
+        }
+        if !matches!(
+            snapshot_applicability,
+            SnapshotApplicability::NotApplicable { .. }
+        ) {
+            return Err(SourceMetadataError::InvalidLiveCoverageRule);
+        }
+        if cohorts.len() > MAX_LIVE_SOURCE_COHORTS {
+            return Err(SourceMetadataError::CollectionTooLarge {
+                field: "live_source_cohorts",
+                max: MAX_LIVE_SOURCE_COHORTS,
+            });
+        }
+        reject_duplicates("live_source_cohorts", &cohorts)?;
+        cohorts.sort();
+        Ok(Self {
+            event_class: LiveEventClass::Screener,
+            depth: None,
+            snapshot_applicability,
+            source_cohorts: bounded("live_source_cohorts", cohorts)?,
+        })
+    }
+
+    /// Returns explicit cohort keys; ordinary instrument rules always have none.
+    pub fn source_cohorts(&self) -> &[SourceIdentifier] {
+        self.source_cohorts.as_slice()
+    }
+
+    /// Requires exact cohort membership under the selected product/channel's Screener rule.
+    pub fn permits_source_cohort(&self, cohort: &SourceIdentifier) -> bool {
+        self.event_class == LiveEventClass::Screener
+            && self.source_cohorts.as_slice().contains(cohort)
     }
 
     /// Returns the live event class.
@@ -76,8 +134,15 @@ impl LiveCoverageRule {
             event_class: _,
             depth: _,
             snapshot_applicability,
+            source_cohorts,
         } = self;
-        snapshot_applicability.dynamic_retained_bytes()
+        let mut bytes = snapshot_applicability
+            .dynamic_retained_bytes()?
+            .checked_add(source_cohorts.checked_allocation_bytes()?)?;
+        for cohort in source_cohorts.as_slice() {
+            bytes = bytes.checked_add(cohort.retained_bytes())?;
+        }
+        Some(bytes)
     }
 }
 
@@ -87,6 +152,7 @@ struct LiveCoverageRuleWire {
     event_class: LiveEventClass,
     depth: Option<MarketDepth>,
     snapshot_applicability: SnapshotApplicability,
+    source_cohorts: BoundedVec<SourceIdentifier, MAX_LIVE_SOURCE_COHORTS>,
 }
 
 impl<'de> Deserialize<'de> for LiveCoverageRule {
@@ -95,8 +161,22 @@ impl<'de> Deserialize<'de> for LiveCoverageRule {
         D: Deserializer<'de>,
     {
         let wire = LiveCoverageRuleWire::deserialize(deserializer)?;
-        Self::try_new(wire.event_class, wire.depth, wire.snapshot_applicability)
-            .map_err(serde::de::Error::custom)
+        let result = if wire.event_class == LiveEventClass::Screener {
+            if wire.depth.is_some() {
+                return Err(serde::de::Error::custom(
+                    SourceMetadataError::InvalidLiveCoverageRule,
+                ));
+            }
+            Self::try_source_cohorts(wire.source_cohorts.into_vec(), wire.snapshot_applicability)
+        } else {
+            if !wire.source_cohorts.is_empty() {
+                return Err(serde::de::Error::custom(
+                    SourceMetadataError::InvalidLiveCoverageRule,
+                ));
+            }
+            Self::try_new(wire.event_class, wire.depth, wire.snapshot_applicability)
+        };
+        result.map_err(serde::de::Error::custom)
     }
 }
 
@@ -311,7 +391,7 @@ pub struct SourceCoverage {
     asset_classes: BoundedVec<AssetClass, MAX_ASSET_CLASSES>,
     topology: CoverageTopology,
     instruments: InstrumentCoverage,
-    live: Option<LiveCoverageDeclaration>,
+    live: BoundedVec<LiveCoverageDeclaration, MAX_LIVE_COVERAGE_CHANNELS>,
     delay: CoverageDelay,
     delivery: DeliveryEvidence,
 }
@@ -337,13 +417,85 @@ impl SourceCoverage {
         delay: CoverageDelay,
         delivery: DeliveryEvidence,
     ) -> Result<Self, SourceMetadataError> {
+        Self::try_instrument_channels(
+            evidence,
+            effective,
+            asset_classes,
+            topology,
+            instruments,
+            live.into_iter().collect(),
+            delay,
+            delivery,
+        )
+    }
+
+    /// Constructs exact product/channel declarations for one shared coverage scope.
+    ///
+    /// Every channel retains its own event/depth rules. Channels must share the declared
+    /// instrument universe, venue topology and delay; different semantics require separate sources.
+    /// Empty channels remain valid for instrument reference extraction only.
+    ///
+    /// # Errors
+    /// Rejects duplicate product/channel keys, more than 32 channels or 32 total rules, or invalid
+    /// instrument/delay scope. Sorting makes metadata identity independent of declaration order.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "coverage dimensions are independent evidence"
+    )]
+    pub fn try_instrument_channels(
+        evidence: ExactPayloadEvidence,
+        effective: EffectiveInterval,
+        asset_classes: Vec<AssetClass>,
+        topology: CoverageTopology,
+        instruments: InstrumentCoverage,
+        mut live: Vec<LiveCoverageDeclaration>,
+        delay: CoverageDelay,
+        delivery: DeliveryEvidence,
+    ) -> Result<Self, SourceMetadataError> {
+        if live.len() > MAX_LIVE_COVERAGE_CHANNELS {
+            return Err(SourceMetadataError::CollectionTooLarge {
+                field: "live_coverage_channels",
+                max: MAX_LIVE_COVERAGE_CHANNELS,
+            });
+        }
+        let rule_count = live.iter().try_fold(0usize, |total, channel| {
+            total.checked_add(channel.rules().len())
+        });
+        if rule_count.is_none_or(|count| count > MAX_LIVE_COVERAGE_RULES) {
+            return Err(SourceMetadataError::CollectionTooLarge {
+                field: "live_coverage_rules",
+                max: MAX_LIVE_COVERAGE_RULES,
+            });
+        }
+        live.sort_by(|left, right| {
+            (
+                left.provider_product().as_source_identifier().as_str(),
+                left.provider_channel().as_source_identifier().as_str(),
+            )
+                .cmp(&(
+                    right.provider_product().as_source_identifier().as_str(),
+                    right.provider_channel().as_source_identifier().as_str(),
+                ))
+        });
+        if live.windows(2).any(|pair| {
+            pair[0].provider_product() == pair[1].provider_product()
+                && pair[0].provider_channel() == pair[1].provider_channel()
+        }) {
+            return Err(SourceMetadataError::DuplicateValue {
+                field: "live_coverage_channels",
+            });
+        }
         if asset_classes.is_empty() {
             return Err(SourceMetadataError::EmptyCollection {
                 field: "asset_classes",
             });
         }
         reject_duplicates("asset_classes", &asset_classes)?;
-        if matches!(delay, CoverageDelay::Delayed(0)) {
+        // Instrument reference metadata has no quote-delivery latency. A live instrument
+        // declaration requires market timing semantics; Unknown is not NotApplicable.
+        if matches!(delay, CoverageDelay::Delayed(0))
+            || (delay == CoverageDelay::NotApplicable && !live.is_empty())
+        {
             return Err(SourceMetadataError::ZeroDelay);
         }
         Ok(Self {
@@ -353,7 +505,7 @@ impl SourceCoverage {
             asset_classes: bounded("asset_classes", asset_classes)?,
             topology,
             instruments,
-            live,
+            live: bounded("live_coverage_channels", live)?,
             delay,
             delivery,
         })
@@ -384,7 +536,7 @@ impl SourceCoverage {
             asset_classes: BoundedVec::empty(),
             topology: CoverageTopology::not_applicable(),
             instruments: InstrumentCoverage::partial(),
-            live: None,
+            live: BoundedVec::empty(),
             delay,
             delivery,
         })
@@ -415,9 +567,29 @@ impl SourceCoverage {
         self.delivery
     }
 
-    /// Returns supported live event classes.
-    pub const fn live(&self) -> Option<&LiveCoverageDeclaration> {
-        self.live.as_ref()
+    /// Returns a channel only when this source declares exactly one.
+    /// Mixed sources deliberately cannot satisfy callers that omit a product/channel key.
+    pub fn live(&self) -> Option<&LiveCoverageDeclaration> {
+        match self.live.as_slice() {
+            [only] => Some(only),
+            _ => None,
+        }
+    }
+
+    /// Returns the bounded, sorted exact declarations without merging channel rules.
+    pub fn live_channels(&self) -> &[LiveCoverageDeclaration] {
+        self.live.as_slice()
+    }
+
+    /// Selects only the explicitly declared product/channel pair; there is no fallback.
+    pub fn live_for(
+        &self,
+        product: &ProviderProduct,
+        channel: &ProviderChannel,
+    ) -> Option<&LiveCoverageDeclaration> {
+        self.live.as_slice().iter().find(|value| {
+            value.provider_product() == product && value.provider_channel() == channel
+        })
     }
 
     /// Returns explicitly covered asset classes.
@@ -461,7 +633,7 @@ struct SourceCoverageWire {
     asset_classes: BoundedVec<AssetClass, MAX_ASSET_CLASSES>,
     topology: CoverageTopology,
     instruments: InstrumentCoverage,
-    live: Option<LiveCoverageDeclaration>,
+    live: BoundedVec<LiveCoverageDeclaration, MAX_LIVE_COVERAGE_CHANNELS>,
     delay: CoverageDelay,
     delivery: DeliveryEvidence,
 }
@@ -473,13 +645,13 @@ impl<'de> Deserialize<'de> for SourceCoverage {
     {
         let wire = SourceCoverageWire::deserialize(deserializer)?;
         let result = if wire.domain == CoverageDomain::Instruments {
-            Self::try_instrument(
+            Self::try_instrument_channels(
                 wire.evidence,
                 wire.effective,
                 wire.asset_classes.as_slice().to_vec(),
                 wire.topology,
                 wire.instruments,
-                wire.live,
+                wire.live.into_vec(),
                 wire.delay,
                 wire.delivery,
             )
@@ -487,7 +659,7 @@ impl<'de> Deserialize<'de> for SourceCoverage {
             if !wire.asset_classes.is_empty()
                 || !wire.topology.is_not_applicable()
                 || !wire.instruments.instruments().is_empty()
-                || wire.live.is_some()
+                || !wire.live.is_empty()
             {
                 return Err(serde::de::Error::custom(
                     SourceMetadataError::InvalidCoverageDomain,
@@ -502,5 +674,30 @@ impl<'de> Deserialize<'de> for SourceCoverage {
             )
         };
         result.map_err(serde::de::Error::custom)
+    }
+}
+
+#[cfg(test)]
+mod cohort_authority_test {
+    use super::*;
+    use market_squawk_domain::RuleVersion;
+
+    // New source-cohort authority must not deserialize as an ordinary instrument rule.
+    #[test]
+    fn cohort_authority_cannot_be_transplanted_into_instrument_coverage()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let snapshot = SnapshotApplicability::NotApplicable {
+            metadata_rule: IntegrityRule::new(
+                SourceIdentifier::try_from("cohort-no-book-state")?,
+                RuleVersion::new(1)?,
+            ),
+        };
+        let key = SourceIdentifier::try_from("EQUITY_ALL_VOLUME_0")?;
+        let rule = LiveCoverageRule::try_source_cohorts(vec![key], snapshot)?;
+        assert!(!rule.permits_source_cohort(&SourceIdentifier::try_from("OPTION_ALL_VOLUME_0")?));
+        let mut wire = serde_json::to_value(&rule)?;
+        wire["event_class"] = serde_json::json!("quote");
+        assert!(serde_json::from_value::<LiveCoverageRule>(wire).is_err());
+        Ok(())
     }
 }

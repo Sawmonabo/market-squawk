@@ -5,11 +5,12 @@ use std::mem::size_of;
 use std::time::Instant;
 
 use market_squawk_domain::{
-    ContractRollMapping, CorporateActionObservation, InstrumentDefinition, InstrumentId,
-    LifecycleTransition, LifecycleTransitionKind, SourceId, SymbolIdentityRecord, Timestamp,
+    AssetClass, ContractRollMapping, CorporateActionObservation, InstrumentDefinition,
+    InstrumentId, LifecycleTransition, LifecycleTransitionKind, SourceId, SymbolIdentityRecord,
+    Timestamp,
 };
 use market_squawk_sources::SourceMetadata;
-use rusqlite::{OptionalExtension as _, params};
+use rusqlite::{OptionalExtension as _, Transaction, params};
 use serde::de::DeserializeOwned;
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -169,85 +170,90 @@ impl Catalog {
         let digest = sha256(json.as_bytes());
         let transaction = self.connection.unchecked_transaction()?;
         let catalog_now = trusted_catalog_now(&transaction)?;
-        let existing_revision: Option<(String, i64)> = transaction
-            .query_row(
-                "SELECT definition_json, observed_at_ns FROM instrument_revisions
-                 WHERE instrument_id=?1 AND revision_digest=?2",
-                params![instrument.instrument_id().to_string(), digest],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        if let Some((existing_json, existing_at)) = existing_revision {
-            if existing_json == json && existing_at == observed_at.unix_nanos() {
-                return Ok(());
-            }
-            let current_at: i64 = transaction.query_row(
-                "SELECT current_observed_at_ns FROM instruments WHERE instrument_id=?1",
-                [instrument.instrument_id().to_string()],
-                |row| row.get(0),
-            )?;
-            return Err(if observed_at.unix_nanos() < current_at {
-                CatalogError::StaleInstrumentRevision
-            } else {
-                CatalogError::InstrumentRevisionConflict
-            });
-        }
-        transaction.execute(
-            "INSERT OR IGNORE INTO instruments
-             (instrument_id, current_revision_digest, current_observed_at_ns,
-              first_observed_at_ns) VALUES (?1, ?2, ?3, ?3)",
-            params![
-                instrument.instrument_id().to_string(),
-                digest,
-                observed_at.unix_nanos()
-            ],
-        )?;
-        transaction.execute(
-            "INSERT INTO instrument_revisions
-             (instrument_id, revision_digest, definition_json, observed_at_ns)
-             VALUES (?1, ?2, ?3, ?4)",
-            params![
-                instrument.instrument_id().to_string(),
-                digest,
-                json,
-                observed_at.unix_nanos()
-            ],
-        )?;
-        transaction.execute(
-            "UPDATE instruments
-             SET current_revision_digest=?1,
-                 current_observed_at_ns=MAX(current_observed_at_ns, ?2)
-             WHERE instrument_id=?3
-               AND (current_revision_digest=?1 OR current_observed_at_ns < ?2)",
-            params![
-                digest,
-                observed_at.unix_nanos(),
-                instrument.instrument_id().to_string()
-            ],
-        )?;
-        let (current_digest, current_at): (Vec<u8>, i64) = transaction.query_row(
-            "SELECT current_revision_digest, current_observed_at_ns
-             FROM instruments WHERE instrument_id=?1",
-            [instrument.instrument_id().to_string()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        if current_digest.as_slice() != digest {
-            return Err(if observed_at.unix_nanos() < current_at {
-                CatalogError::StaleInstrumentRevision
-            } else {
-                CatalogError::InstrumentRevisionConflict
-            });
-        }
-        persist_instrument_children(&transaction, instrument, observed_at)?;
-        append_audit(
+        put_instrument_revision(
             &transaction,
-            "instrument.recorded",
-            &instrument.instrument_id().to_string(),
+            instrument,
+            observed_at,
+            &json,
             digest,
             catalog_now,
         )?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Atomically publishes a bounded set of configured canonical instrument definitions.
+    ///
+    /// An unchanged current definition is a restart-safe no-op. Changed content must advance both
+    /// the monotonic definition revision and durable observation time. The complete set commits
+    /// together so conflicting provider mappings cannot expose a partial configured universe.
+    pub fn synchronize_instruments(
+        &self,
+        instruments: &[InstrumentDefinition],
+        observed_at: Timestamp,
+        limit: CatalogLimit,
+    ) -> Result<usize, CatalogError> {
+        self.enforce_limit(limit)?;
+        if instruments.len() > limit.get() {
+            return Err(CatalogError::InvalidLimit);
+        }
+        let mut instrument_ids = BTreeSet::new();
+        for instrument in instruments {
+            if !instrument_ids.insert(instrument.instrument_id()) {
+                return Err(CatalogError::InstrumentRevisionConflict);
+            }
+        }
+
+        let transaction = self.connection.unchecked_transaction()?;
+        let catalog_now = trusted_catalog_now(&transaction)?;
+        let mut published = 0_usize;
+        for instrument in instruments {
+            let json = serde_json::to_string(instrument)?;
+            let digest = sha256(json.as_bytes());
+            let current: Option<(String, Vec<u8>, i64)> = transaction
+                .query_row(
+                    "SELECT revisions.definition_json, revisions.revision_digest,
+                            instruments.current_observed_at_ns
+                     FROM instruments
+                     JOIN instrument_revisions AS revisions
+                       ON revisions.instrument_id=instruments.instrument_id
+                      AND revisions.revision_digest=instruments.current_revision_digest
+                     WHERE instruments.instrument_id=?1",
+                    [instrument.instrument_id().to_string()],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            if let Some((current_json, current_digest, current_observed_at)) = current {
+                if current_digest.as_slice() == digest {
+                    if current_json != json {
+                        return Err(CatalogError::EvidenceConflict);
+                    }
+                    continue;
+                }
+                let current: InstrumentDefinition = serde_json::from_str(&current_json)?;
+                if instrument.definition_revision() < current.definition_revision()
+                    || observed_at.unix_nanos() < current_observed_at
+                {
+                    return Err(CatalogError::StaleInstrumentRevision);
+                }
+                if instrument.definition_revision() == current.definition_revision()
+                    || observed_at.unix_nanos() == current_observed_at
+                {
+                    return Err(CatalogError::InstrumentRevisionConflict);
+                }
+            }
+            put_instrument_revision(
+                &transaction,
+                instrument,
+                observed_at,
+                &json,
+                digest,
+                catalog_now,
+            )?;
+            published = published.checked_add(1).ok_or(CatalogError::Allocation)?;
+        }
+        transaction.commit()?;
+        Ok(published)
     }
 
     /// Persists one explicit venue-symbol validity interval.
@@ -493,25 +499,7 @@ impl Catalog {
         limit: CatalogLimit,
     ) -> Result<Vec<InstrumentDefinition>, CatalogError> {
         self.enforce_limit(limit)?;
-        let mut budget = ResultBudget::new(self.result_bytes);
-        let row_limit = i64::try_from(limit.get()).map_err(|_| CatalogError::InvalidLimit)?;
-        let mut statement = self.connection.prepare(
-            "SELECT definition_json, revision_digest FROM instrument_revisions
-             WHERE instrument_id=?1
-             ORDER BY observed_at_ns DESC, revision_digest DESC LIMIT ?2",
-        )?;
-        let rows = statement.query_map(params![instrument_id.to_string(), row_limit], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })?;
-        let mut history = Vec::new();
-        history
-            .try_reserve_exact(budget.bounded_row_capacity(limit.get()))
-            .map_err(|_| CatalogError::Allocation)?;
-        for row in rows {
-            let (value, digest) = row?;
-            history.push(deserialize_verified(&value, &digest, &mut budget)?);
-        }
-        Ok(history)
+        instrument_history(&self.connection, self.result_bytes, instrument_id, limit)
     }
 
     /// Pins complete, verified instrument-definition histories at one catalog knowledge bound.
@@ -536,6 +524,55 @@ impl Catalog {
         self.pin_instrument_definitions_checked(instrument_ids, as_of, limit, || {
             check_instrument_definition_read(deadline, cancellation)
         })
+    }
+
+    /// Pins independently retained terms for the expected canonical asset family.
+    /// Missing or incompatible original definitions return None; malformed history remains an error.
+    pub fn pin_optional_instrument_definition_bounded(
+        &self,
+        instrument_id: InstrumentId,
+        expected_asset_class: AssetClass,
+        as_of: Timestamp,
+        limit: CatalogLimit,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<PinnedInstrumentDefinitions>, CatalogError> {
+        check_instrument_definition_read(deadline, cancellation)?;
+        self.enforce_limit(limit)?;
+        let original: Option<(String, Vec<u8>)> = self
+            .connection
+            .query_row(
+                "SELECT definition_json, revision_digest FROM instrument_revisions
+             WHERE instrument_id=?1 AND observed_at_ns<=?2
+             ORDER BY observed_at_ns DESC, revision_digest DESC LIMIT 1",
+                params![instrument_id.to_string(), as_of.unix_nanos()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        check_instrument_definition_read(deadline, cancellation)?;
+        let Some((definition_json, stored_digest)) = original else {
+            return Ok(None);
+        };
+        let mut budget = ResultBudget::new(self.result_bytes);
+        let original: InstrumentDefinition =
+            deserialize_verified(&definition_json, &stored_digest, &mut budget)?;
+        // Validate every retained row before interpreting an incompatible family as unavailable.
+        let pinned = self.pin_instrument_definitions_bounded(
+            &[instrument_id],
+            as_of,
+            limit,
+            deadline,
+            cancellation,
+        )?;
+        if original.instrument_id() != instrument_id
+            || pinned.execution_terms_at(instrument_id, as_of) != Some(original.execution_terms())
+        {
+            return Err(CatalogError::CorruptCatalog);
+        }
+        if original.asset_class() != expected_asset_class {
+            return Ok(None);
+        }
+        Ok(Some(pinned))
     }
 
     fn pin_instrument_definitions_checked(
@@ -762,6 +799,122 @@ impl Catalog {
     }
 }
 
+fn put_instrument_revision(
+    transaction: &Transaction<'_>,
+    instrument: &InstrumentDefinition,
+    observed_at: Timestamp,
+    json: &str,
+    digest: [u8; 32],
+    catalog_now: Timestamp,
+) -> Result<(), CatalogError> {
+    let existing_revision: Option<(String, i64)> = transaction
+        .query_row(
+            "SELECT definition_json, observed_at_ns FROM instrument_revisions
+             WHERE instrument_id=?1 AND revision_digest=?2",
+            params![instrument.instrument_id().to_string(), digest],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((existing_json, existing_at)) = existing_revision {
+        if existing_json == json && existing_at == observed_at.unix_nanos() {
+            return Ok(());
+        }
+        let current_at: i64 = transaction.query_row(
+            "SELECT current_observed_at_ns FROM instruments WHERE instrument_id=?1",
+            [instrument.instrument_id().to_string()],
+            |row| row.get(0),
+        )?;
+        return Err(if observed_at.unix_nanos() < current_at {
+            CatalogError::StaleInstrumentRevision
+        } else {
+            CatalogError::InstrumentRevisionConflict
+        });
+    }
+    transaction.execute(
+        "INSERT OR IGNORE INTO instruments
+         (instrument_id, current_revision_digest, current_observed_at_ns,
+          first_observed_at_ns) VALUES (?1, ?2, ?3, ?3)",
+        params![
+            instrument.instrument_id().to_string(),
+            digest,
+            observed_at.unix_nanos()
+        ],
+    )?;
+    transaction.execute(
+        "INSERT INTO instrument_revisions
+         (instrument_id, revision_digest, definition_json, observed_at_ns)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![
+            instrument.instrument_id().to_string(),
+            digest,
+            json,
+            observed_at.unix_nanos()
+        ],
+    )?;
+    transaction.execute(
+        "UPDATE instruments
+         SET current_revision_digest=?1,
+             current_observed_at_ns=MAX(current_observed_at_ns, ?2)
+         WHERE instrument_id=?3
+           AND (current_revision_digest=?1 OR current_observed_at_ns < ?2)",
+        params![
+            digest,
+            observed_at.unix_nanos(),
+            instrument.instrument_id().to_string()
+        ],
+    )?;
+    let (current_digest, current_at): (Vec<u8>, i64) = transaction.query_row(
+        "SELECT current_revision_digest, current_observed_at_ns
+         FROM instruments WHERE instrument_id=?1",
+        [instrument.instrument_id().to_string()],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    if current_digest.as_slice() != digest {
+        return Err(if observed_at.unix_nanos() < current_at {
+            CatalogError::StaleInstrumentRevision
+        } else {
+            CatalogError::InstrumentRevisionConflict
+        });
+    }
+    persist_instrument_children(transaction, instrument, observed_at)?;
+    append_audit(
+        transaction,
+        "instrument.recorded",
+        &instrument.instrument_id().to_string(),
+        digest,
+        catalog_now,
+    )?;
+    Ok(())
+}
+
+/// Shared digest-verified history query for writer-owned and independent snapshot reads.
+pub(super) fn instrument_history(
+    connection: &rusqlite::Connection,
+    result_limits: CatalogResultLimits,
+    instrument_id: InstrumentId,
+    limit: CatalogLimit,
+) -> Result<Vec<InstrumentDefinition>, CatalogError> {
+    let mut budget = ResultBudget::new(result_limits);
+    let row_limit = i64::try_from(limit.get()).map_err(|_| CatalogError::InvalidLimit)?;
+    let mut statement = connection.prepare(
+        "SELECT definition_json, revision_digest FROM instrument_revisions
+         WHERE instrument_id=?1
+         ORDER BY observed_at_ns DESC, revision_digest DESC LIMIT ?2",
+    )?;
+    let rows = statement.query_map(params![instrument_id.to_string(), row_limit], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+    })?;
+    let mut history = Vec::new();
+    history
+        .try_reserve_exact(budget.bounded_row_capacity(limit.get()))
+        .map_err(|_| CatalogError::Allocation)?;
+    for row in rows {
+        let (value, digest) = row?;
+        history.push(deserialize_verified(&value, &digest, &mut budget)?);
+    }
+    Ok(history)
+}
+
 fn check_instrument_definition_read(
     deadline: Instant,
     cancellation: &CancellationToken,
@@ -829,7 +982,7 @@ fn pinned_definition_identity(
     Ok(Sha256Digest::new(hash.finalize().into()))
 }
 
-fn deserialize_verified<T: DeserializeOwned>(
+pub(super) fn deserialize_verified<T: DeserializeOwned>(
     value: &str,
     stored_digest: &[u8],
     budget: &mut ResultBudget,

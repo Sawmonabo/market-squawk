@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-fair-value-control"
+description = "Enables the fair_value_control command without any pre-configured scope."
+commands.allow = ["fair_value_control"]
+
+[[permission]]
+identifier = "deny-fair-value-control"
+description = "Denies the fair_value_control command without any pre-configured scope."
+commands.deny = ["fair_value_control"]

@@ -227,69 +227,416 @@ fn revision_evidence_rejects_future_corporate_action_knowledge() -> TestResult {
 #[test]
 fn cumulative_corporate_action_plan_replaces_prior_snapshot_without_replaying_steps() -> TestResult
 {
-    let usd = Currency::try_from("USD")?;
-    let instrument_id = instrument(1)?;
-    let records = corporate_action_records(instrument_id, usd)?;
-    let first_plan = action_plan(records.clone(), 6)?;
-    let cumulative_plan = action_plan(records, 7)?;
-    let mut ledger = PortfolioLedger::try_new(account()?, usd, limits()?)?;
+    use market_squawk_data::{
+        CorporateActionApplication, CorporateActionPaymentPolicy, CorporateActionRecord,
+        CorporateActionSessionValues,
+    };
+    use market_squawk_domain::{
+        AvailabilityEvidence, CalendarDate, CorporateActionObservation, DataQuality,
+        PayloadReference, ResearchContext, ResearchProvenance, ResearchProvenanceInput,
+        ResearchTemporalCoordinate, ResearchTime, VenueId,
+    };
 
-    let first = ledger.try_apply(
-        vec![entry(
-            "cumulative-buy",
+    let usd = Currency::try_from("USD")?;
+    let subject = instrument(1)?;
+    let short = instrument(2)?;
+    // Explicit native-date/session fixture: September 14 ex-open, September 15 split, September 16 payable close.
+    let ex_open = 1_789_392_600_000_000_000_i64;
+    let ex_close = 1_789_416_000_000_000_000_i64;
+    let payable_close = 1_789_588_800_000_000_000_i64;
+    let known = Timestamp::from_unix_nanos(ex_open - 20);
+    let knowledge_cutoff = Timestamp::from_unix_nanos(payable_close + 1);
+    let session = |day, open, close, marker| -> Result<_, Box<dyn Error>> {
+        Ok(CorporateActionSessionValues {
+            date: CalendarDate::new(2026, 9, day)?,
+            opens_at: Timestamp::from_unix_nanos(open),
+            closes_at_exclusive: Timestamp::from_unix_nanos(close),
+            available_at: known,
+            receipt_digest: EvidenceDigest::new(DigestAlgorithm::Sha256, [marker; 32]),
+        })
+    };
+    let ex = session(14, ex_open, ex_close, 31)?;
+    let split = session(15, 1_789_479_000_000_000_000, 1_789_502_400_000_000_000, 32)?;
+    let payable = session(16, 1_789_565_400_000_000_000, payable_close, 33)?;
+    let record = |marker,
+                  instrument_id,
+                  action,
+                  effective: CorporateActionSessionValues,
+                  pays|
+     -> Result<_, Box<dyn Error>> {
+        let id = source(&format!("native-action-{marker}"))?;
+        let observation = CorporateActionObservation::new(
+            ResearchContext::new(
+                ResearchProvenance::try_new(ResearchProvenanceInput {
+                    source_id: SourceId::try_from("official-actions")?,
+                    instrument_id: Some(instrument_id),
+                    venue_id: Some(VenueId::try_from("XNYS")?),
+                    source_identifier: id.clone(),
+                    source_timestamp: None,
+                    received_at: known,
+                    ingested_at: known,
+                    quality: DataQuality::OfficialDelayed,
+                    payload_reference: PayloadReference::SourceReference(id.clone()),
+                    availability: AvailabilityEvidence::evidenced(known, id),
+                })?,
+                ResearchTime::try_new_with_coordinates(
+                    ResearchTemporalCoordinate::calendar_date(effective.date),
+                    None,
+                    RevisionNumber::new(1)?,
+                    None,
+                )?,
+            )?,
+            action,
+        )?;
+        let original = CorporateActionRecord::new(
+            observation,
+            dataset(marker)?,
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [marker; 32]),
+        );
+        let application = CorporateActionApplication::try_from_retained_values(
+            &original,
+            EvidenceDigest::new(DigestAlgorithm::Sha256, [marker; 32]),
+            known,
+            effective,
+            if pays { Some(payable.date) } else { None },
+            if pays { Some(payable) } else { None },
+            CorporateActionPaymentPolicy::EndOfReportedPayableSessionV1,
+        )?;
+        let applied = original.clone().with_application(application)?;
+        assert_eq!(applied.observation(), original.observation());
+        Ok(applied)
+    };
+    let records = vec![
+        record(
+            34,
+            subject,
+            CorporateActionKind::CashDividend {
+                amount: money(2, usd),
+            },
+            ex,
+            true,
+        )?,
+        record(
+            35,
+            short,
+            CorporateActionKind::CashDividend {
+                amount: money(2, usd),
+            },
+            ex,
+            true,
+        )?,
+        record(
+            36,
+            subject,
+            CorporateActionKind::Split {
+                numerator: NonZeroU32::new(3).ok_or("ratio")?,
+                denominator: NonZeroU32::MIN,
+            },
+            split,
+            false,
+        )?,
+    ];
+    let plan = |at| -> Result<_, Box<dyn Error>> {
+        Ok(CorporateActionPlan::try_build(
+            CorporateActionPolicy::new(CorporateActionAdjustment::TotalReturn, NonZeroU32::MIN),
+            knowledge_cutoff,
+            Timestamp::from_unix_nanos(at),
+            records.clone(),
+            CorporateActionLimits::try_new(
+                NonZeroUsize::new(3).ok_or("actions")?,
+                NonZeroUsize::new(64 * 1024).ok_or("bytes")?,
+            )?,
+        )?)
+    };
+    let evidence = |marker, at, plan: &CorporateActionPlan| -> TestResultEvidence {
+        Ok(RevisionEvidence::try_new_with_knowledge_cutoff(
+            Timestamp::from_unix_nanos(at),
+            knowledge_cutoff,
+            dataset(marker)?,
+            market_squawk_data::Sha256Digest::new([marker; 32]),
+            market_squawk_data::Sha256Digest::new([marker + 1; 32]),
+            vec![source("official-actions")?],
+            Vec::new(),
+            Some(market_squawk_portfolio::CorporateActionBinding::from_plan(
+                plan,
+            )),
+        )?)
+    };
+    let trade = |id, at, instrument_id, side, units| -> Result<_, Box<dyn Error>> {
+        entry(
+            id,
             1,
             None,
-            1,
+            at,
             1,
             LedgerEntryKind::Trade(Trade::try_new(
-                TradeSide::Buy,
+                side,
                 instrument_id,
-                Decimal::TEN,
+                Decimal::from(units),
                 money(10, usd),
                 money(0, usd),
                 LotSelection::Fifo,
             )?),
-        )?],
+        )
+    };
+    let first_plan = plan(ex_close)?;
+    let mut ledger = PortfolioLedger::try_new(account()?, usd, limits()?)?;
+    let first_entries = vec![
+        entry(
+            "capital",
+            1,
+            None,
+            ex_open - 3,
+            1,
+            LedgerEntryKind::CashFlow(CashFlow::try_new(
+                CashFlowKind::Deposit,
+                money(100, usd),
+                None,
+            )?),
+        )?,
+        trade(
+            "long-before-ex",
+            ex_open - 2,
+            subject,
+            TradeSide::Buy,
+            3_i64,
+        )?,
+        trade(
+            "short-before-ex",
+            ex_open - 1,
+            short,
+            TradeSide::SellShort,
+            1_i64,
+        )?,
+        trade("buy-at-ex", ex_open, subject, TradeSide::Buy, 1_i64)?,
+        trade(
+            "sell-after-ex",
+            ex_open + 1,
+            subject,
+            TradeSide::Sell,
+            1_i64,
+        )?,
+    ];
+    let first = ledger.try_apply(
+        first_entries.clone(),
         Some(&first_plan),
-        valuation(12, 20, &[(1, 5)])?,
-        revision_evidence_with_plan(12, 20, &first_plan)?,
+        valuation(40, ex_close, &[(1, 10), (2, 10)])?,
+        evidence(40, ex_close, &first_plan)?,
     )?;
+    // Replay the same unsorted source through a real operation-owned SQLite snapshot. This
+    // covers action-before-entry ties, long/short entitlements, settlement, and indexed restore.
+    let directory = tempfile::tempdir()?;
+    let paths =
+        market_squawk_platform::LocalPaths::prepare(directory.path().join("streamed-ledger"))?;
+    let catalog_config = market_squawk_data::CatalogConfig::try_new(
+        paths.catalog()?.clone(),
+        std::time::Duration::from_millis(250),
+        market_squawk_data::CatalogLimit::new(16)?,
+        market_squawk_data::CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+    )?;
+    let service = market_squawk_data::AnalyticalDataService::initialize(
+        market_squawk_data::CatalogAuthority::open(catalog_config)?,
+        market_squawk_data::AnalyticalManifestCatalog::open(paths.catalog()?, 8)?,
+        paths.artifacts()?.clone(),
+        market_squawk_data::ObjectStoreConfig::try_new(
+            8 * 1024 * 1024,
+            1024,
+            std::time::Duration::from_secs(60),
+        )?,
+    )?;
+    let scratch = std::sync::Arc::new(service.object_store().operation_scratch()?);
+    let cancellation = tokio_util::sync::CancellationToken::new();
+    let mut streamed = PortfolioLedger::try_new(account()?, usd, limits()?)?;
+    let indexed_first = streamed.try_apply_stream(
+        first_entries.into_iter().rev().map(Ok),
+        Some(&first_plan),
+        valuation(40, ex_close, &[(1, 10), (2, 10)])?,
+        evidence(40, ex_close, &first_plan)?,
+        scratch.clone(),
+        8 * 1024 * 1024,
+        &cancellation,
+    )?;
+    assert_eq!(indexed_first.token(), first.token());
+    assert_eq!(indexed_first.positions(), first.positions());
+    assert_eq!(indexed_first.cash_entitlements(), first.cash_entitlements());
+    assert_eq!(indexed_first.cash(), first.cash());
+    let mut indexed_restored = indexed_first.clone().into_ledger()?;
+    assert_eq!(first.cash(), money(80, usd));
+    assert_eq!(first.receivable_value(), money(4, usd));
     assert_eq!(
         first
-            .position(instrument_id)
-            .ok_or("first position")?
-            .quantity(),
-        Decimal::from(20_u32)
+            .cash_entitlements()
+            .iter()
+            .find(|v| v.instrument() == subject)
+            .ok_or("long claim")?
+            .amount(),
+        money(6, usd)
     );
+    assert_eq!(
+        first
+            .cash_entitlements()
+            .iter()
+            .find(|v| v.instrument() == short)
+            .ok_or("short claim")?
+            .amount(),
+        money(-2, usd)
+    );
+    assert!(first.cash_entitlements().iter().all(|v| !v.settled()));
 
+    let before_payable = payable_close - 1;
+    let cumulative_plan = plan(before_payable)?;
+    let mut restored = first.clone().into_ledger()?;
     let cumulative = ledger.try_apply(
         Vec::new(),
         Some(&cumulative_plan),
-        valuation(13, 20, &[(1, 5)])?,
-        revision_evidence_with_plan(13, 20, &cumulative_plan)?,
+        valuation(41, before_payable, &[(1, 3), (2, 10)])?,
+        evidence(41, before_payable, &cumulative_plan)?,
     )?;
+    let replayed = restored.try_apply(
+        Vec::new(),
+        Some(&cumulative_plan),
+        valuation(41, before_payable, &[(1, 3), (2, 10)])?,
+        evidence(41, before_payable, &cumulative_plan)?,
+    )?;
+    let indexed_cumulative = indexed_restored.try_apply(
+        Vec::new(),
+        Some(&cumulative_plan),
+        valuation(41, before_payable, &[(1, 3), (2, 10)])?,
+        evidence(41, before_payable, &cumulative_plan)?,
+    )?;
+    assert_eq!(indexed_cumulative.token(), cumulative.token());
+    assert_eq!(indexed_cumulative.positions(), cumulative.positions());
+    assert_eq!(
+        indexed_cumulative.cash_entitlements(),
+        cumulative.cash_entitlements()
+    );
+    assert_eq!(replayed.token(), cumulative.token());
+    assert_eq!(replayed.cash_entitlements(), cumulative.cash_entitlements());
     assert_eq!(
         cumulative
-            .position(instrument_id)
-            .ok_or("cumulative position")?
+            .position(subject)
+            .ok_or("split position")?
             .quantity(),
-        Decimal::from(20_u32)
+        Decimal::from(9)
     );
-    assert_eq!(cumulative.cash().amount(), Decimal::from(-80_i32));
-    assert_eq!(cumulative.corporate_action_bindings().len(), 1);
+    assert_eq!(cumulative.cash(), money(80, usd));
+    assert_eq!(cumulative.receivable_value(), money(4, usd));
+    for prior in first.cash_entitlements() {
+        let current = cumulative
+            .cash_entitlements()
+            .iter()
+            .find(|value| value.action_evidence() == prior.action_evidence())
+            .ok_or("retained claim")?;
+        assert_eq!(current.amount(), prior.amount());
+        assert_eq!(current.entitled_at(), prior.entitled_at());
+        assert_eq!(current.payable_date(), prior.payable_date());
+        assert!(!current.settled());
+    }
+
+    let settled_plan = plan(payable_close)?;
+    let mut reopened = cumulative.clone().into_ledger()?;
+    let settled = ledger.try_apply(
+        Vec::new(),
+        Some(&settled_plan),
+        valuation(42, payable_close, &[(1, 3), (2, 10)])?,
+        evidence(42, payable_close, &settled_plan)?,
+    )?;
+    let recovered = reopened.try_apply(
+        Vec::new(),
+        Some(&settled_plan),
+        valuation(42, payable_close, &[(1, 3), (2, 10)])?,
+        evidence(42, payable_close, &settled_plan)?,
+    )?;
+    let mut indexed_reopened = indexed_cumulative.into_ledger()?;
+    let indexed_settled = indexed_reopened.try_apply(
+        Vec::new(),
+        Some(&settled_plan),
+        valuation(42, payable_close, &[(1, 3), (2, 10)])?,
+        evidence(42, payable_close, &settled_plan)?,
+    )?;
+    assert_eq!(indexed_settled.token(), settled.token());
+    assert_eq!(indexed_settled.cash(), settled.cash());
     assert_eq!(
-        first
-            .corporate_action_binding()
-            .ok_or("first action binding")?
-            .content_identity(),
-        first_plan.content_hash()
+        indexed_settled.cash_entitlements(),
+        settled.cash_entitlements()
     );
+    let correction = entry(
+        "capital",
+        2,
+        Some(1),
+        ex_open - 3,
+        1,
+        LedgerEntryKind::CashFlow(CashFlow::try_new(
+            CashFlowKind::Deposit,
+            money(101, usd),
+            None,
+        )?),
+    )?;
+    let corrected = ledger.try_apply(
+        vec![correction.clone()],
+        None,
+        valuation(43, payable_close + 1, &[(1, 3), (2, 10)])?,
+        evidence(43, payable_close + 1, &settled_plan)?,
+    )?;
+    let indexed_corrected = indexed_reopened.try_apply(
+        vec![correction.clone()],
+        None,
+        valuation(43, payable_close + 1, &[(1, 3), (2, 10)])?,
+        evidence(43, payable_close + 1, &settled_plan)?,
+    )?;
+    assert_eq!(indexed_corrected.token(), corrected.token());
+    assert_eq!(indexed_corrected.cash(), corrected.cash());
+    assert_eq!(indexed_corrected.positions(), corrected.positions());
+    assert!(matches!(
+        indexed_reopened.try_apply(
+            vec![correction],
+            None,
+            valuation(43, payable_close + 1, &[(1, 3), (2, 10)])?,
+            evidence(43, payable_close + 1, &settled_plan)?
+        ),
+        Err(PortfolioError::DuplicateTransactionRevision)
+    ));
+    let before_failure = indexed_reopened
+        .history()
+        .last()
+        .ok_or("indexed head")?
+        .token();
+    assert!(matches!(
+        indexed_reopened.try_apply_stream(
+            std::iter::once(Err(PortfolioError::Storage)),
+            None,
+            valuation(43, payable_close + 1, &[(1, 3), (2, 10)])?,
+            evidence(43, payable_close + 1, &settled_plan)?,
+            scratch.clone(),
+            8 * 1024 * 1024,
+            &cancellation
+        ),
+        Err(PortfolioError::Storage)
+    ));
+    assert_eq!(
+        indexed_reopened
+            .history()
+            .last()
+            .ok_or("unchanged indexed head")?
+            .token(),
+        before_failure
+    );
+    assert_eq!(recovered.token(), settled.token());
+    assert_eq!(recovered.cash_entitlements(), settled.cash_entitlements());
+    assert_eq!(settled.cash(), money(84, usd));
+    assert_eq!(settled.receivable_value(), money(0, usd));
+    assert_eq!(settled.marked_equity(), cumulative.marked_equity());
+    assert!(settled.cash_entitlements().iter().all(|v| v.settled()
+        && v.simulated_settlement_at() == Some(Timestamp::from_unix_nanos(payable_close))));
+    // Earlier immutable revisions retain unpaid claims; an older action plan cannot replace the head.
+    assert_eq!(first.cash(), money(80, usd));
+    assert!(first.cash_entitlements().iter().all(|v| !v.settled()));
     assert!(matches!(
         ledger.try_apply(
             Vec::new(),
             Some(&first_plan),
-            valuation(14, 21, &[(1, 5)])?,
-            revision_evidence_with_plan(14, 21, &first_plan)?,
+            valuation(43, payable_close + 1, &[(1, 3), (2, 10)])?,
+            evidence(43, payable_close + 1, &first_plan)?
         ),
         Err(PortfolioError::EvidenceMismatch)
     ));
@@ -362,9 +709,33 @@ fn opposing_lots_preserve_gross_exposure_and_merger_cash_direction() -> TestResu
         valuation(22, 20, &[])?,
         revision_evidence_with_plan(22, 20, &cash_plan)?,
     )?;
-    assert_eq!(cash_result.cash().amount(), Decimal::from(30_u32));
-    assert_eq!(cash_result.realized_gain().amount(), Decimal::from(30_u32));
-    assert_eq!(cash_result.realized_loss().amount(), Decimal::from(20_u32));
+    assert_eq!(cash_result.cash(), money(-60, usd));
+    assert_eq!(cash_result.receivable_value(), money(90, usd));
+    assert_eq!(cash_result.marked_equity(), money(30, usd));
+    assert_eq!(cash_result.cash_entitlements().len(), 1);
+    let cash_claim = cash_result
+        .cash_entitlements()
+        .first()
+        .ok_or("merger claim")?;
+    assert_eq!(cash_claim.amount(), money(90, usd));
+    assert!(!cash_claim.settled());
+    assert_eq!(cash_claim.simulated_settlement_at(), None);
+    assert_eq!(
+        cash_result
+            .realized_gain()
+            .complete()
+            .ok_or("complete realized gain")?
+            .amount(),
+        Decimal::from(30_u32)
+    );
+    assert_eq!(
+        cash_result
+            .realized_loss()
+            .complete()
+            .ok_or("complete realized loss")?
+            .amount(),
+        Decimal::from(20_u32)
+    );
     assert!(cash_result.positions().is_empty());
 
     let mixed_plan = action_plan(
@@ -383,15 +754,39 @@ fn opposing_lots_preserve_gross_exposure_and_merger_cash_direction() -> TestResu
         20,
     )?;
     let mut mixed_ledger = PortfolioLedger::try_new(account()?, usd, limits()?)?;
-    assert!(matches!(
-        mixed_ledger.try_apply(
-            entries,
-            Some(&mixed_plan),
-            valuation(23, 20, &[(2, 20)])?,
-            revision_evidence_with_plan(23, 20, &mixed_plan)?,
-        ),
-        Err(PortfolioError::UnresolvedCorporateAction)
-    ));
+    let mixed_result = mixed_ledger.try_apply(
+        entries,
+        Some(&mixed_plan),
+        valuation(23, 20, &[(2, 20)])?,
+        revision_evidence_with_plan(23, 20, &mixed_plan)?,
+    )?;
+    assert!(mixed_result.position(subject).is_none());
+    let successor_position = mixed_result
+        .position(successor)
+        .ok_or("successor position")?;
+    assert_eq!(successor_position.quantity(), Decimal::from(3_u32));
+    assert_eq!(successor_position.lots().len(), 2);
+    assert_eq!(mixed_result.gross_exposure(), money(140, usd));
+    assert_eq!(mixed_result.market_value(), money(60, usd));
+    assert_eq!(mixed_result.cash(), money(-60, usd));
+    assert_eq!(mixed_result.receivable_value(), money(30, usd));
+    assert_eq!(mixed_result.marked_equity(), money(30, usd));
+    assert_eq!(mixed_result.cash_entitlements().len(), 1);
+    let mixed_claim = mixed_result
+        .cash_entitlements()
+        .first()
+        .ok_or("mixed claim")?;
+    assert_eq!(mixed_claim.amount(), money(30, usd));
+    assert!(!mixed_claim.settled());
+    assert_eq!(mixed_claim.simulated_settlement_at(), None);
+    assert_eq!(
+        successor_position.cost_basis(),
+        BasisMeasurement::Incomplete
+    );
+    assert_eq!(mixed_result.cost_basis(), BasisMeasurement::Incomplete);
+    assert_eq!(mixed_result.unrealized_gain(), BasisMeasurement::Incomplete);
+    assert_eq!(mixed_result.realized_gain(), BasisMeasurement::Incomplete);
+    assert_eq!(mixed_result.realized_loss(), BasisMeasurement::Incomplete);
     Ok(())
 }
 
@@ -461,7 +856,24 @@ fn return_of_capital_reduces_each_complete_lot_and_realizes_each_excess() -> Tes
     assert_eq!(cheap.basis().amount(), Decimal::ZERO);
     assert_eq!(expensive.basis().amount(), Decimal::from(90_u32));
     assert_eq!(revision.return_of_capital().amount(), Decimal::from(20_u32));
-    assert_eq!(revision.realized_gain().amount(), Decimal::from(9_u32));
+    assert_eq!(revision.cash(), money(-101, usd));
+    assert_eq!(revision.receivable_value(), money(20, usd));
+    assert_eq!(revision.cash_entitlements().len(), 1);
+    let claim = revision
+        .cash_entitlements()
+        .first()
+        .ok_or("capital-return claim")?;
+    assert_eq!(claim.amount(), money(20, usd));
+    assert!(!claim.settled());
+    assert_eq!(claim.simulated_settlement_at(), None);
+    assert_eq!(
+        revision
+            .realized_gain()
+            .complete()
+            .ok_or("complete realized gain")?
+            .amount(),
+        Decimal::from(9_u32)
+    );
     Ok(())
 }
 
@@ -606,7 +1018,14 @@ fn accounting_vertical_is_exact_revisioned_and_reconciles_without_overwrite() ->
             .quantity(),
         -Decimal::ONE
     );
-    assert_eq!(revision.realized_gain().amount(), Decimal::new(226, 1));
+    assert_eq!(
+        revision
+            .realized_gain()
+            .complete()
+            .ok_or("complete realized gain")?
+            .amount(),
+        Decimal::new(226, 1)
+    );
     assert_eq!(
         revision
             .unrealized_gain()
@@ -748,7 +1167,14 @@ fn specific_lots_corporate_actions_negative_cash_and_overflow_fail_closed() -> T
             .amount(),
         Decimal::from(40_u32)
     );
-    assert_eq!(first.realized_gain().amount(), Decimal::TEN);
+    assert_eq!(
+        first
+            .realized_gain()
+            .complete()
+            .ok_or("complete realized gain")?
+            .amount(),
+        Decimal::TEN
+    );
 
     let records = corporate_action_records(instrument_a, usd)?;
     let plan = CorporateActionPlan::try_build(
@@ -796,29 +1222,42 @@ fn specific_lots_corporate_actions_negative_cash_and_overflow_fail_closed() -> T
     assert!(adjusted.return_of_capital().amount().is_sign_positive());
     assert!(adjusted.income().amount().is_sign_positive());
 
-    assert!(matches!(
-        ledger.try_apply(
-            vec![entry(
-                "sell-incomplete-spinoff",
-                1,
-                None,
-                21,
-                22,
-                LedgerEntryKind::Trade(Trade::try_new(
-                    TradeSide::Sell,
-                    instrument(3)?,
-                    Decimal::ONE,
-                    money(8, usd),
-                    money(0, usd),
-                    LotSelection::Fifo,
-                )?),
-            )?],
+    let mut disposal_ledger = adjusted.clone().into_ledger()?;
+    let disposed = disposal_ledger.try_apply(
+        vec![entry(
+            "sell-incomplete-spinoff",
+            1,
             None,
-            valuation(6, 21, &[(3, 8), (4, 12)])?,
-            revision_evidence_with_plan(6, 21, &plan)?,
-        ),
-        Err(PortfolioError::UnresolvedCorporateAction)
-    ));
+            21,
+            22,
+            LedgerEntryKind::Trade(Trade::try_new(
+                TradeSide::Sell,
+                instrument(3)?,
+                Decimal::ONE,
+                money(8, usd),
+                money(0, usd),
+                LotSelection::Fifo,
+            )?),
+        )?],
+        None,
+        valuation(6, 21, &[(3, 8), (4, 12)])?,
+        revision_evidence_with_plan(6, 21, &plan)?,
+    )?;
+    assert_eq!(disposed.cash(), money(-22, usd));
+    assert_eq!(disposed.receivable_value(), money(12, usd));
+    assert_eq!(disposed.cash_entitlements(), adjusted.cash_entitlements());
+    assert_eq!(
+        disposed
+            .position(instrument(3)?)
+            .ok_or("remaining spinoff")?
+            .quantity(),
+        Decimal::from(2_u32)
+    );
+    assert_eq!(disposed.marked_equity(), money(42, usd));
+    assert_eq!(disposed.marked_equity(), adjusted.marked_equity());
+    assert_eq!(disposed.cost_basis(), BasisMeasurement::Incomplete);
+    assert_eq!(disposed.realized_gain(), BasisMeasurement::Incomplete);
+    assert_eq!(disposed.realized_loss(), BasisMeasurement::Incomplete);
 
     let eur = Currency::try_from("EUR")?;
     let fx_revision = ledger.try_apply(
@@ -932,7 +1371,14 @@ proptest! {
                     .amount(),
                 remaining * Decimal::from(7_u32)
             );
-            assert_eq!(revision.realized_gain().amount(), sold * Decimal::from(4_u32));
+            assert_eq!(
+                revision
+                    .realized_gain()
+                    .complete()
+                    .ok_or("complete realized gain")?
+                    .amount(),
+                sold * Decimal::from(4_u32)
+            );
             Ok(())
         })();
         prop_assert!(result.is_ok(), "{result:?}");

@@ -134,10 +134,14 @@ pub(super) fn decode_row(
 ) -> Result<DecodedRow, TreasuryProtocolError> {
     ensure_allowed_fields(family, properties)?;
     let (mut points, market_unavailability_reason) = match family {
-        TreasuryDailyRateFamily::NominalParYieldCurve => (nominal_points(properties)?, None),
+        TreasuryDailyRateFamily::NominalParYieldCurve => {
+            (nominal_points(properties, record_date)?, None)
+        }
         TreasuryDailyRateFamily::BillRates => bill_points(properties, record_date)?,
         TreasuryDailyRateFamily::LongTermRates => (long_term_points(properties)?, None),
-        TreasuryDailyRateFamily::RealParYieldCurve => (real_curve_points(properties)?, None),
+        TreasuryDailyRateFamily::RealParYieldCurve => {
+            (real_curve_points(properties, record_date)?, None)
+        }
         TreasuryDailyRateFamily::RealLongTermRates => (real_long_term_points(properties)?, None),
     };
     points.sort_by_key(TreasuryDailyRatePoint::metric);
@@ -156,42 +160,39 @@ pub(super) fn decode_row(
 
 fn nominal_points(
     properties: &BTreeMap<String, PropertyValue>,
+    record_date: CalendarDate,
 ) -> Result<Vec<TreasuryDailyRatePoint>, TreasuryProtocolError> {
     let mut points = Vec::new();
     for (field, maturity) in NOMINAL_RATE_FIELDS {
-        if let Some(rate) = optional_decimal(properties, field)? {
-            points.push(TreasuryDailyRatePoint::new(
-                TreasuryDailyRateMetric::NominalParYield(maturity),
-                rate,
+        let metric = TreasuryDailyRateMetric::NominalParYield(maturity);
+        if record_date.year() >= metric.first_schema_year() {
+            points.push(rate_point(
+                metric,
+                decimal_field(properties, field)?,
                 None,
                 None,
                 None,
             ));
         }
     }
-    let display = optional_decimal(properties, "BC_30YEARDISPLAY")?;
-    let thirty_year = points
-        .iter()
-        .find(|point| {
-            point.metric()
-                == TreasuryDailyRateMetric::NominalParYield(TreasuryMaturity::ThirtyYears)
-        })
-        .map(TreasuryDailyRatePoint::rate_percent);
-    if display.is_some() && display != thirty_year {
-        return Err(TreasuryProtocolError::SchemaDrift);
-    }
+    // This auxiliary field need not equal the published BC_30YEAR yield: Treasury's
+    // historical responses contain display 0.00 alongside nonzero BC_30YEAR values.
+    // Validate its declared numeric type; retain its exact token in the captured raw page.
+    let _display = optional_decimal(properties, "BC_30YEARDISPLAY")?;
     Ok(points)
 }
 
 fn real_curve_points(
     properties: &BTreeMap<String, PropertyValue>,
+    record_date: CalendarDate,
 ) -> Result<Vec<TreasuryDailyRatePoint>, TreasuryProtocolError> {
     let mut points = Vec::new();
     for (field, maturity) in REAL_RATE_FIELDS {
-        if let Some(rate) = optional_decimal(properties, field)? {
-            points.push(TreasuryDailyRatePoint::new(
-                TreasuryDailyRateMetric::RealParYield(maturity),
-                rate,
+        let metric = TreasuryDailyRateMetric::RealParYield(maturity);
+        if record_date.year() >= metric.first_schema_year() {
+            points.push(rate_point(
+                metric,
+                decimal_field(properties, field)?,
                 None,
                 None,
                 None,
@@ -247,26 +248,23 @@ fn bill_points(
             ),
         ];
         let parsed = rates
-            .map(|(field, measure)| optional_decimal(properties, field).map(|rate| (measure, rate)))
+            .map(|(field, measure)| decimal_field(properties, field).map(|rate| (measure, rate)))
             .into_iter()
             .collect::<Result<Vec<_>, _>>()?;
-        if parsed.iter().any(|(_, rate)| rate.is_some())
+        if parsed
+            .iter()
+            .any(|(_, rate)| matches!(rate, DecimalField::Observed(_)))
             && (maturity_date.is_none() || cusip.is_none())
         {
             return Err(TreasuryProtocolError::SchemaDrift);
         }
         for (measure, rate) in parsed {
-            if let Some(rate) = rate {
-                points.push(TreasuryDailyRatePoint::new(
-                    TreasuryDailyRateMetric::Bill {
-                        maturity: spec.maturity,
-                        measure,
-                    },
-                    rate,
-                    maturity_date,
-                    cusip.clone(),
-                    None,
-                ));
+            let metric = TreasuryDailyRateMetric::Bill {
+                maturity: spec.maturity,
+                measure,
+            };
+            if record_date.year() >= metric.first_schema_year() {
+                points.push(rate_point(metric, rate, maturity_date, cusip.clone(), None));
             }
         }
     }
@@ -286,9 +284,9 @@ fn long_term_points(
         "N/A" => TreasuryExtrapolationFactor::NotApplicable,
         value => TreasuryExtrapolationFactor::Exact(parse_decimal(value)?),
     };
-    Ok(vec![TreasuryDailyRatePoint::new(
+    Ok(vec![rate_point(
         TreasuryDailyRateMetric::LongTerm(rate_type),
-        required_decimal(properties, "RATE")?,
+        decimal_field(properties, "RATE")?,
         None,
         None,
         Some(factor),
@@ -298,13 +296,63 @@ fn long_term_points(
 fn real_long_term_points(
     properties: &BTreeMap<String, PropertyValue>,
 ) -> Result<Vec<TreasuryDailyRatePoint>, TreasuryProtocolError> {
-    Ok(vec![TreasuryDailyRatePoint::new(
+    Ok(vec![rate_point(
         TreasuryDailyRateMetric::RealLongTermAverage,
-        required_decimal(properties, "RATE")?,
+        decimal_field(properties, "RATE")?,
         None,
         None,
         None,
     )])
+}
+
+#[derive(Clone, Copy)]
+enum DecimalField {
+    Observed(Decimal),
+    Missing(&'static str),
+}
+
+fn decimal_field(
+    properties: &BTreeMap<String, PropertyValue>,
+    name: &str,
+) -> Result<DecimalField, TreasuryProtocolError> {
+    match properties.get(name) {
+        None => Ok(DecimalField::Missing("absent")),
+        Some(property) if property.is_null => {
+            if property.text.is_some()
+                || property
+                    .data_type
+                    .as_deref()
+                    .is_some_and(|value| value != "Edm.Double")
+            {
+                return Err(TreasuryProtocolError::SchemaDrift);
+            }
+            Ok(DecimalField::Missing("m:null=true"))
+        }
+        Some(_) => optional_decimal(properties, name)?
+            .map(DecimalField::Observed)
+            .ok_or(TreasuryProtocolError::SchemaDrift),
+    }
+}
+
+fn rate_point(
+    metric: TreasuryDailyRateMetric,
+    value: DecimalField,
+    maturity_date: Option<CalendarDate>,
+    cusip: Option<String>,
+    extrapolation_factor: Option<TreasuryExtrapolationFactor>,
+) -> TreasuryDailyRatePoint {
+    match value {
+        DecimalField::Observed(value) => {
+            TreasuryDailyRatePoint::new(metric, value, maturity_date, cusip, extrapolation_factor)
+        }
+        DecimalField::Missing(marker) => TreasuryDailyRatePoint::missing(
+            metric,
+            marker,
+            maturity_date,
+            cusip,
+            extrapolation_factor,
+        ),
+    }
 }
 
 fn ensure_allowed_fields(
@@ -384,13 +432,6 @@ pub(super) const fn date_field(family: TreasuryDailyRateFamily) -> &'static str 
             "QUOTE_DATE"
         }
     }
-}
-
-fn required_decimal(
-    properties: &BTreeMap<String, PropertyValue>,
-    name: &str,
-) -> Result<Decimal, TreasuryProtocolError> {
-    optional_decimal(properties, name)?.ok_or(TreasuryProtocolError::SchemaDrift)
 }
 
 fn optional_decimal(

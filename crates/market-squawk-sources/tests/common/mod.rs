@@ -16,15 +16,58 @@ use market_squawk_domain::{
     SnapshotApplicability, SourceId, SourceIdentifier, Timestamp, VenueId,
 };
 use market_squawk_sources::{
-    AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope, CoverageTopology,
+    AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetDecision, BudgetDispatchDecision,
+    BudgetReservationDecision, BudgetScope, CoverageTopology,
     EndpointPolicy, FreshnessPolicy, HistoricalCapability, InstrumentCoverage,
     LiveCoverageDeclaration, LiveCoverageRule, LiveProtocolProfile, NetworkAccessPolicy,
     ProviderBudgetPolicy, ProviderNumericPolicy, SemanticInterpretationProfile,
-    SequenceValidationProfile, SourceCapabilities, SourceClass, SourceCoverage, SourceMetadata,
+    SequenceValidationProfile, SharedProviderBudget, SourceCapabilities, SourceClass, SourceCoverage,
+    SourceMetadata,
     SourceMetadataInput, SourceProtocolProfile,
 };
 
 pub(crate) type TestResult<T = ()> = Result<T, Box<dyn Error>>;
+
+use market_squawk_sources as sources;
+mod provider_identity;
+
+/// Deterministic selection for registry/processor tests, not real catalog evidence.
+/// Real catalog selection, replacement, and restart are exercised in data/adapter tests.
+/// Only the explicitly installed native routes can pass this test composition seam.
+pub(crate) fn register_fixture_source(
+    metadata: SourceMetadata,
+    routes: &[(market_squawk_domain::InstrumentId, &str)],
+    registered_at: Timestamp,
+) -> TestResult<(
+    market_squawk_sources::AuthoritativeSourceRegistry,
+    market_squawk_sources::RegisteredSource,
+)> {
+    use market_squawk_sources::AuthoritativeSourceRegistry;
+    let (authority, requests) =
+        provider_identity::fixture_identity_authority(routes, now_timestamp()?)?;
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?
+        .with_provider_identity_authority(authority)?;
+    let registered = registry.register(metadata, registered_at)?;
+    registry.record_provider_identities(
+        &registered,
+        &requests,
+        std::time::Instant::now() + std::time::Duration::from_secs(2),
+        &tokio_util::sync::CancellationToken::new(),
+    )?;
+    Ok((registry, registered))
+}
+
+pub(crate) fn acquire_budget(budget: &SharedProviderBudget) -> BudgetDecision {
+    match budget.try_reserve_request() {
+        BudgetReservationDecision::Ready(reservation) => match reservation.commit_dispatch() {
+            BudgetDispatchDecision::Ready(permit) => BudgetDecision::Ready(permit),
+            BudgetDispatchDecision::WaitUntil(deadline) => BudgetDecision::WaitUntil(deadline),
+            BudgetDispatchDecision::Unavailable(reason) => BudgetDecision::Unavailable(reason),
+        },
+        BudgetReservationDecision::WaitUntil(deadline) => BudgetDecision::WaitUntil(deadline),
+        BudgetReservationDecision::Unavailable(reason) => BudgetDecision::Unavailable(reason),
+    }
+}
 
 pub(crate) fn now_timestamp() -> TestResult<Timestamp> {
     let nanos = SystemTime::now().duration_since(UNIX_EPOCH)?.as_nanos();

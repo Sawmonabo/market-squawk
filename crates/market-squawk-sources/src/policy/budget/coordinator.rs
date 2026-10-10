@@ -1,12 +1,16 @@
 use super::*;
 
-/// Lock-free lease proving a budget remained available at one allocation generation.
+/// Test probe for dispatch-generation and durable-budget failure cases.
+/// Received-data authority does not retain request availability.
+#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct BudgetAvailabilityLease {
     allocation: Arc<BudgetAllocation>,
     generation: u64,
+    provider_generation: Option<u64>,
 }
 
+#[cfg(test)]
 impl std::fmt::Debug for BudgetAvailabilityLease {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -16,9 +20,15 @@ impl std::fmt::Debug for BudgetAvailabilityLease {
     }
 }
 
+#[cfg(test)]
 impl BudgetAvailabilityLease {
     pub(crate) fn is_available(&self) -> bool {
-        !self.allocation.terminal.load(Ordering::Acquire)
+        self.provider_generation.is_none_or(|generation| {
+            self.allocation
+                .provider_rate
+                .as_ref()
+                .is_some_and(|binding| binding.availability_generation_is_current(generation))
+        }) && !self.allocation.terminal.load(Ordering::Acquire)
             && !self.allocation.state.is_poisoned()
             && self
                 .allocation
@@ -33,29 +43,9 @@ impl BudgetAvailabilityLease {
             && !self.allocation.state.is_poisoned()
             && !self.allocation.terminal.load(Ordering::Acquire)
     }
-
-    pub(crate) fn shared_allocation_charge(&self) -> Option<usize> {
-        let state_dynamic = self
-            .allocation
-            .state
-            .lock()
-            .ok()?
-            .dynamic_retained_bytes()?;
-        std::mem::size_of::<BudgetAllocation>()
-            .checked_add(crate::conservative_arc_control_block_charge::<
-                BudgetAllocation,
-            >())
-            .and_then(|bytes| {
-                self.allocation
-                    .policy
-                    .dynamic_retained_bytes()
-                    .and_then(|dynamic| bytes.checked_add(dynamic))
-            })
-            .and_then(|bytes| bytes.checked_add(state_dynamic))
-            .and_then(|bytes| bytes.checked_add(self.allocation.clock.shared_allocation_charge()))
-    }
 }
 
+#[cfg(test)]
 impl SharedProviderBudget {
     pub(crate) fn availability_lease(
         &self,
@@ -70,6 +60,36 @@ impl SharedProviderBudget {
                 return self.terminal_fail(BudgetUnavailableReason::StatePoisoned, &operation);
             }
         };
+        if let Some(binding) = &self.allocation.provider_rate {
+            let (availability, provider_generation) = binding
+                .availability_lease_generation()
+                .map_err(|reason| self.terminal_fault(reason, &operation))?;
+            let reason = match availability {
+                ProviderRateAvailability::Available => None,
+                ProviderRateAvailability::WaitUntil(_) => {
+                    Some(BudgetUnavailableReason::AvailabilityChanged)
+                }
+                ProviderRateAvailability::Unavailable(reason) => Some(reason),
+            };
+            if let Some(reason) = reason {
+                self.revoke_availability(&operation)?;
+                return Err(reason);
+            }
+            let lease = BudgetAvailabilityLease {
+                allocation: Arc::clone(&self.allocation),
+                generation: self
+                    .allocation
+                    .availability_generation
+                    .load(Ordering::Acquire),
+                provider_generation: Some(provider_generation),
+            };
+            drop(state);
+            return if lease.is_available() {
+                Ok(lease)
+            } else {
+                Err(BudgetUnavailableReason::AvailabilityChanged)
+            };
+        }
         let observation = match self.allocation.clock.observation() {
             Ok(observation) => observation,
             Err(_reason) => {
@@ -127,6 +147,7 @@ impl SharedProviderBudget {
         let lease = BudgetAvailabilityLease {
             allocation: Arc::clone(&self.allocation),
             generation,
+            provider_generation: None,
         };
         if lease.is_available() {
             Ok(lease)
@@ -144,7 +165,7 @@ impl SharedProviderBudget {
 mod durability;
 pub(in crate::policy) use durability::CleanShutdownProof;
 pub(crate) use durability::ProviderBudgetPool;
-pub use durability::{BudgetPermit, BudgetPoolError};
+pub use durability::{BudgetPermit, BudgetPermitLease, BudgetPoolError, BudgetReservation};
 
 pub(super) trait BudgetClock: Send + Sync {
     fn observation(&self) -> Result<ClockObservation, BudgetUnavailableReason>;
@@ -167,23 +188,34 @@ impl SystemBudgetClock {
 
 impl BudgetClock for SystemBudgetClock {
     fn observation(&self) -> Result<ClockObservation, BudgetUnavailableReason> {
-        let elapsed_duration = Instant::now()
-            .checked_duration_since(self.origin)
-            .ok_or(BudgetUnavailableReason::ClockUnavailable)?;
-        let elapsed = u64::try_from(elapsed_duration.as_nanos())
-            .map_err(|_| BudgetUnavailableReason::ClockUnavailable)?;
-        let wall_duration = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_err(|_| BudgetUnavailableReason::ClockUnavailable)?;
-        let wall_nanos = i64::try_from(wall_duration.as_nanos())
-            .map_err(|_| BudgetUnavailableReason::ClockUnavailable)?;
-        Ok(ClockObservation::new(
-            Timestamp::from_unix_nanos(wall_nanos),
-            MonotonicInstant::from_nanos(elapsed),
-        ))
+        observe_system_clocks(self.origin, SystemTime::now, Instant::now)
     }
 
     fn shared_allocation_charge(&self) -> usize {
         std::mem::size_of::<Self>() + crate::conservative_arc_control_block_charge::<Self>()
     }
+}
+
+/// Samples wall time before monotonic time so a scheduling delay can only extend a converted
+/// provider deadline. Sampling in the inverse order could make Retry-After and rate-window
+/// deadlines expire early by the suspension interval between the two reads.
+fn observe_system_clocks(
+    origin: Instant,
+    wall_now: impl FnOnce() -> SystemTime,
+    monotonic_now: impl FnOnce() -> Instant,
+) -> Result<ClockObservation, BudgetUnavailableReason> {
+    let wall_duration = wall_now()
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| BudgetUnavailableReason::ClockUnavailable)?;
+    let elapsed_duration = monotonic_now()
+        .checked_duration_since(origin)
+        .ok_or(BudgetUnavailableReason::ClockUnavailable)?;
+    let elapsed = u64::try_from(elapsed_duration.as_nanos())
+        .map_err(|_| BudgetUnavailableReason::ClockUnavailable)?;
+    let wall_nanos = i64::try_from(wall_duration.as_nanos())
+        .map_err(|_| BudgetUnavailableReason::ClockUnavailable)?;
+    Ok(ClockObservation::new(
+        Timestamp::from_unix_nanos(wall_nanos),
+        MonotonicInstant::from_nanos(elapsed),
+    ))
 }

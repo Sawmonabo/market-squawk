@@ -205,10 +205,23 @@ pub(super) fn map_datafusion(error: DataFusionError, limit: u64) -> QueryError {
         QueryError::Cancelled
     } else if error_chain_has_marker::<PinnedIoAdmissionError>(&error) {
         QueryError::BlockingTaskLimitExceeded
+    } else if datafusion_spill_error(&error) {
+        QueryError::SpillStorageExhausted
     } else if datafusion_memory_error(&error) {
         QueryError::MemoryLimitExceeded { limit }
     } else {
         QueryError::DataFusion(error)
+    }
+}
+
+fn datafusion_spill_error(error: &DataFusionError) -> bool {
+    match error {
+        DataFusionError::ResourcesExhausted(message) => {
+            message.contains("used disk space during the spilling process")
+        }
+        DataFusionError::IoError(error) => error.kind() == std::io::ErrorKind::StorageFull,
+        DataFusionError::Context(_, source) => datafusion_spill_error(source),
+        _ => false,
     }
 }
 

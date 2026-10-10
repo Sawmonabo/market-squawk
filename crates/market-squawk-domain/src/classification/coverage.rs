@@ -14,6 +14,10 @@ use crate::{SourceId, Timestamp, VenueId};
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "value")]
 pub enum CoverageDelay {
+    /// Nonmarket extraction data for which quote-delivery latency has no meaning.
+    NotApplicable,
+    /// Market delivery timing has not been established.
+    Unknown,
     /// Provider metadata declares real-time delivery.
     RealTime,
     /// Provider metadata declares a positive delay in nanoseconds.
@@ -123,6 +127,9 @@ impl CoverageScope {
         effective_until: Option<Timestamp>,
         metadata_revision: MetadataRevision,
     ) -> Result<Self, CoverageError> {
+        if delay == CoverageDelay::NotApplicable {
+            return Err(CoverageError::NonMarketDelay);
+        }
         if matches!(delay, CoverageDelay::Delayed(0)) {
             return Err(CoverageError::ZeroDelay);
         }
@@ -335,6 +342,8 @@ pub enum CoverageDimension {
 /// Failure to construct or bind source coverage metadata.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CoverageError {
+    /// Nonmarket delay semantics were supplied to a live market coverage scope.
+    NonMarketDelay,
     /// A delayed declaration used a zero delay.
     ZeroDelay,
     /// Effective end precedes effective start.
@@ -352,6 +361,9 @@ pub enum CoverageError {
 impl fmt::Display for CoverageError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::NonMarketDelay => {
+                formatter.write_str("live coverage requires market delivery timing")
+            }
             Self::ZeroDelay => formatter.write_str("delayed coverage must have a positive delay"),
             Self::InvalidEffectiveInterval => {
                 formatter.write_str("coverage effective interval is reversed")

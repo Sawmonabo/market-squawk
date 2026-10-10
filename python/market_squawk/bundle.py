@@ -12,7 +12,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping
 
 from . import _native
 
@@ -20,6 +20,10 @@ from . import _native
 MAX_ARTIFACT_BYTES = 1024 * 1024
 MAX_ONNX_ARTIFACT_BYTES = 64 * 1024 * 1024
 MAX_METADATA_BYTES = 256 * 1024
+MAX_FORECAST_RESIDUAL_BYTES = 16 * 1024 * 1024
+MAX_FORECAST_POLICY_BYTES = 64 * 1024
+MAX_PROBABILITY_OUTCOME_BYTES = 100_000 * 40
+MAX_PROBABILITY_POLICY_BYTES = 64 * 1024
 MAX_AUTHORITY_BYTES = 256 * 1024
 MAX_VALIDATOR_BYTES = 128 * 1024 * 1024
 VALIDATOR_READ_BYTES = 1024 * 1024
@@ -134,6 +138,7 @@ class BundleCandidate:
     metadata_bytes: bytes = field(repr=False)
     artifact_bytes: bytes = field(repr=False)
     training_run_bytes: bytes = field(repr=False)
+    calibration_artifacts: tuple[tuple[str, bytes], ...] = field(repr=False)
     artifact_path: str
     metadata_sha256: str
     artifact_sha256: str
@@ -144,9 +149,13 @@ class BundleCandidate:
         metadata: Mapping[str, Any],
         artifact: Mapping[str, Any],
         run_record: Mapping[str, Any],
+        *,
+        calibration_artifacts: Mapping[str, bytes] | None = None,
     ) -> None:
         artifact_bytes = _canonical(artifact, MAX_ARTIFACT_BYTES)
-        self._initialize(metadata, artifact_bytes, run_record, "artifact.json")
+        self._initialize(
+            metadata, artifact_bytes, run_record, "artifact.json", calibration_artifacts
+        )
 
     @classmethod
     def onnx(
@@ -154,13 +163,17 @@ class BundleCandidate:
         metadata: Mapping[str, Any],
         artifact: bytes,
         run_record: Mapping[str, Any],
+        *,
+        calibration_artifacts: Mapping[str, bytes] | None = None,
     ) -> BundleCandidate:
         """Construct a candidate containing one exact code-owned ONNX protobuf."""
 
         if type(artifact) is not bytes or not artifact or len(artifact) > MAX_ONNX_ARTIFACT_BYTES:
             raise BundleExportError("ONNX artifact exceeds its closed byte contract")
         candidate = object.__new__(cls)
-        candidate._initialize(metadata, artifact, run_record, "model.onnx")
+        candidate._initialize(
+            metadata, artifact, run_record, "model.onnx", calibration_artifacts
+        )
         return candidate
 
     def _initialize(
@@ -169,12 +182,11 @@ class BundleCandidate:
         artifact_bytes: bytes,
         run_record: Mapping[str, Any],
         artifact_path: str,
+        calibration_artifacts: Mapping[str, bytes] | None,
     ) -> None:
-        training_run_bytes = _canonical(run_record, MAX_METADATA_BYTES)
-        artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
-        training_run_sha256 = hashlib.sha256(training_run_bytes).hexdigest()
         try:
             finalized_metadata = dict(metadata)
+            finalized_run = dict(run_record)
             finalized_artifact = dict(finalized_metadata["artifact"])
             finalized_training_run = dict(finalized_metadata["training_run"])
         except (KeyError, TypeError, ValueError) as error:
@@ -194,6 +206,47 @@ class BundleCandidate:
             )
         ):
             raise BundleExportError("bundle artifact path or format is invalid")
+        retained_calibration: tuple[tuple[str, bytes], ...] = ()
+        if calibration_artifacts is not None:
+            probability = finalized_metadata.get("output_semantics") == "binary_probability"
+            field_name = "probability_calibration" if probability else "forecast_calibration"
+            other_field = "forecast_calibration" if probability else "probability_calibration"
+            closed_artifacts = (
+                ("outcomes", "calibration/probability-outcomes.bin", MAX_PROBABILITY_OUTCOME_BYTES),
+                ("policy", "calibration/probability-policy.json", MAX_PROBABILITY_POLICY_BYTES),
+            ) if probability else (
+                ("residuals", "calibration/residuals.f64le", MAX_FORECAST_RESIDUAL_BYTES),
+                ("policy", "calibration/policy.json", MAX_FORECAST_POLICY_BYTES),
+            )
+            if set(calibration_artifacts) != {path for _, path, _ in closed_artifacts}:
+                raise BundleExportError("calibration artifact set differs from the output contract")
+            references = {}
+            retained = []
+            for name, path, maximum in closed_artifacts:
+                content = calibration_artifacts[path]
+                if type(content) is not bytes or not content or len(content) > maximum:
+                    raise BundleExportError("calibration exceeds its closed byte contract")
+                if name == "outcomes" and len(content) % 40:
+                    raise BundleExportError("probability outcome records are incomplete")
+                references[name] = {
+                    "path": path,
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                    "size_bytes": len(content),
+                }
+                retained.append((path, content))
+            retained_calibration = tuple(retained)
+            for document in (finalized_metadata, finalized_run):
+                if document.get(field_name, references) != references or document.get(other_field) is not None:
+                    raise BundleExportError("calibration artifact references differ")
+                document[field_name] = references
+        elif any(
+            document.get("forecast_calibration") is not None or document.get("probability_calibration") is not None
+            for document in (finalized_metadata, finalized_run)
+        ) or finalized_metadata.get("output_semantics") == "binary_probability":
+            raise BundleExportError("required calibration artifacts are absent")
+        training_run_bytes = _canonical(finalized_run, MAX_METADATA_BYTES)
+        artifact_sha256 = hashlib.sha256(artifact_bytes).hexdigest()
+        training_run_sha256 = hashlib.sha256(training_run_bytes).hexdigest()
         finalized_artifact["sha256"] = artifact_sha256
         finalized_artifact["size_bytes"] = len(artifact_bytes)
         finalized_training_run["sha256"] = training_run_sha256
@@ -204,6 +257,7 @@ class BundleCandidate:
         object.__setattr__(self, "metadata_bytes", metadata_bytes)
         object.__setattr__(self, "artifact_bytes", artifact_bytes)
         object.__setattr__(self, "training_run_bytes", training_run_bytes)
+        object.__setattr__(self, "calibration_artifacts", retained_calibration)
         object.__setattr__(self, "artifact_path", artifact_path)
         object.__setattr__(self, "metadata_sha256", hashlib.sha256(metadata_bytes).hexdigest())
         object.__setattr__(self, "artifact_sha256", artifact_sha256)
@@ -230,6 +284,31 @@ class BundleCandidate:
             raise BundleExportError("bundle candidate cannot contain its independent authority")
         if authority.root.is_relative_to(resolved_output):
             raise BundleExportError("bundle authority cannot be nested below candidate output")
+        final = self._stage_files(output_root, lambda temporary: _validate_with_rust(
+            temporary, self.metadata_sha256, authority, dataset_receipt,
+        ))
+        return BundleReceipt(
+            root=final, metadata=final / "bundle.json",
+            artifact=final / self.artifact_path, run_record=final / "training-run.json",
+            metadata_sha256=self.metadata_sha256, artifact_sha256=self.artifact_sha256,
+            training_run_sha256=self.training_run_sha256, authority_sha256=authority.sha256,
+            dataset_export_sha256=dataset_receipt.export_sha256,
+            dataset_selection_sha256=dataset_receipt.selection_sha256,
+            catalog_identity_sha256=dataset_receipt.catalog_identity,
+            validated_by_rust=True,
+        )
+
+    def _stage_for_product_admission(self, output_root: Path, proposal: bytes) -> Path:
+        """Stage untrusted bytes for the owning Rust job; this grants no admission."""
+        if type(proposal) is not bytes or not 0 < len(proposal) <= MAX_AUTHORITY_BYTES:
+            raise BundleExportError("product authority proposal exceeds its byte bound")
+        return self._stage_files(output_root, lambda temporary: _write_exact(
+            temporary / "authority-proposal.json", proposal,
+        ))
+
+    def _stage_files(self, output_root: Path, before_publish: Callable[[Path], None]) -> Path:
+        if output_root.is_symlink() or _windows_reparse_path(output_root) or not output_root.is_dir():
+            raise BundleExportError("bundle output root is not a controlled directory")
         final = output_root / "candidate"
         if final.exists() or final.is_symlink() or _windows_reparse_path(final):
             raise BundleExportError("bundle candidate generation already exists")
@@ -238,29 +317,17 @@ class BundleCandidate:
             _write_exact(temporary / self.artifact_path, self.artifact_bytes)
             _write_exact(temporary / "bundle.json", self.metadata_bytes)
             _write_exact(temporary / "training-run.json", self.training_run_bytes)
+            if self.calibration_artifacts:
+                calibration_root = temporary / "calibration"
+                calibration_root.mkdir(mode=0o700)
+                for path, content in self.calibration_artifacts:
+                    _write_exact(temporary / path, content)
+                _fsync_directory(calibration_root)
+            before_publish(temporary)
             _fsync_directory(temporary)
-            _validate_with_rust(
-                temporary,
-                self.metadata_sha256,
-                authority,
-                dataset_receipt,
-            )
             os.replace(temporary, final)
             _fsync_directory(output_root)
-            return BundleReceipt(
-                root=final,
-                metadata=final / "bundle.json",
-                artifact=final / self.artifact_path,
-                run_record=final / "training-run.json",
-                metadata_sha256=self.metadata_sha256,
-                artifact_sha256=self.artifact_sha256,
-                training_run_sha256=self.training_run_sha256,
-                authority_sha256=authority.sha256,
-                dataset_export_sha256=dataset_receipt.export_sha256,
-                dataset_selection_sha256=dataset_receipt.selection_sha256,
-                catalog_identity_sha256=dataset_receipt.catalog_identity,
-                validated_by_rust=True,
-            )
+            return final
         except Exception:
             shutil.rmtree(temporary, ignore_errors=True)
             raise
@@ -380,12 +447,42 @@ def _validator_digest(path: Path) -> str:
     return digest.hexdigest()
 
 
-def _validator_path() -> tuple[Path, str]:
+def _validator_path() -> tuple[Path, str | None, Any | None]:
+    if _native.__market_squawk_build_identity__ == "development-unsealed-v1":
+        try:
+            environment = _native.training_environment_receipt()
+        except ValueError as error:
+            raise BundleExportError(str(error)) from error
+        if (
+            environment.origin != "source-development"
+            or environment.validator_path is None
+            or environment.source_development_root is None
+        ):
+            raise BundleExportError(
+                "source validator configuration is unavailable; refresh the managed environment"
+            )
+        path = Path(environment.validator_path)
+        try:
+            metadata = path.stat(follow_symlinks=False)
+        except OSError as error:
+            raise BundleExportError("configured source Rust validator is unavailable") from error
+        executable = (
+            path.suffix.lower() == ".exe" if os.name == "nt" else metadata.st_mode & 0o111
+        )
+        if (
+            not path.is_absolute()
+            or not stat.S_ISREG(metadata.st_mode)
+            or _windows_reparse_point(metadata)
+            or not 0 < metadata.st_size <= MAX_VALIDATOR_BYTES
+            or not executable
+        ):
+            raise BundleExportError("configured source Rust validator is not a bounded executable")
+        return path, None, environment
     expected_sha256 = _expected_validator_sha256()
     path = _native_release_executable("market-squawk-model-validator")
     if _validator_digest(path) != expected_sha256:
         raise BundleExportError("Rust model bundle validator identity mismatch")
-    return path, expected_sha256
+    return path, expected_sha256, None
 
 
 def _validate_with_rust(
@@ -394,7 +491,7 @@ def _validate_with_rust(
     authority: BundleAuthorityRef,
     dataset_receipt: Any,
 ) -> None:
-    validator, validator_sha256 = _validator_path()
+    validator, validator_sha256, source_environment = _validator_path()
     command = [
         str(validator),
         "--root",
@@ -419,7 +516,13 @@ def _validate_with_rust(
         dataset_receipt.selection_sha256,
         "--catalog-identity-sha256",
         dataset_receipt.catalog_identity,
+        "--dataset-product-contract",
+        dataset_receipt.product_contract,
     ]
+    if source_environment is not None:
+        command.extend([
+            "--source-development-root", source_environment.source_development_root,
+        ])
     try:
         completed = subprocess.run(
             command,
@@ -431,11 +534,25 @@ def _validate_with_rust(
             env=_native_subprocess_environment(),
         )
     except (OSError, subprocess.TimeoutExpired) as error:
-        if _validator_digest(validator) != validator_sha256:
+        if validator_sha256 is not None and _validator_digest(validator) != validator_sha256:
             raise BundleExportError("Rust model bundle validator identity changed") from error
         raise BundleExportError("Rust model bundle validation could not complete") from error
-    if _validator_digest(validator) != validator_sha256:
+    if validator_sha256 is not None and _validator_digest(validator) != validator_sha256:
         raise BundleExportError("Rust model bundle validator identity changed")
+    if source_environment is not None:
+        try:
+            current_environment = _native.training_environment_receipt()
+        except ValueError as error:
+            raise BundleExportError(str(error)) from error
+        if (
+            current_environment.origin != source_environment.origin
+            or current_environment.sha256 != source_environment.sha256
+            or current_environment.training_code_revision
+            != source_environment.training_code_revision
+        ):
+            raise BundleExportError(
+                "source training environment changed during validation; refresh the managed environment"
+            )
     if completed.returncode != 0 or len(completed.stdout) > 4096 or len(completed.stderr) > 4096:
         raise BundleExportError("Rust model bundle validation rejected the candidate")
     try:

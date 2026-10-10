@@ -1,0 +1,88 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="color-scheme" content="dark">
+    <title>{{heading}} | Market Squawk</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+        color: oklch(0.975 0.003 265);
+        background: oklch(0.105 0.004 265);
+      }
+      * { box-sizing: border-box; }
+      body {
+        margin: 0;
+        min-height: 100vh;
+        min-height: 100svh;
+        display: grid;
+        place-items: center;
+        padding: 24px;
+      }
+      main {
+        width: 100%;
+        max-width: 480px;
+        padding: 40px 32px;
+        text-align: center;
+        background: oklch(0.155 0.006 265);
+        border: 1px solid oklch(0.25 0.007 265);
+        border-radius: 14px;
+      }
+      .brand {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        margin-bottom: 36px;
+        font-size: 22px;
+        font-weight: 700;
+        letter-spacing: -0.6px;
+      }
+      .brand svg { width: 44px; height: 32px; flex: none; }
+      .brand span { color: #155dfc; }
+      .connection {
+        margin: 0 0 12px;
+        color: oklch(0.65 0.01 265);
+        font-size: 14px;
+      }
+      h1 {
+        margin: 0;
+        color: oklch(0.62 0.22 257);
+        font-size: clamp(24px, 6vw, 30px);
+        line-height: 1.25;
+        letter-spacing: -0.6px;
+        overflow-wrap: anywhere;
+      }
+      .detail { margin: 16px 0 0; font-size: 16px; line-height: 1.6; }
+      .return {
+        margin: 28px 0 0;
+        padding-top: 24px;
+        border-top: 1px solid oklch(0.25 0.007 265);
+        font-size: 15px;
+        line-height: 1.6;
+      }
+      @media (max-width: 360px) {
+        body { padding: 16px; }
+        main { padding: 32px 20px; }
+      }
+    </style>
+  </head>
+  <body>
+    <main aria-labelledby="result-heading">
+      <div class="brand">
+        <!-- Existing desktop mark: apps/market-squawk-desktop/src/assets/market-squawk-mark.svg -->
+        <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 230 165" aria-hidden="true" focusable="false">
+          <path fill="#155dfc" d="M6 16 155 16 126 48 124 61 129 72 160 98 160 109 142 128 97 128 73 96 99 96 101 95 101 89 60 89 38 59 38 57 82 57 82 51 31 51 6 19Z" />
+          <path fill="#fafafa" d="M220 53C219.8 53.5 219.4 54.5 219 55 214 55.3 196.3 53.5 190 55 183.7 56.5 182.2 60.7 181 64 179.8 67.3 180.7 71.7 183 75 185.3 78.3 190.8 80 195 84 199.2 88 205.5 93.7 208 99 210.5 104.3 210.3 111.8 210 116 209.7 120.2 208.2 121.2 206 124 203.8 126.8 201.7 129.8 197 133 192.3 136.2 185.7 140 178 143 170.3 146 161 148.8 151 151 141 153.2 124 155.5 118 156 121 154.5 148.2 137.5 157 131 165.8 124.5 168 120.8 171 117 174 113.2 174.3 110.5 175 108 175.7 105.5 175.7 104.5 175 102 174.3 99.5 176.3 99.3 171 93 165.7 86.7 147.8 70.7 143 64 138.2 57.3 141.5 56.2 142 53 142.5 49.8 143.2 47.8 146 45 148.8 42.2 153.2 37.8 159 36 164.8 34.2 176 34 181 34 186 34 186 34.3 189 36 192 37.7 195.5 42.2 199 44 202.5 45.8 206.5 45.5 210 47 213.5 48.5 218.3 52 220 53Z" />
+        </svg>
+        <div>Market <span>Squawk</span></div>
+      </div>
+      <p class="connection">Schwab connection</p>
+      <h1 id="result-heading">{{heading}}</h1>
+      <p class="detail">{{detail}}</p>
+      <p class="return">You can close this tab and return to Market Squawk.</p>
+    </main>
+  </body>
+</html>

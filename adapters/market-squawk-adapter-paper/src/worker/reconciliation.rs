@@ -130,6 +130,7 @@ impl PaperWorker {
     pub(super) fn snapshot(&self) -> PaperExecutionSnapshot {
         PaperExecutionSnapshot::from_state(
             self.config.digest(),
+            &self.config,
             self.state.sequence,
             self.state.reconciliation_required,
             &self.state.orders,
@@ -140,10 +141,9 @@ impl PaperWorker {
         )
     }
 
-    pub(super) fn checkpoint(
-        &mut self,
-    ) -> Result<PaperExecutionCheckpoint, crate::PaperCheckpointError> {
-        let checkpoint = PaperExecutionCheckpoint {
+    /// Original immutable state projection; does not replace an issued persistence checkpoint.
+    pub(super) fn portfolio_checkpoint(&self) -> PaperExecutionCheckpoint {
+        PaperExecutionCheckpoint {
             schema_version: PaperExecutionConfig::CHECKPOINT_SCHEMA_VERSION,
             configuration_digest: self.config.digest(),
             complete: true,
@@ -163,7 +163,13 @@ impl PaperWorker {
                 .clone(),
             ledger: self.state.ledger.clone(),
             idempotency: self.state.idempotency.clone(),
-        };
+        }
+    }
+
+    pub(super) fn checkpoint(
+        &mut self,
+    ) -> Result<PaperExecutionCheckpoint, crate::PaperCheckpointError> {
+        let checkpoint = self.portfolio_checkpoint();
         self.state.issued_checkpoint = Some(IssuedCheckpoint {
             evidence: crate::PaperCheckpointPersistenceEvidence {
                 configuration_digest: checkpoint.configuration_digest,

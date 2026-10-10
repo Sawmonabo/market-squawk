@@ -7,25 +7,55 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest as _, Sha256};
 
+use super::super::{
+    BacktestScope, GovernedBacktestCommand, GovernedBacktestDiscoveryEntry,
+    GovernedBacktestDiscoveryPage, GovernedBacktestDiscoveryQuery, GovernedBacktestRecord,
+};
+use super::recommendation::StoredRecommendationTerminalV1;
 use super::{
     GovernedBacktestRepositoryLimits, ProductionGovernedBacktestRepositoryError, strictly_ordered,
 };
-use crate::application::{
-    analysis::{BacktestScope, GovernedBacktestCommand, GovernedBacktestRecord},
-    domain_support::encode_hex,
-};
+use crate::application::domain_support::encode_hex;
 
 const TERMINAL_INDEX_SCHEMA_VERSION: u16 = 1;
 
 #[derive(Clone)]
 pub(super) struct TerminalIndex {
     pub(super) entries: Vec<StoredTerminal>,
+    pub(super) recommendation_entries: Vec<StoredRecommendationTerminalV1>,
 }
 
 impl TerminalIndex {
+    pub(super) fn backup_artifacts(
+        &self,
+        maximum: usize,
+    ) -> Result<Vec<market_squawk_services::ArtifactReference>, ServiceError> {
+        let mut all = std::collections::BTreeMap::new();
+        for terminal in &self.recommendation_entries {
+            for reference in terminal.backup_artifacts()? {
+                if let Some(existing) = all.get(reference.id()) {
+                    if existing != &reference {
+                        return Err(ServiceError::InvalidResult);
+                    }
+                } else {
+                    if all.len() >= maximum {
+                        return Err(ServiceError::ResourceExhausted);
+                    }
+                    all.insert(reference.id().to_owned(), reference);
+                }
+            }
+        }
+        Ok(all.into_values().collect())
+    }
+
+    pub(super) fn is_empty(&self) -> bool {
+        self.entries.is_empty() && self.recommendation_entries.is_empty()
+    }
+
     pub(super) const fn empty() -> Self {
         Self {
             entries: Vec::new(),
+            recommendation_entries: Vec::new(),
         }
     }
 
@@ -39,7 +69,7 @@ impl TerminalIndex {
         let wire: TerminalIndexWire = serde_json::from_slice(bytes)
             .map_err(|_| ProductionGovernedBacktestRepositoryError::CorruptIndex)?;
         if wire.schema_version != TERMINAL_INDEX_SCHEMA_VERSION
-            || wire.entries.len() > limits.maximum_terminals
+            || wire.entries.len() + wire.recommendation_entries.len() > limits.maximum_terminals
         {
             return Err(ProductionGovernedBacktestRepositoryError::CorruptIndex);
         }
@@ -76,7 +106,22 @@ impl TerminalIndex {
         {
             return Err(ProductionGovernedBacktestRepositoryError::CorruptIndex);
         }
-        let index = Self { entries };
+        for entry in &wire.recommendation_entries {
+            entry
+                .validate(limits.maximum_index_bytes)
+                .map_err(|_| ProductionGovernedBacktestRepositoryError::CorruptIndex)?;
+        }
+        if wire
+            .recommendation_entries
+            .windows(2)
+            .any(|pair| pair[0].evidence_digest() >= pair[1].evidence_digest())
+        {
+            return Err(ProductionGovernedBacktestRepositoryError::CorruptIndex);
+        }
+        let index = Self {
+            entries,
+            recommendation_entries: wire.recommendation_entries,
+        };
         if index
             .encode(limits)
             .map_err(|_| ProductionGovernedBacktestRepositoryError::CorruptIndex)?
@@ -91,7 +136,7 @@ impl TerminalIndex {
         &self,
         limits: GovernedBacktestRepositoryLimits,
     ) -> Result<Vec<u8>, ProductionGovernedBacktestRepositoryError> {
-        if self.entries.len() > limits.maximum_terminals {
+        if self.entries.len() + self.recommendation_entries.len() > limits.maximum_terminals {
             return Err(ProductionGovernedBacktestRepositoryError::ResourceExhausted);
         }
         let mut entries = Vec::new();
@@ -110,6 +155,7 @@ impl TerminalIndex {
         let bytes = serde_json::to_vec(&TerminalIndexView {
             schema_version: TERMINAL_INDEX_SCHEMA_VERSION,
             entries,
+            recommendation_entries: &self.recommendation_entries,
         })
         .map_err(|_| ProductionGovernedBacktestRepositoryError::CorruptIndex)?;
         if bytes.len() > limits.maximum_index_bytes
@@ -139,6 +185,44 @@ impl TerminalIndex {
             .and_then(|position| self.entries.get(position))
             .map(|terminal| &terminal.record)
     }
+
+    pub(super) fn discover_completed(
+        &self,
+        query: &GovernedBacktestDiscoveryQuery,
+    ) -> Result<GovernedBacktestDiscoveryPage, ServiceError> {
+        let maximum_results = query.maximum_results().get();
+        let mut entries = Vec::new();
+        entries
+            .try_reserve_exact(maximum_results)
+            .map_err(|_| ServiceError::ResourceExhausted)?;
+        let mut truncated = false;
+        for terminal in &self.entries {
+            if !terminal.record.is_completed()
+                || terminal
+                    .command
+                    .scope()
+                    .instruments()
+                    .binary_search(&query.instrument_id())
+                    .is_err()
+                || query
+                    .strategy_id()
+                    .is_some_and(|strategy| terminal.command.strategy_id() != strategy)
+            {
+                continue;
+            }
+            if entries.len() == maximum_results {
+                truncated = true;
+                break;
+            }
+            entries.push(GovernedBacktestDiscoveryEntry::new(
+                terminal.command.clone(),
+                &terminal.command_digest,
+                &terminal.record_digest,
+                terminal.record.clone(),
+            ));
+        }
+        GovernedBacktestDiscoveryPage::try_new(query.clone(), entries, truncated)
+    }
 }
 
 #[derive(Clone)]
@@ -163,6 +247,8 @@ impl PartialEq for StoredTerminal {
 struct TerminalIndexView<'a> {
     schema_version: u16,
     entries: Vec<TerminalEntryView<'a>>,
+    #[serde(skip_serializing_if = "<[StoredRecommendationTerminalV1]>::is_empty")]
+    recommendation_entries: &'a [StoredRecommendationTerminalV1],
 }
 
 #[derive(Serialize)]
@@ -180,6 +266,8 @@ struct TerminalEntryView<'a> {
 struct TerminalIndexWire {
     schema_version: u16,
     entries: Vec<TerminalEntryWire>,
+    #[serde(default)]
+    recommendation_entries: Vec<StoredRecommendationTerminalV1>,
 }
 
 #[derive(Deserialize)]
@@ -192,49 +280,73 @@ struct TerminalEntryWire {
     record: Value,
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct CommandWire {
+pub(super) struct CommandWire {
     strategy_id: SourceIdentifier,
     input_id: SourceIdentifier,
     instruments: Vec<InstrumentId>,
     time_range: Option<TimeRangeWire>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    time_ranges: Option<Vec<TimeRangeWire>>,
     sources: Vec<SourceId>,
 }
 
 impl CommandWire {
-    fn from_command(command: &GovernedBacktestCommand) -> Self {
+    pub(super) fn from_command(command: &GovernedBacktestCommand) -> Self {
+        let time_ranges = command.scope().time_ranges();
         Self {
             strategy_id: command.strategy_id().clone(),
             input_id: command.input_id().clone(),
             instruments: command.scope().instruments().to_vec(),
-            time_range: command
-                .scope()
-                .time_range()
-                .map(|(starts_at, ends_at)| TimeRangeWire {
-                    starts_at_unix_nanos: starts_at.unix_nanos(),
-                    ends_at_unix_nanos: ends_at.unix_nanos(),
-                }),
+            time_range: (time_ranges.len() == 1).then(|| TimeRangeWire {
+                starts_at_unix_nanos: time_ranges[0].0.unix_nanos(),
+                ends_at_unix_nanos: time_ranges[0].1.unix_nanos(),
+            }),
+            time_ranges: (time_ranges.len() > 1).then(|| {
+                time_ranges
+                    .iter()
+                    .map(|(starts_at, ends_at)| TimeRangeWire {
+                        starts_at_unix_nanos: starts_at.unix_nanos(),
+                        ends_at_unix_nanos: ends_at.unix_nanos(),
+                    })
+                    .collect()
+            }),
             sources: command.scope().sources().to_vec(),
         }
     }
 
-    fn into_command(
+    pub(super) fn into_command(
         self,
     ) -> Result<GovernedBacktestCommand, ProductionGovernedBacktestRepositoryError> {
         if !strictly_ordered(&self.instruments) || !strictly_ordered(&self.sources) {
             return Err(ProductionGovernedBacktestRepositoryError::CorruptIndex);
         }
-        let time_range = self.time_range.map(TimeRangeWire::into_range).transpose()?;
+        if self.time_range.is_some() && self.time_ranges.is_some() {
+            return Err(ProductionGovernedBacktestRepositoryError::CorruptIndex);
+        }
+        let time_ranges = match self.time_ranges {
+            Some(time_ranges) => time_ranges
+                .into_iter()
+                .map(TimeRangeWire::into_range)
+                .collect::<Result<Vec<_>, _>>()?,
+            None => self
+                .time_range
+                .map(TimeRangeWire::into_range)
+                .transpose()?
+                .into_iter()
+                .collect(),
+        };
         Ok(GovernedBacktestCommand::new(
             self.strategy_id,
             self.input_id,
-            BacktestScope::new(self.instruments, time_range, self.sources),
+            BacktestScope::try_new_with_time_ranges(self.instruments, time_ranges, self.sources)
+                .map_err(|_| ProductionGovernedBacktestRepositoryError::CorruptIndex)?,
         ))
     }
 }
 
-#[derive(Deserialize, Serialize)]
+#[derive(Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct TimeRangeWire {
     starts_at_unix_nanos: i64,
@@ -264,13 +376,21 @@ pub(super) fn command_digest(command: &GovernedBacktestCommand) -> Result<String
     for instrument in command.scope().instruments() {
         hash.update(instrument.as_uuid().as_bytes());
     }
-    match command.scope().time_range() {
-        Some((starts_at, ends_at)) => {
+    match command.scope().time_ranges() {
+        [] => hash.update([0]),
+        [(starts_at, ends_at)] => {
             hash.update([1]);
             hash.update(starts_at.unix_nanos().to_be_bytes());
             hash.update(ends_at.unix_nanos().to_be_bytes());
         }
-        None => hash.update([0]),
+        time_ranges => {
+            hash.update([2]);
+            hash_count(&mut hash, time_ranges.len())?;
+            for (starts_at, ends_at) in time_ranges {
+                hash.update(starts_at.unix_nanos().to_be_bytes());
+                hash.update(ends_at.unix_nanos().to_be_bytes());
+            }
+        }
     }
     hash_count(&mut hash, command.scope().sources().len())?;
     for source in command.scope().sources() {

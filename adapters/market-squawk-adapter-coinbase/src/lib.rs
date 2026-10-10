@@ -1,6 +1,6 @@
-//! Bounded Coinbase Exchange public and authenticated Direct market-data adapters.
+//! Bounded Coinbase public Advanced Trade and authenticated Direct market-data adapters.
 //!
-//! The public profile remains pinned to the Exchange Market Data endpoint and a
+//! The public profile is pinned to the Advanced Trade Market Data endpoint and a
 //! `DirectUnverified` ceiling. The authenticated profile combines `ws-direct` `full` with exact
 //! REST product and level-3 snapshot capture. Both emit provider evidence only; current
 //! qualification, canonical events, order composition, and execution eligibility remain owned by
@@ -10,11 +10,14 @@ mod config;
 mod decoder;
 mod direct;
 mod direct_transport;
+mod market_handoff;
+mod publication;
+mod reference;
 mod source;
 
 pub use config::{
-    COINBASE_EXCHANGE_ENDPOINT, CoinbaseChannel, CoinbaseConfigError, CoinbaseExchangeConfig,
-    CoinbaseProductMapping, CoinbaseTransportLimits,
+    COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT, CoinbaseChannel, CoinbaseConfigError,
+    CoinbaseExchangeConfig, CoinbaseProductMapping, CoinbaseTransportLimits,
 };
 pub use decoder::CoinbaseExchangeDecoder;
 pub use direct::{
@@ -23,12 +26,37 @@ pub use direct::{
     CoinbaseDirectDecodeError, CoinbaseDirectDecodeOutcome, CoinbaseDirectDecoder,
     CoinbaseDirectHmacSigner, CoinbaseDirectLimits, CoinbaseDirectNonBookEvent,
     CoinbaseDirectNonBookKind, CoinbaseDirectProductError, CoinbaseDirectProductEvidence,
-    CoinbaseDirectReceivedLifecycle, CoinbaseDirectSigningCapability, CoinbaseDirectSigningError,
-    CoinbaseDirectSigningRequest, CoinbaseDirectSnapshotDecoder, CoinbaseDirectSnapshotError,
-    CoinbaseDirectStopType, CoinbaseDirectTpslTriggeredLifecycle, CoinbaseSignedSubscription,
+    CoinbaseDirectProductReferenceEvidence,
+    CoinbaseDirectProductReferenceProfile,
+    CoinbaseDirectReceivedLifecycle, CoinbaseDirectSequencedEvent, CoinbaseDirectSigningCapability,
+    CoinbaseDirectSigningError, CoinbaseDirectSigningRequest, CoinbaseDirectSnapshotDecoder,
+    CoinbaseDirectSnapshotError, CoinbaseDirectStopType, CoinbaseDirectTpslTriggeredLifecycle,
+    CoinbaseSignedSubscription,
 };
 pub use direct_transport::{
-    CoinbaseDirectBookUpdate, CoinbaseDirectOutput, CoinbaseDirectPublicationError,
+    CoinbaseDirectOrderLevelPayload, CoinbaseDirectOrderLevelPublicationError,
+    CoinbaseDirectOrderLevelUpdate, CoinbaseDirectOutput, CoinbaseDirectOutputAdmission,
+    CoinbaseDirectProductPreflight, CoinbaseDirectProductPreflightCompletion,
+    CoinbaseDirectProductPreflightFreshness, CoinbaseDirectPublicationError,
     CoinbaseDirectPublicationKind, CoinbaseDirectSession, CoinbaseDirectSessionError,
 };
+pub use market_handoff::{
+    CoinbaseDirectInitialMarketLineage, CoinbaseDirectReplayFrame,
+    CoinbaseDirectSuccessorMarketLineage, CoinbaseDirectTradeEvidence,
+    CoinbaseMarketChannel, CoinbaseMarketContinuity, CoinbaseMarketDecodeOutcome,
+    CoinbaseMarketFeed, CoinbaseMarketHandoff, CoinbaseMarketHandoffError,
+    CoinbaseMarketHandoffEvidence, CoinbaseMarketRawLineage,
+};
+pub use publication::{
+    CoinbaseDirectSnapshotSealMaterial, CoinbaseDirectSnapshotSegmentEvidence,
+    CoinbaseEventMicrobatchSealMaterial, CoinbaseMarketNonPublicationReason,
+    CoinbaseMarketOmission, CoinbaseMarketOmissionReason, CoinbaseMarketPhysicalCaptureIdentity,
+    CoinbaseMarketPublicationContext, CoinbaseMarketPublicationError,
+    CoinbaseMarketQualificationOutcome, CoinbaseMarketRawSealFrame, CoinbaseMarketSealMaterial,
+    CoinbaseMarketSealRejoin, CoinbaseMarketSealedTokens, CoinbaseQualifiedDirectReplayRow,
+    CoinbaseQualifiedMarketPublication, CoinbaseQualifiedPublicRow,
+    CoinbaseSealedMarketPublication, CoinbaseSealedRawMarketPublication,
+};
 pub use source::CoinbaseExchangeSource;
+
+pub use reference::{COINBASE_PUBLIC_PRODUCT_ENDPOINT, CoinbasePublicProductReference, CoinbasePublicProductReferenceError, MAX_COINBASE_PUBLIC_PRODUCT_BYTES};

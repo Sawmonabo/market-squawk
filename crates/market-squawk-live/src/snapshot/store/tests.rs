@@ -288,21 +288,19 @@ fn aggregate_snapshots_and_revision_vector_are_sorted_without_global_as_of() -> 
 }
 
 #[test]
-fn close_rejects_new_reads_without_mutating_an_existing_lease() -> TestResult {
+fn publisher_loss_closes_new_reads_without_mutating_an_existing_lease() -> TestResult {
     let bundle = create_snapshot_plane(initial(1, 6)?, 1)?;
     let shard = ShardId::new(0, 1)?;
     let retained = bundle.reader.try_load(shard)?;
+    let reader = bundle.reader.clone();
 
-    bundle.reader.plane.close();
+    drop(bundle.publishers);
 
     assert_eq!(
-        bundle.reader.try_load(shard).err(),
+        reader.try_load(shard).err(),
         Some(SnapshotReadError::Closed)
     );
-    assert_eq!(
-        bundle.reader.try_load_all().err(),
-        Some(SnapshotReadError::Closed)
-    );
+    assert_eq!(reader.try_load_all().err(), Some(SnapshotReadError::Closed));
     assert_eq!(retained.snapshot().snapshot_revision().get(), 1);
     Ok(())
 }

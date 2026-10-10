@@ -8,6 +8,8 @@ use crate::{InstrumentId, MetadataRevision, OrderContractError, Timestamp, Venue
 mod definition;
 #[path = "instrument/identifier_records.rs"]
 mod identifier_records;
+#[path = "instrument/market_data_definition.rs"]
+mod market_data_definition;
 #[path = "instrument/provider_identities.rs"]
 mod provider_identities;
 
@@ -16,6 +18,12 @@ pub use identifier_records::{
     AssignmentVerification, ExternalIdentifier, ExternalIdentifierRecord,
     ExternalIdentifierRecordInput, IdentifierEntitlement, IdentifierRightsPolicyReference,
     IdentifierSyntaxVerification,
+};
+pub use market_data_definition::{
+    MAX_MARKET_DATA_DISPLAY_NAME_BYTES, MAX_MARKET_DATA_EXTERNAL_IDENTIFIERS,
+    MAX_MARKET_DATA_PROVIDER_IDENTITIES, MAX_MARKET_DATA_VENUE_MAPPINGS, MarketDataDisplayName,
+    MarketDataInstrumentDefinition, MarketDataInstrumentDefinitionError,
+    MarketDataInstrumentDefinitionInput,
 };
 pub use provider_identities::{
     ProviderIdentityCollection, ProviderIdentityConflict, ProviderIdentityConflictReason,

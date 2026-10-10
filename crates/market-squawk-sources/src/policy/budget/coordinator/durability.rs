@@ -49,6 +49,7 @@ pub(crate) enum CleanShutdownValidationError {
 /// Sole composition-owned mint for conservatively colliding network/authorization authority.
 pub(crate) struct ProviderBudgetPool {
     budgets: Vec<RegisteredBudget>,
+    retained_provider_policies: Vec<ResolvedProviderBudgetPolicy>,
     durability: Option<Arc<AuthorityDurabilitySession>>,
     provider_rate: Option<ProviderRateAuthority>,
     local_coordinator: Option<ProcessBudgetCoordinator>,
@@ -64,9 +65,30 @@ impl std::fmt::Debug for ProviderBudgetPool {
 }
 
 impl ProviderBudgetPool {
+    pub(crate) fn has_active_requests(&self) -> Result<bool, CleanShutdownValidationError> {
+        for (index, registered) in self.budgets.iter().enumerate() {
+            if self.budgets[..index].iter().any(|earlier| {
+                Arc::ptr_eq(&earlier.budget.allocation, &registered.budget.allocation)
+            }) {
+                continue;
+            }
+            let state = registered
+                .budget
+                .allocation
+                .state
+                .lock()
+                .map_err(|_| CleanShutdownValidationError::StateUnavailable)?;
+            if state.in_flight != 0 {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     pub(crate) fn new() -> Result<Self, BudgetPoolError> {
         Ok(Self {
             budgets: Vec::new(),
+            retained_provider_policies: Vec::new(),
             durability: None,
             provider_rate: None,
             local_coordinator: None,
@@ -76,6 +98,7 @@ impl ProviderBudgetPool {
     pub(crate) fn new_in_memory_with_provider_rate(provider_rate: ProviderRateAuthority) -> Self {
         Self {
             budgets: Vec::new(),
+            retained_provider_policies: Vec::new(),
             durability: None,
             provider_rate: Some(provider_rate),
             local_coordinator: Some(ProcessBudgetCoordinator::new(MAX_PROCESS_BUDGET_SCOPES)),
@@ -85,6 +108,7 @@ impl ProviderBudgetPool {
     pub(crate) fn new_durable(session: Arc<AuthorityDurabilitySession>) -> Self {
         Self {
             budgets: Vec::new(),
+            retained_provider_policies: Vec::new(),
             durability: Some(session),
             provider_rate: None,
             local_coordinator: None,
@@ -97,6 +121,7 @@ impl ProviderBudgetPool {
     ) -> Self {
         Self {
             budgets: Vec::new(),
+            retained_provider_policies: Vec::new(),
             durability: Some(session),
             provider_rate: Some(provider_rate),
             local_coordinator: Some(ProcessBudgetCoordinator::new(MAX_PROCESS_BUDGET_SCOPES)),
@@ -129,6 +154,11 @@ impl ProviderBudgetPool {
         let budget = coordinated
             .pop()
             .ok_or(BudgetPoolError::CoordinatorCorrupt)?;
+        self.retained_provider_policies.retain(|retained| {
+            !retained
+                .collision_key()
+                .collides_with(resolved.collision_key())
+        });
         self.budgets.push(RegisteredBudget {
             persisted: resolved.persisted().clone(),
             budget: budget.clone(),
@@ -179,6 +209,11 @@ impl ProviderBudgetPool {
         } else {
             coordinate_durable_budget_policy(&resolved, session, registry)?
         };
+        self.retained_provider_policies.retain(|retained| {
+            !retained
+                .collision_key()
+                .collides_with(resolved.collision_key())
+        });
         self.budgets.push(RegisteredBudget {
             persisted: resolved.persisted().clone(),
             budget: budget.clone(),
@@ -238,6 +273,9 @@ impl ProviderBudgetPool {
         &mut self,
         groups: Vec<(Vec<ResolvedProviderBudgetPolicy>, BudgetCheckpointState)>,
     ) -> Result<(), BudgetPoolError> {
+        if self.provider_rate.is_some() {
+            return Err(BudgetPoolError::ConflictingDurability);
+        }
         let session = Arc::clone(
             self.durability
                 .as_ref()
@@ -273,11 +311,7 @@ impl ProviderBudgetPool {
             }),
         );
         let coordinated = if let Some(coordinator) = &mut self.local_coordinator {
-            coordinator.coordinate_restored_with_provider_rate(
-                &groups_to_coordinate,
-                &session,
-                self.provider_rate.as_ref(),
-            )?
+            coordinator.coordinate_restored(&groups_to_coordinate, &session)?
         } else {
             coordinate_restored_budget_groups(&groups_to_coordinate, &session)?
         };
@@ -297,10 +331,62 @@ impl ProviderBudgetPool {
     }
 
     pub(crate) fn policies(&self) -> Vec<PersistedProviderBudgetPolicy> {
-        self.budgets
+        self.retained_provider_policies
             .iter()
-            .map(|registered| registered.persisted.clone())
+            .map(|policy| policy.persisted().clone())
+            .chain(
+                self.budgets
+                    .iter()
+                    .map(|registered| registered.persisted.clone()),
+            )
             .collect()
+    }
+
+    /// Retained declarations prove association only; opening never replays provider settings.
+    pub(crate) fn restore_provider_associations(
+        &mut self,
+        policies: Vec<ResolvedProviderBudgetPolicy>,
+        groups: Vec<(Vec<ResolvedProviderBudgetPolicy>, BudgetCheckpointState)>,
+    ) -> Result<(), BudgetPoolError> {
+        let authority = self
+            .provider_rate
+            .as_ref()
+            .ok_or(BudgetPoolError::ConflictingDurability)?;
+        for policy in &policies {
+            authority.validate_retained_budget(&ProviderRateDeclaration::from_resolved(policy)?)?;
+        }
+        let mut combined = Vec::new();
+        for (declarations, checkpoint) in &groups {
+            // Aggregate quota replaces counters, never an unresolved source lifecycle fault.
+            if checkpoint.terminal || checkpoint.poisoned || checkpoint.in_flight != 0 {
+                return Err(BudgetPoolError::Persistence);
+            }
+            let group = combine_durable_group(declarations)?;
+            if combined
+                .iter()
+                .any(|earlier: &ResolvedProviderBudgetPolicy| {
+                    earlier.collision_key().collides_with(group.collision_key())
+                })
+                || declarations.iter().any(|declaration| {
+                    !policies
+                        .iter()
+                        .any(|policy| policy.persisted() == declaration.persisted())
+                })
+            {
+                return Err(BudgetPoolError::CoordinatorCorrupt);
+            }
+            authority.validate_retained_budget(&ProviderRateDeclaration::from_resolved(&group)?)?;
+            combined.push(group);
+        }
+        let session = self
+            .durability
+            .as_ref()
+            .ok_or(BudgetPoolError::ConflictingDurability)?;
+        session
+            .discard_redundant_provider_checkpoints()
+            .map_err(|_| BudgetPoolError::Persistence)?;
+        self.retained_provider_policies = policies;
+        Ok(())
     }
 
     fn coordinate(
@@ -320,11 +406,25 @@ impl ProviderBudgetPool {
 
     pub(crate) fn policies_with(
         &self,
-        declaration: &PersistedProviderBudgetPolicy,
+        resolved: &ResolvedProviderBudgetPolicy,
     ) -> Vec<PersistedProviderBudgetPolicy> {
-        let mut policies = self.policies();
-        if !policies.contains(declaration) {
-            policies.push(declaration.clone());
+        let mut policies: Vec<_> = self
+            .retained_provider_policies
+            .iter()
+            .filter(|retained| {
+                !retained
+                    .collision_key()
+                    .collides_with(resolved.collision_key())
+            })
+            .map(|retained| retained.persisted().clone())
+            .chain(
+                self.budgets
+                    .iter()
+                    .map(|registered| registered.persisted.clone()),
+            )
+            .collect();
+        if !policies.contains(resolved.persisted()) {
+            policies.push(resolved.persisted().clone());
         }
         policies
     }
@@ -333,6 +433,9 @@ impl ProviderBudgetPool {
         &self,
         session: &Arc<AuthorityDurabilitySession>,
     ) -> Result<CleanShutdownProof, CleanShutdownValidationError> {
+        if !session.is_idle_and_available() {
+            return Err(CleanShutdownValidationError::ActiveRequest);
+        }
         let Ok(groups) = session.budget_groups() else {
             return Err(CleanShutdownValidationError::StateUnavailable);
         };
@@ -344,9 +447,6 @@ impl ProviderBudgetPool {
             }) {
                 continue;
             }
-            unique_allocations = unique_allocations
-                .checked_add(1)
-                .ok_or(CleanShutdownValidationError::StateUnavailable)?;
             let allocation = &registered.budget.allocation;
             if allocation.terminal.load(Ordering::Acquire) {
                 session.invalidate();
@@ -364,11 +464,37 @@ impl ProviderBudgetPool {
                 session.invalidate();
                 return Err(CleanShutdownValidationError::DurabilityMismatch);
             }
-            let Some(group) = groups.get(binding.slot) else {
+            let Ok(state) = allocation.state.lock() else {
+                session.invalidate();
+                return Err(CleanShutdownValidationError::StateUnavailable);
+            };
+            if state.in_flight != 0 {
+                session.invalidate();
+                return Err(CleanShutdownValidationError::ActiveRequest);
+            }
+            if let Some(provider) = &allocation.provider_rate {
+                if !provider.transport_generation_is_current(provider.transport_generation()) {
+                    session.invalidate();
+                    return Err(CleanShutdownValidationError::TerminalAllocation);
+                }
+                if binding.slot.is_some() || !state.windows.is_empty() {
+                    session.invalidate();
+                    return Err(CleanShutdownValidationError::CheckpointMismatch);
+                }
+                continue;
+            }
+            let Some(slot) = binding.slot else {
                 session.invalidate();
                 return Err(CleanShutdownValidationError::CheckpointMismatch);
             };
-            let Some(slot_seen) = bound_slots.get_mut(binding.slot) else {
+            unique_allocations = unique_allocations
+                .checked_add(1)
+                .ok_or(CleanShutdownValidationError::StateUnavailable)?;
+            let Some(group) = groups.get(slot) else {
+                session.invalidate();
+                return Err(CleanShutdownValidationError::CheckpointMismatch);
+            };
+            let Some(slot_seen) = bound_slots.get_mut(slot) else {
                 session.invalidate();
                 return Err(CleanShutdownValidationError::CheckpointMismatch);
             };
@@ -395,14 +521,6 @@ impl ProviderBudgetPool {
                 session.invalidate();
                 return Err(CleanShutdownValidationError::DeclarationMismatch);
             }
-            let Ok(state) = allocation.state.lock() else {
-                session.invalidate();
-                return Err(CleanShutdownValidationError::StateUnavailable);
-            };
-            if state.in_flight != 0 {
-                session.invalidate();
-                return Err(CleanShutdownValidationError::ActiveRequest);
-            }
             if group.checkpoint().in_flight() != state.in_flight {
                 session.invalidate();
                 return Err(CleanShutdownValidationError::CheckpointMismatch);
@@ -427,6 +545,26 @@ struct DurableRegistration<'a> {
 struct CoordinatedBudgetAllocation {
     collision_key: BudgetCollisionKey,
     allocation: Arc<BudgetAllocation>,
+}
+
+enum StagedProviderAllocationBacking {
+    Existing(Arc<BudgetAllocation>),
+    New { policy: ProviderBudgetPolicy },
+}
+
+struct StagedProviderAllocation {
+    collision_key: BudgetCollisionKey,
+    backing: StagedProviderAllocationBacking,
+    input_indexes: Vec<usize>,
+}
+
+impl StagedProviderAllocation {
+    fn policy(&self) -> &ProviderBudgetPolicy {
+        match &self.backing {
+            StagedProviderAllocationBacking::Existing(allocation) => &allocation.policy,
+            StagedProviderAllocationBacking::New { policy } => policy,
+        }
+    }
 }
 
 struct ProcessBudgetCoordinator {
@@ -466,6 +604,9 @@ impl ProcessBudgetCoordinator {
         durable: Option<DurableRegistration<'_>>,
         provider_rate: Option<&ProviderRateAuthority>,
     ) -> Result<Vec<SharedProviderBudget>, BudgetPoolError> {
+        if let Some(provider_rate) = provider_rate {
+            return self.coordinate_atomic_provider_rate(policies, durable, provider_rate);
+        }
         self.discard_cleanly_closed_durable_allocations();
         let remaining_capacity = self
             .capacity
@@ -481,12 +622,6 @@ impl ProcessBudgetCoordinator {
             .try_reserve(policies.len())
             .map_err(|_| BudgetPoolError::CoordinatorAllocation)?;
         for resolved in policies {
-            let provider_rate_binding = provider_rate
-                .map(|authority| {
-                    ProviderRateDeclaration::from_resolved(resolved)
-                        .and_then(|declaration| authority.register_binding(&declaration))
-                })
-                .transpose()?;
             let mut matching_index = None;
             for (index, allocation) in working.iter().enumerate() {
                 if !allocation
@@ -534,20 +669,13 @@ impl ProcessBudgetCoordinator {
                         registration
                             .session
                             .add_budget_declaration(
-                                binding.slot,
+                                binding.slot.ok_or(BudgetPoolError::ConflictingDurability)?,
                                 registration.registry.clone(),
                                 resolved.persisted().clone(),
                                 observation.wall_clock,
                             )
                             .map_err(|_| BudgetPoolError::Persistence)?;
                     }
-                    (None, Some(_)) | (Some(_), None) | (Some(_), Some(_)) => {
-                        return Err(BudgetPoolError::ConflictingDurability);
-                    }
-                }
-                match (&existing.allocation.provider_rate, &provider_rate_binding) {
-                    (None, None) => {}
-                    (Some(existing), Some(candidate)) if existing.same_group(candidate) => {}
                     (None, Some(_)) | (Some(_), None) | (Some(_), Some(_)) => {
                         return Err(BudgetPoolError::ConflictingDurability);
                     }
@@ -580,35 +708,16 @@ impl ProcessBudgetCoordinator {
                     .map_err(|_| BudgetPoolError::Persistence)?;
                 let durability = BudgetDurabilityBinding {
                     session: Arc::clone(registration.session),
-                    slot,
+                    slot: Some(slot),
                 };
-                match provider_rate_binding {
-                    Some(provider_rate) => SharedProviderBudget::new_durable_with_provider_rate(
-                        resolved.policy().clone(),
-                        observation.monotonic,
-                        clock,
-                        durability,
-                        provider_rate,
-                    ),
-                    None => SharedProviderBudget::new_durable(
-                        resolved.policy().clone(),
-                        observation.monotonic,
-                        clock,
-                        durability,
-                    ),
-                }
+                SharedProviderBudget::new_durable(
+                    resolved.policy().clone(),
+                    observation.monotonic,
+                    clock,
+                    durability,
+                )
             } else {
-                match provider_rate_binding {
-                    Some(provider_rate) => SharedProviderBudget::new_with_provider_rate(
-                        resolved.policy().clone(),
-                        provider_rate,
-                    )?,
-                    None => SharedProviderBudget::new(
-                        resolved.policy().clone(),
-                        observation.monotonic,
-                        clock,
-                    ),
-                }
+                SharedProviderBudget::new(resolved.policy().clone(), observation.monotonic, clock)
             };
             working.push(CoordinatedBudgetAllocation {
                 collision_key: resolved.collision_key().clone(),
@@ -623,19 +732,238 @@ impl ProcessBudgetCoordinator {
         Ok(result)
     }
 
+    fn coordinate_atomic_provider_rate(
+        &mut self,
+        policies: &[ResolvedProviderBudgetPolicy],
+        durable: Option<DurableRegistration<'_>>,
+        provider_rate: &ProviderRateAuthority,
+    ) -> Result<Vec<SharedProviderBudget>, BudgetPoolError> {
+        if policies.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.discard_cleanly_closed_durable_allocations();
+        let mut staged = Vec::new();
+        staged
+            .try_reserve(self.capacity)
+            .map_err(|_| BudgetPoolError::CoordinatorAllocation)?;
+        staged.extend(
+            self.allocations
+                .iter()
+                .map(|allocation| StagedProviderAllocation {
+                    collision_key: allocation.collision_key.clone(),
+                    backing: StagedProviderAllocationBacking::Existing(Arc::clone(
+                        &allocation.allocation,
+                    )),
+                    input_indexes: Vec::new(),
+                }),
+        );
+        let mut input_allocation_indexes = Vec::new();
+        input_allocation_indexes
+            .try_reserve_exact(policies.len())
+            .map_err(|_| BudgetPoolError::CoordinatorAllocation)?;
+        let mut provider_declarations = Vec::new();
+        provider_declarations
+            .try_reserve_exact(policies.len())
+            .map_err(|_| BudgetPoolError::CoordinatorAllocation)?;
+
+        for (input_index, resolved) in policies.iter().enumerate() {
+            let declaration = provider_rate.configured_request_declaration(
+                ProviderRateDeclaration::from_resolved(resolved)?,
+            )?;
+            let policy = declaration.policy().clone();
+            provider_declarations.push(declaration);
+            let mut matching_index = None;
+            for (index, allocation) in staged.iter().enumerate() {
+                if !allocation
+                    .collision_key
+                    .collides_with(resolved.collision_key())
+                {
+                    continue;
+                }
+                if matching_index.replace(index).is_some() {
+                    return Err(BudgetPoolError::BridgingIdentity);
+                }
+            }
+            let allocation_index = if let Some(index) = matching_index {
+                let existing = staged
+                    .get_mut(index)
+                    .ok_or(BudgetPoolError::CoordinatorCorrupt)?;
+                if !existing.policy().has_same_limits_as(&policy) {
+                    return Err(BudgetPoolError::ConflictingPolicy);
+                }
+                if let StagedProviderAllocationBacking::Existing(allocation) = &existing.backing {
+                    match (&allocation.durability, &durable) {
+                        (None, None) => {}
+                        (Some(binding), Some(registration))
+                            if Arc::ptr_eq(&binding.session, registration.session) => {}
+                        (None, Some(_)) | (Some(_), None) | (Some(_), Some(_)) => {
+                            return Err(BudgetPoolError::ConflictingDurability);
+                        }
+                    }
+                    if allocation.provider_rate.is_none() {
+                        return Err(BudgetPoolError::ConflictingDurability);
+                    }
+                }
+                existing
+                    .collision_key
+                    .merge_public_authorities(resolved.collision_key())
+                    .map_err(|error| match error {
+                        BudgetCollisionMergeError::Capacity => {
+                            BudgetPoolError::CanonicalAuthorityCapacity
+                        }
+                        BudgetCollisionMergeError::Allocation => {
+                            BudgetPoolError::CanonicalAuthorityAllocation
+                        }
+                    })?;
+                existing.input_indexes.push(input_index);
+                index
+            } else {
+                if staged.len() == self.capacity {
+                    return Err(BudgetPoolError::CoordinatorCapacity);
+                }
+                let index = staged.len();
+                staged.push(StagedProviderAllocation {
+                    collision_key: resolved.collision_key().clone(),
+                    backing: StagedProviderAllocationBacking::New { policy },
+                    input_indexes: vec![input_index],
+                });
+                index
+            };
+            input_allocation_indexes.push(allocation_index);
+        }
+
+        let local_persisted = std::cell::Cell::new(false);
+        let coordinated = provider_rate.with_prepared_registration_bindings(
+            &provider_declarations,
+            |bindings, observation| {
+                let mut staged_bindings = Vec::new();
+                staged_bindings
+                    .try_reserve_exact(staged.len())
+                    .map_err(|_| BudgetPoolError::CoordinatorAllocation)?;
+                staged_bindings.resize_with(staged.len(), || None);
+                for (stage_index, allocation) in staged.iter().enumerate() {
+                    if allocation.input_indexes.is_empty() {
+                        continue;
+                    }
+                    let first_input = *allocation
+                        .input_indexes
+                        .first()
+                        .ok_or(BudgetPoolError::CoordinatorCorrupt)?;
+                    let candidate = bindings
+                        .get(first_input)
+                        .ok_or(BudgetPoolError::CoordinatorCorrupt)?
+                        .clone();
+                    if allocation.input_indexes.iter().any(|input| {
+                        bindings
+                            .get(*input)
+                            .is_none_or(|binding| !candidate.same_group(binding))
+                    }) {
+                        return Err(BudgetPoolError::ConflictingDurability);
+                    }
+                    if let StagedProviderAllocationBacking::Existing(existing) = &allocation.backing
+                    {
+                        let retained = existing
+                            .provider_rate
+                            .as_ref()
+                            .ok_or(BudgetPoolError::ConflictingDurability)?;
+                        if !candidate.same_group(retained) {
+                            return Err(BudgetPoolError::ConflictingDurability);
+                        }
+                    }
+                    staged_bindings[stage_index] = Some(candidate);
+                }
+                if staged.iter().enumerate().any(|(stage_index, allocation)| {
+                    matches!(
+                        &allocation.backing,
+                        StagedProviderAllocationBacking::New { .. }
+                    ) && staged_bindings[stage_index].is_none()
+                }) {
+                    return Err(BudgetPoolError::CoordinatorCorrupt);
+                }
+
+                let mut working = Vec::new();
+                working
+                    .try_reserve_exact(staged.len())
+                    .map_err(|_| BudgetPoolError::CoordinatorAllocation)?;
+                let mut result = Vec::new();
+                result
+                    .try_reserve_exact(input_allocation_indexes.len())
+                    .map_err(|_| BudgetPoolError::CoordinatorAllocation)?;
+
+                if let Some(registration) = &durable {
+                    registration
+                        .session
+                        .persist_registry(registration.registry.clone(), observation.wall_clock)
+                        .map_err(|_| BudgetPoolError::Persistence)?;
+                    local_persisted.set(true);
+                }
+                for (stage_index, allocation) in staged.iter().enumerate() {
+                    let runtime = match &allocation.backing {
+                        StagedProviderAllocationBacking::Existing(existing) => Arc::clone(existing),
+                        StagedProviderAllocationBacking::New { policy } => {
+                            let binding = staged_bindings[stage_index]
+                                .as_ref()
+                                .ok_or(BudgetPoolError::CoordinatorCorrupt)?
+                                .clone();
+                            if let Some(registration) = &durable {
+                                SharedProviderBudget::new_durable_with_provider_rate(
+                                    policy.clone(),
+                                    observation.monotonic,
+                                    BudgetDurabilityBinding {
+                                        session: Arc::clone(registration.session),
+                                        slot: None,
+                                    },
+                                    binding,
+                                )
+                                .allocation
+                            } else {
+                                SharedProviderBudget::new_with_provider_rate_at(
+                                    policy.clone(),
+                                    observation.monotonic,
+                                    binding,
+                                )
+                                .allocation
+                            }
+                        }
+                    };
+                    working.push(CoordinatedBudgetAllocation {
+                        collision_key: allocation.collision_key.clone(),
+                        allocation: runtime,
+                    });
+                }
+                for allocation_index in &input_allocation_indexes {
+                    result.push(SharedProviderBudget {
+                        allocation: Arc::clone(
+                            &working
+                                .get(*allocation_index)
+                                .ok_or(BudgetPoolError::CoordinatorCorrupt)?
+                                .allocation,
+                        ),
+                    });
+                }
+                Ok((working, result))
+            },
+        );
+        match coordinated {
+            Ok((working, result)) => {
+                self.allocations = working;
+                Ok(result)
+            }
+            Err(error) => {
+                if local_persisted.get() {
+                    if let Some(registration) = durable {
+                        registration.session.invalidate();
+                    }
+                }
+                Err(error)
+            }
+        }
+    }
+
     fn coordinate_restored(
         &mut self,
         groups: &[(ResolvedProviderBudgetPolicy, BudgetCheckpointState)],
         session: &Arc<AuthorityDurabilitySession>,
-    ) -> Result<Vec<SharedProviderBudget>, BudgetPoolError> {
-        self.coordinate_restored_with_provider_rate(groups, session, None)
-    }
-
-    fn coordinate_restored_with_provider_rate(
-        &mut self,
-        groups: &[(ResolvedProviderBudgetPolicy, BudgetCheckpointState)],
-        session: &Arc<AuthorityDurabilitySession>,
-        provider_rate: Option<&ProviderRateAuthority>,
     ) -> Result<Vec<SharedProviderBudget>, BudgetPoolError> {
         self.discard_cleanly_closed_durable_allocations();
         let total = self
@@ -663,32 +991,17 @@ impl ProcessBudgetCoordinator {
             }) {
                 return Err(BudgetPoolError::ConflictingDurability);
             }
-            let clock: Arc<dyn BudgetClock> = Arc::new(SystemBudgetClock::new());
             let durability = BudgetDurabilityBinding {
                 session: Arc::clone(session),
-                slot,
+                slot: Some(slot),
             };
-            let provider_rate_binding = provider_rate
-                .map(|authority| {
-                    ProviderRateDeclaration::from_resolved(resolved)
-                        .and_then(|declaration| authority.register_binding(&declaration))
-                })
-                .transpose()?;
-            let budget = match provider_rate_binding {
-                Some(provider_rate) => SharedProviderBudget::from_checkpoint_with_provider_rate(
-                    resolved.policy().clone(),
-                    checkpoint,
-                    clock,
-                    durability,
-                    provider_rate,
-                ),
-                None => SharedProviderBudget::from_checkpoint(
-                    resolved.policy().clone(),
-                    checkpoint,
-                    clock,
-                    durability,
-                ),
-            }
+            let clock: Arc<dyn BudgetClock> = Arc::new(SystemBudgetClock::new());
+            let budget = SharedProviderBudget::from_checkpoint(
+                resolved.policy().clone(),
+                checkpoint,
+                clock,
+                durability,
+            )
             .map_err(|_| BudgetPoolError::Persistence)?;
             working.push(CoordinatedBudgetAllocation {
                 collision_key: resolved.collision_key().clone(),
@@ -781,11 +1094,135 @@ pub enum BudgetPoolError {
     Persistence,
 }
 
-/// RAII reservation for one in-flight provider request.
+/// Non-serializable proof that one exact provider request or upgraded transport remains active.
+///
+/// Request leases bind post-admission request availability. After an explicit successful
+/// handshake transition, transport leases bind the same allocation's control generation instead
+/// of free request capacity. Both expire with their permit owner, budget control revocation, or
+/// terminal/session failure; neither can be reconstructed from provider health DTOs.
+#[derive(Clone)]
+pub struct BudgetPermitLease {
+    allocation: Arc<BudgetAllocation>,
+    availability_generation: u64,
+    established_transport: bool,
+    provider_generation: Option<u64>,
+    active: Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for BudgetPermitLease {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BudgetPermitLease")
+            .field("availability_generation", &self.availability_generation)
+            .finish_non_exhaustive()
+    }
+}
+
+impl BudgetPermitLease {
+    /// Proves only producer ownership for received data, never permission to dispatch.
+    /// Handshake replacement, release and owner drop invalidate this exact active marker.
+    pub(crate) fn owner_is_alive(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn is_current(&self) -> bool {
+        self.provider_generation.is_none_or(|generation| {
+            self.allocation
+                .provider_rate
+                .as_ref()
+                .is_some_and(|binding| {
+                    if self.established_transport {
+                        binding.transport_generation_is_current(generation)
+                    } else {
+                        binding.availability_generation_is_current(generation)
+                    }
+                })
+        }) && self.active.load(Ordering::Acquire)
+            && !self.allocation.terminal.load(Ordering::Acquire)
+            && !self.allocation.state.is_poisoned()
+            && self
+                .allocation
+                .durability
+                .as_ref()
+                .is_none_or(|binding| binding.session.is_available())
+            && if self.established_transport {
+                self.allocation.transport_generation.load(Ordering::Acquire)
+                    == self.availability_generation
+            } else {
+                self.allocation
+                    .availability_generation
+                    .load(Ordering::Acquire)
+                    == self.availability_generation
+            }
+            && self.active.load(Ordering::Acquire)
+            && !self.allocation.state.is_poisoned()
+            && !self.allocation.terminal.load(Ordering::Acquire)
+    }
+
+    pub(crate) fn shares_allocation_with(&self, budget: &SharedProviderBudget) -> bool {
+        Arc::ptr_eq(&self.allocation, &budget.allocation)
+    }
+
+    pub(crate) fn shared_allocation_charge(&self) -> Option<usize> {
+        let state_dynamic = self
+            .allocation
+            .state
+            .lock()
+            .ok()?
+            .dynamic_retained_bytes()?;
+        std::mem::size_of::<BudgetAllocation>()
+            .checked_add(crate::conservative_arc_control_block_charge::<
+                BudgetAllocation,
+            >())
+            .and_then(|bytes| {
+                self.allocation
+                    .policy
+                    .dynamic_retained_bytes()
+                    .and_then(|dynamic| bytes.checked_add(dynamic))
+            })
+            .and_then(|bytes| bytes.checked_add(state_dynamic))
+            .and_then(|bytes| {
+                bytes.checked_add(self.allocation.admission.shared_allocation_charge()?)
+            })
+            .and_then(|bytes| bytes.checked_add(self.allocation.clock.shared_allocation_charge()))
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<AtomicBool>()))
+            .and_then(|bytes| {
+                bytes.checked_add(crate::conservative_arc_control_block_charge::<AtomicBool>())
+            })
+    }
+}
+
+/// RAII concurrency reservation for one request that has not reached transport dispatch.
+///
+/// Dropping or releasing it consumes no provider request-window capacity. Only
+/// [`BudgetReservation::commit_dispatch`] or the weighted-response
+/// [`BudgetReservation::commit_dispatch_with_response_bound`] transport seam can produce a
+/// [`BudgetPermit`] and an active request lease.
+pub struct BudgetReservation {
+    pub(in crate::policy) allocation: Arc<BudgetAllocation>,
+    pub(in crate::policy) runtime_admission: Option<RuntimeOperationAdmission>,
+    pub(in crate::policy) provider_rate: Option<ProviderRateReservation>,
+    pub(in crate::policy) released: bool,
+}
+
+impl std::fmt::Debug for BudgetReservation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("BudgetReservation")
+            .field("released", &self.released)
+            .finish_non_exhaustive()
+    }
+}
+
+/// RAII owner for one provider request, optionally retained by its upgraded transport.
+/// Request concurrency is released at handshake completion; owner drop still revokes its lease.
 pub struct BudgetPermit {
     pub(in crate::policy) allocation: Arc<BudgetAllocation>,
     pub(in crate::policy) runtime_admission: RuntimeOperationAdmission,
     pub(in crate::policy) provider_rate: Option<ProviderRatePermit>,
+    pub(in crate::policy) active: Arc<AtomicBool>,
+    pub(in crate::policy) transport_generation: u64,
+    pub(in crate::policy) provider_transport_generation: Option<u64>,
     pub(in crate::policy) released: bool,
 }
 
@@ -799,15 +1236,147 @@ impl std::fmt::Debug for BudgetPermit {
 }
 
 impl BudgetPermit {
-    /// Explicitly releases the concurrency slot; request-window consumption remains recorded.
+    /// Borrows this exact request or established transport as a process-local authority lease.
+    pub fn active_lease(&self) -> BudgetPermitLease {
+        BudgetPermitLease {
+            allocation: Arc::clone(&self.allocation),
+            availability_generation: if self.released {
+                self.transport_generation
+            } else {
+                self.allocation
+                    .availability_generation
+                    .load(Ordering::Acquire)
+            },
+            established_transport: self.released,
+            provider_generation: if self.released {
+                self.provider_transport_generation
+            } else {
+                self.allocation
+                    .provider_rate
+                    .as_ref()
+                    .map(ProviderRateBinding::availability_generation)
+            },
+            active: Arc::clone(&self.active),
+        }
+    }
+
+    /// Completes a successful HTTP upgrade without reserving request capacity for socket life.
+    ///
+    /// The adapter must call this only after the original transport reports a successful upgrade.
+    /// The same permit remains owned until that socket exits. Existing request leases are
+    /// permanently invalidated; newly borrowed leases retain allocation, control-generation,
+    /// durability, and owner-lifetime checks while independent requests use the freed slot.
+    ///
+    /// # Errors
+    ///
+    /// Rejects repeated completion, weighted-response policies, revoked control authority, and
+    /// any failed local or durable release. Request-window charges are never refunded.
+    pub fn complete_transport_handshake(&mut self) -> Result<(), BudgetUnavailableReason> {
+        if self.released || !self.active.load(Ordering::Acquire) {
+            return Err(BudgetUnavailableReason::AvailabilityChanged);
+        }
+        if self.allocation.policy.has_weighted_windows() {
+            return Err(BudgetUnavailableReason::PersistenceUnavailable);
+        }
+        // Release exact aggregate ownership (or the local-only checkpoint) once and retain
+        // the lifecycle operation until transport exit. Never revive its old request lease.
+        self.release_inner();
+        if self.allocation.terminal.load(Ordering::Acquire) {
+            return Err(BudgetUnavailableReason::AvailabilityGenerationExhausted);
+        }
+        if self.allocation.transport_generation.load(Ordering::Acquire) != self.transport_generation
+        {
+            return Err(BudgetUnavailableReason::AvailabilityChanged);
+        }
+        self.active = Arc::new(AtomicBool::new(true));
+        if !self.active_lease().is_current() {
+            self.active.store(false, Ordering::Release);
+            return Err(BudgetUnavailableReason::AvailabilityChanged);
+        }
+        Ok(())
+    }
+
+    /// Atomically terminalizes this exact dispatched provider response and releases concurrency.
+    ///
+    /// The durable aggregate store consumes the exact permit first. The local allocation then
+    /// releases its owned request count without copying quota or cooldown state. A
+    /// weighted permit cannot be terminalized through the legacy success/refusal controls.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed when this permit is not bound to the product-wide provider-rate authority,
+    /// the exact response settlement is rejected, or local ownership cannot be released.
+    pub fn settle_response(
+        mut self,
+        settlement: crate::ProviderRateResponseSettlement,
+    ) -> Result<crate::ProviderRateResponseSettlementReceipt, BudgetUnavailableReason> {
+        let admission = Arc::clone(&self.allocation.admission);
+        let _changed = admission.notify_on_drop();
+        if self.released
+            || !self.active.load(Ordering::Acquire)
+            || self.allocation.terminal.load(Ordering::Acquire)
+        {
+            return Err(BudgetUnavailableReason::AvailabilityGenerationExhausted);
+        }
+        let budget = SharedProviderBudget {
+            allocation: Arc::clone(&self.allocation),
+        };
+        if !budget.policy().has_weighted_windows() {
+            return Err(BudgetUnavailableReason::PersistenceUnavailable);
+        }
+        let provider_rate = self
+            .provider_rate
+            .as_mut()
+            .ok_or(BudgetUnavailableReason::PersistenceUnavailable)?;
+        let receipt = provider_rate
+            .settle_response(settlement)
+            .map_err(|reason| budget.terminal_fault(reason, &self.runtime_admission))?;
+
+        // The aggregate permit has now been consumed. Prevent every later error path and Drop
+        // from attempting a second release against the exact durable permit.
+        self.active.store(false, Ordering::Release);
+        self.released = true;
+
+        let mut state = self.allocation.state.lock().map_err(|_| {
+            budget.terminal_fault(
+                BudgetUnavailableReason::StatePoisoned,
+                &self.runtime_admission,
+            )
+        })?;
+        let observation = self.allocation.clock.observation().map_err(|_| {
+            budget.terminal_fault(
+                BudgetUnavailableReason::ClockUnavailable,
+                &self.runtime_admission,
+            )
+        })?;
+        let in_flight = state.in_flight.checked_sub(1).ok_or_else(|| {
+            budget.terminal_fault(
+                BudgetUnavailableReason::StateCorrupt,
+                &self.runtime_admission,
+            )
+        })?;
+        state.in_flight = in_flight;
+        budget.persist_locked(&state, observation, &self.runtime_admission)?;
+        Ok(receipt)
+    }
+
+    /// Explicitly releases the in-flight slot; request-window consumption remains recorded.
+    ///
+    /// For a weighted provider-rate permit, the durable store conservatively terminalizes its
+    /// pending maximum response claim as unknown completion before releasing concurrency.
     pub fn release(mut self) {
         self.release_inner();
     }
 
     fn release_inner(&mut self) {
+        // Handshake completion has already released concurrency, but Drop must still revoke
+        // the established transport lease retained by the same owner.
+        self.active.store(false, Ordering::Release);
         if self.released {
             return;
         }
+        let admission = Arc::clone(&self.allocation.admission);
+        let _changed = admission.notify_on_drop();
         let budget = SharedProviderBudget {
             allocation: Arc::clone(&self.allocation),
         };

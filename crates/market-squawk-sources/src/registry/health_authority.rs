@@ -13,6 +13,24 @@ impl AuthoritativeSourceRegistry {
         session: &CurrentSourceSession,
         update: CurrentHealthUpdate,
     ) -> Result<(), RegistryError> {
+        self.record_health_with_qualification(session, update)
+            .map(|_recording| ())
+    }
+
+    /// Records health and reports whether the registry issued current-data authority.
+    ///
+    /// The returned classification is computed by the same closed predicate that owns health
+    /// authority. It exists so a capture-first caller can distinguish an aged bootstrap from a
+    /// revoked or otherwise invalid source without recreating the predicate outside the registry.
+    ///
+    /// # Errors
+    ///
+    /// Rejects stale/transplanted sessions or health evidence bound to another session tuple.
+    pub fn record_health_with_qualification(
+        &mut self,
+        session: &CurrentSourceSession,
+        update: CurrentHealthUpdate,
+    ) -> Result<CurrentHealthRecording, RegistryError> {
         let health = &update.snapshot;
         let session_started_at = self
             .validate_session_structure(session)?
@@ -58,7 +76,17 @@ impl AuthoritativeSourceRegistry {
         if health.observed_at().unix_nanos() <= previous_observed {
             return Err(RegistryError::StaleHealthObservation);
         }
-        let live_declaration = entry.metadata.coverage().live();
+        let live_declaration = match health.coverage() {
+            crate::CoverageHealth::Sufficient {
+                provider_product,
+                provider_channel,
+                ..
+            } => entry
+                .metadata
+                .coverage()
+                .live_for(provider_product, provider_channel),
+            _ => None,
+        };
         let quality_ceiling = entry.metadata.quality_ceiling();
         let exact_runtime_coverage = matches!(
             (health.coverage(), live_declaration),
@@ -72,35 +100,74 @@ impl AuthoritativeSourceRegistry {
             ) if provider_product == live.provider_product()
                 && provider_channel == live.provider_channel()
         );
-        let source_timestamp_qualified = match health.source_freshness() {
-            crate::SourceTimestampFreshness::Fresh { .. } => true,
-            crate::SourceTimestampFreshness::Uninitialized => {
-                quality_ceiling != market_squawk_domain::DataQuality::DirectVerified
-            }
-            crate::SourceTimestampFreshness::Stale { .. } => false,
-        };
-        let qualified = session.capture.is_healthy()
-            && matches!(health.connection(), crate::ConnectionLiveness::Live { .. })
+        let mut causes = 0_u16;
+        if !session.capture.is_healthy() {
+            causes |= CurrentHealthUnqualification::CAPTURE;
+        }
+        if !matches!(health.connection(), crate::ConnectionLiveness::Live { .. }) {
+            causes |= CurrentHealthUnqualification::CONNECTION_FRESHNESS;
+        }
+        if !matches!(
+            health.transport_freshness(),
+            crate::TransportFreshness::Fresh { .. }
+        ) {
+            causes |= CurrentHealthUnqualification::TRANSPORT_FRESHNESS;
+        }
+        if !matches!(
+            health.market_freshness(),
+            crate::MarketFreshness::Fresh { .. }
+        ) {
+            causes |= CurrentHealthUnqualification::MARKET_FRESHNESS;
+        }
+        if matches!(
+            health.source_freshness(),
+            crate::SourceTimestampFreshness::Stale { .. }
+        ) || quality_ceiling == market_squawk_domain::DataQuality::DirectVerified
             && matches!(
-                health.transport_freshness(),
-                crate::TransportFreshness::Fresh { .. }
+                health.source_freshness(),
+                crate::SourceTimestampFreshness::Uninitialized
             )
-            && matches!(
-                health.market_freshness(),
-                crate::MarketFreshness::Fresh { .. }
-            )
-            && source_timestamp_qualified
-            && health.stream_integrity() == market_squawk_domain::StreamIntegrityState::Healthy
-            && health.capture_integrity()
-                != market_squawk_domain::CaptureIntegrityState::Incomplete
-            && matches!(
-                health.authorization(),
-                crate::AuthorizationHealth::Valid { .. }
-            )
-            && exact_runtime_coverage
-            && health.budget() == crate::BudgetHealth::Available
-            && update.budget.health() == crate::BudgetHealth::Available
-            && health.last_error().is_none();
+        {
+            causes |= CurrentHealthUnqualification::SOURCE_FRESHNESS;
+        }
+        if health.stream_integrity() != market_squawk_domain::StreamIntegrityState::Healthy {
+            causes |= CurrentHealthUnqualification::STREAM_INTEGRITY;
+        }
+        if health.capture_integrity() == market_squawk_domain::CaptureIntegrityState::Incomplete {
+            causes |= CurrentHealthUnqualification::CAPTURE_INTEGRITY;
+        }
+        if !matches!(
+            health.authorization(),
+            crate::AuthorizationHealth::Valid { .. }
+        ) {
+            causes |= CurrentHealthUnqualification::AUTHORIZATION;
+        }
+        if !exact_runtime_coverage {
+            causes |= CurrentHealthUnqualification::COVERAGE;
+        }
+        if !update.producer.is_alive() {
+            causes |= CurrentHealthUnqualification::PRODUCER_INACTIVE;
+        }
+        if health.last_error().is_some() {
+            causes |= CurrentHealthUnqualification::LAST_ERROR;
+        }
+        if validation_at.wall() < health.observed_at() {
+            causes |= CurrentHealthUnqualification::OBSERVATION_TIME;
+        }
+        if !matches!(
+            health.authorization(),
+            crate::AuthorizationHealth::Valid { valid_until, .. }
+                if validation_at.wall() <= *valid_until
+        ) {
+            causes |= CurrentHealthUnqualification::AUTHORIZATION;
+        }
+        if !matches!(
+            health.coverage(),
+            crate::CoverageHealth::Sufficient { valid_until, .. }
+                if validation_at.wall() <= *valid_until
+        ) {
+            causes |= CurrentHealthUnqualification::COVERAGE;
+        }
         let valid_until = health
             .current_data_valid_until(quality_ceiling)
             .map(|health_until| {
@@ -120,15 +187,59 @@ impl AuthoritativeSourceRegistry {
             .map(|until| validation_at.checked_deadline(until))
             .transpose()?
             .flatten();
-        let qualified = qualified
-            && validation_at.wall() >= health.observed_at()
-            && valid_until_monotonic.is_some();
+        let metadata_authorization_current = entry
+            .metadata
+            .authorization()
+            .inclusive_authorization_deadline()
+            .is_none_or(|deadline| validation_at.wall() <= deadline);
+        let metadata_coverage_current = entry
+            .metadata
+            .coverage()
+            .inclusive_coverage_deadline()
+            .is_none_or(|deadline| validation_at.wall() <= deadline);
+        if !metadata_authorization_current || !metadata_coverage_current {
+            causes |= CurrentHealthUnqualification::STATIC_DEADLINE;
+        } else if valid_until_monotonic.is_none() {
+            causes |= CurrentHealthUnqualification::CURRENT_DATA_DEADLINE;
+        }
+        let qualified = causes == 0;
         let epoch = match session.lease.next_health_epoch() {
             Some(epoch) => epoch,
             None => {
                 entry.terminally_invalidate_health_authority();
                 return Err(RegistryError::HealthEpochExhausted);
             }
+        };
+        // Permission survives ordinary price freshness, but never its own static/runtime expiry.
+        let permission_valid_until = match (health.authorization(), health.coverage()) {
+            (
+                crate::AuthorizationHealth::Valid {
+                    valid_until: authorization,
+                    ..
+                },
+                crate::CoverageHealth::Sufficient {
+                    valid_until: coverage,
+                    ..
+                },
+            ) => Some(
+                (*authorization)
+                    .min(*coverage)
+                    .min(
+                        entry
+                            .metadata
+                            .authorization()
+                            .inclusive_authorization_deadline()
+                            .unwrap_or(Timestamp::from_unix_nanos(i64::MAX)),
+                    )
+                    .min(
+                        entry
+                            .metadata
+                            .coverage()
+                            .inclusive_coverage_deadline()
+                            .unwrap_or(Timestamp::from_unix_nanos(i64::MAX)),
+                    ),
+            ),
+            _ => None,
         };
         let next_authority = if qualified {
             Some(CurrentHealthAuthority {
@@ -141,16 +252,29 @@ impl AuthoritativeSourceRegistry {
                 valid_until: valid_until.ok_or(RegistryError::HealthNotQualified)?,
                 valid_until_monotonic: valid_until_monotonic
                     .ok_or(RegistryError::HealthNotQualified)?,
+                permission_valid_until: permission_valid_until
+                    .ok_or(RegistryError::HealthNotQualified)?,
+                permission_valid_until_monotonic: validation_at
+                    .checked_deadline(
+                        permission_valid_until.ok_or(RegistryError::HealthNotQualified)?,
+                    )?
+                    .ok_or(RegistryError::HealthNotQualified)?,
                 authorization: health.authorization().clone(),
                 coverage: health.coverage().clone(),
-                budget: update.budget,
+                producer: update.producer,
             })
         } else {
             None
         };
+        let benign_renewal = entry
+            .health_authority
+            .as_ref()
+            .zip(next_authority.as_ref())
+            .is_some_and(|(previous, next)| previous.is_benign_renewal(next));
         session.lease.commit_live_qualification(
             epoch,
             qualified,
+            benign_renewal,
             qualified.then_some(health.observed_at()),
             valid_until,
         );
@@ -159,7 +283,11 @@ impl AuthoritativeSourceRegistry {
             .last_health_observed_nanos
             .store(health.observed_at().unix_nanos(), Ordering::Release);
         entry.health_authority = next_authority;
-        Ok(())
+        Ok(if qualified {
+            CurrentHealthRecording::Qualified
+        } else {
+            CurrentHealthRecording::Unqualified(CurrentHealthUnqualification::new(causes))
+        })
     }
 
     /// Returns opaque current health/subscription authority for live scope validation.
@@ -188,13 +316,11 @@ impl AuthoritativeSourceRegistry {
             || validation_at.wall() < health.observed_at
             || validation_at.wall() > health.valid_until
             || validation_at.monotonic() > health.valid_until_monotonic
-            || !session
-                .lease
-                .validate_health_epoch(health.epoch, validation_at.wall())
+            || !session.lease.validate_health_epoch(health.epoch)
         {
             return Err(RegistryError::HealthNotQualified);
         }
-        if !health.budget.is_available() {
+        if !health.producer.is_alive() {
             return Err(RegistryError::HealthNotQualified);
         }
         if !session.capture.is_healthy() {
@@ -208,6 +334,7 @@ impl AuthoritativeSourceRegistry {
             validated,
             health,
             attestation,
+            provider_identities: &entry.provider_identities,
             validated_at: validation_at,
             clock: &self.clock,
         })
@@ -271,5 +398,51 @@ impl AuthoritativeSourceRegistry {
             return Err(RegistryError::SessionNotCurrent);
         }
         Ok(entry)
+    }
+}
+
+impl CurrentHealthAuthority {
+    /// Renewal may extend time, but cannot replace or narrow the evidence authorizing old work.
+    fn is_benign_renewal(&self, next: &Self) -> bool {
+        let authorization_continues = match (&self.authorization, &next.authorization) {
+            (
+                crate::AuthorizationHealth::Valid {
+                    evidence: before,
+                    valid_until: before_until,
+                },
+                crate::AuthorizationHealth::Valid {
+                    evidence: after,
+                    valid_until: after_until,
+                },
+            ) => before == after && after_until >= before_until,
+            _ => false,
+        };
+        let coverage_continues = match (&self.coverage, &next.coverage) {
+            (
+                crate::CoverageHealth::Sufficient {
+                    evidence: before,
+                    provider_product: before_product,
+                    provider_channel: before_channel,
+                    valid_until: before_until,
+                },
+                crate::CoverageHealth::Sufficient {
+                    evidence: after,
+                    provider_product: after_product,
+                    provider_channel: after_channel,
+                    valid_until: after_until,
+                },
+            ) => {
+                before == after
+                    && before_product == after_product
+                    && before_channel == after_channel
+                    && after_until >= before_until
+            }
+            _ => false,
+        };
+        authorization_continues
+            && coverage_continues
+            && next.valid_until >= self.valid_until
+            && next.valid_until_monotonic >= self.valid_until_monotonic
+            && self.producer.is_alive()
     }
 }

@@ -150,6 +150,66 @@ Compaction produces a new immutable generation from an exact pinned parent. It d
 parent or weaken lineage. Consumers can continue reading a prior pin while a later generation is
 being published.
 
+### Persistent endpoint identity
+
+Catalog and artifact-root bindings retain the canonical path and exact file identity. On macOS,
+the shared platform helper uses the volume's persistent UUID and file ID for the durable digest;
+a mount's device number is used only for live handle/path validation. Device numbers can change
+across a machine restart and must not make an unchanged saved workspace appear replaced.
+The helper brackets the Foundation lookup with retained-handle and no-follow path checks, so file,
+directory and symlink substitution still fail. Other platforms retain their existing identity
+inputs; this correction does not establish new native-platform restart evidence.
+
+This updates the active V1 binding in place. Old diagnostic roots are preserved as evidence;
+startup does not rewrite their bindings, bypass a mismatch or introduce a compatibility migration.
+Fresh validation roots exercise the corrected format. Implementation:
+[shared endpoint identity](../../crates/market-squawk-platform/src/persistent_endpoint.rs),
+[catalog binding](../../crates/market-squawk-data/src/catalog/authority.rs) and
+[artifact binding](../../crates/market-squawk-data/src/parquet_store/authority.rs).
+Reviewed 2026-09-30 against Apple's
+[persistent volume UUID contract](https://developer.apple.com/documentation/foundation/urlresourcevalues/volumeuuidstring).
+
+### Catalog startup and full audits
+
+Ordinary catalog opening validates the catalog identity, active schema, writer ownership and
+artifact-root binding and enables SQLite foreign-key enforcement. It does not scan all retained
+rows and indexes before the workspace becomes available. Selected evidence still undergoes its
+existing identity, lineage and content checks when consumed. A successful open therefore is not
+a claim that every historical row has been audited.
+
+Full SQLite integrity and foreign-key checks remain in explicit catalog auditing and the existing
+backup/restore boundaries. SQLite's `integrity_check(1)` limits reported errors, not examined data;
+`quick_check` also traverses the database and is not a bounded startup substitute. Planner statistics
+use SQLite's bounded `PRAGMA optimize` mechanism. Research startup records separate catalog,
+manifest, bound analytical store and raw capture store timings to distinguish their actual costs.
+This changes the active V1 path without a schema change or migration.
+
+Reviewed 2026-10-04 against SQLite's
+[integrity checks](https://sqlite.org/pragma.html#pragma_integrity_check) and
+[planner optimization](https://sqlite.org/pragma.html#pragma_optimize).
+Implementation: [catalog lifecycle](../../crates/market-squawk-data/src/catalog.rs) and
+[research composition](../../apps/market-squawk/src/research_service.rs).
+
+### Repeated connection and selected-row reads
+
+Each active provider account retains one verified onboarding snapshot. A short database read
+compares its complete committed stream head before reuse; a changed head requires replay. Every
+use still checks the current profile, exact lease and wall-clock expiry. The snapshot mutex is
+released before acquiring catalog authority. A snapshot reconstructed inside a caller's transaction
+is never marked committed or installed in the account cache, because that transaction can roll back.
+
+Retained market-event authorization reads the selected coordinate and native component through
+their existing indexes, checking publication kind, source, component, ordinal and digests. Run,
+dataset, temporal horizon and current use grants remain checked. Full aggregate verification stays
+at publication admission and explicit replay. This narrows authorization work; the preceding
+point-in-time publication reader still reconstructs the publication and is a separate cost.
+
+Reviewed 2026-10-04 against SQLite's [transaction isolation](https://www.sqlite.org/isolation.html),
+including visibility of uncommitted changes on the same connection. Implementation:
+[onboarding reads](../../crates/market-squawk-data/src/catalog/onboarding.rs),
+[account ownership](../../apps/market-squawk/src/provider_activation/account.rs) and
+[retained-use authorization](../../crates/market-squawk-data/src/research_use/market_event.rs).
+
 ## Point-in-time construction
 
 The dataset builder consumes exact parent manifest pins and a digest-bound build specification. It
@@ -186,6 +246,22 @@ merely because its effective date is earlier.
 The output is a reproducible Parquet generation whose manifest, universe digest, policy digest,
 build-spec digest, feature/label identity, and lineage can be revalidated before query, Python
 export, model admission, or backtesting.
+
+### Guided preparation choices
+
+The guided Research list reads compact canonical summary columns and indexes relevant history,
+membership and action rows in an operation-owned SQLite scratch database. It traverses dataset
+pages and the complete retained history; it does not decode unrelated financial payloads or build
+all possible financial datasets merely to populate a selector. The two guided recipes select up to
+2,048 value-independent examples across the complete eligible chronology. The annual recipe purges
+labels crossing its training, validation and test boundaries; source histories remain intact.
+
+A choice means that source history and its declared use are available. Selected Preview separately
+validates complete macro, point-in-time and financial inputs and retains the exact build request
+behind the existing one-use receipt. Choice identity binds immutable manifests, recipe coordinates,
+membership and stable rights-graph evidence. Expiring check timestamps do not change that identity.
+Scratch indexes are reclaimed with their owning operation; they are not another durable store.
+Implementation: [guided catalog](../../apps/market-squawk/src/application/research/dataset_preparation/catalog.rs).
 
 ## Query and Python boundaries
 
@@ -314,3 +390,16 @@ Squawk behavior.
 | [Apache Parquet format documentation](https://parquet.apache.org/docs/) | Durable columnar file and metadata semantics | 2026-07-23 |
 | [Apache DataFusion SQL reference](https://datafusion.apache.org/user-guide/sql/) | Embedded analytical SQL surface; Market Squawk applies a smaller read-only grammar and stricter local bounds | 2026-07-23 |
 | [SQLite transaction documentation](https://www.sqlite.org/lang_transaction.html) | Transaction and single-writer semantics for local catalog authority | 2026-07-23 |
+
+## Stable selected evidence and execution admission
+
+A pinned query retains two identities from the shared manifest/schema/SQL encoding. Its semantic
+identity describes the exact immutable data and query; its artifact admission identity additionally
+binds every execution limit for reservation and execution validation. Macro selections and consumed
+financial evidence use the semantic identity together with the actual result, selected observations,
+cutoffs, object graph and native publication binding. A different remaining request deadline cannot
+change otherwise identical financial evidence after reopening the application.
+
+Request deadlines, cancellation with joined termination, row/byte/memory/spill limits and artifact
+reservation checks remain enforced independently. This changes the active V1 implementation in place;
+it adds no stored-schema migration or alternate compatibility path.

@@ -92,6 +92,7 @@ fn recorded_and_composite_live_events_preserve_availability() -> Result<(), Box<
         PriceTicks::new(100),
         QuantityLots::new(2)?,
         AggressorSide::Buy,
+        None,
     )?);
     let restored: MarketEvent = serde_json::from_str(&serde_json::to_string(&event)?)?;
     let MarketEvent::Trade(trade) = restored else {

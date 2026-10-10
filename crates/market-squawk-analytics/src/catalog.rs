@@ -66,6 +66,10 @@ pub enum KnownFeatureImplementation {
     BatchMacro,
     /// Portfolio exposure, attribution, and scenario analytics.
     BatchPortfolioScenarios,
+    /// Deterministic causal harmonic price-pattern analysis.
+    BatchHarmonicPatterns,
+    /// Exact selected signed monetary amount under the existing data-owned native fiscal recipe.
+    BatchReportedFinancialAmount,
 }
 
 /// Closed identity set for the mandatory production live features.

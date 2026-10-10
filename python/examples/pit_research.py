@@ -6,6 +6,7 @@ Set ``MARKET_SQUAWK_EXAMPLE_DATASET_ROOT`` to a local admitted dataset root and
 
 from __future__ import annotations
 
+from decimal import Decimal
 import hashlib
 import json
 import os
@@ -27,15 +28,20 @@ dataset = open_dataset(
     FIXTURE,
     EXPORT_SHA256,
     UtcNanoseconds(120),
-    max_rows=16,
-    max_bytes=1_000_000,
+    product_contract="market-squawk.feature-dataset.price-return-macro-context-fixed-horizon-forward-return.training/v1",
+    max_rows=128,
+    max_bytes=64 * 1024 * 1024,
     context=OperationContext(60_000, 1_000_000),
 )
-feature_rows = tuple(row for row in dataset.rows if row["component_kind"] == "feature")
+feature_rows = tuple(
+    {"decision_at": row["decision_at"], "price_return": Decimal(row["value_decimal_mantissa"]).scaleb(-row["value_decimal_scale"])}
+    for row in dataset.rows
+    if row["component_kind"] == "feature" and row["component_name"] == "research.price-return"
+)
 specification = chart_spec(
     feature_rows,
-    x="cutoff_at",
-    y="value_f64",
+    x="decision_at",
+    y="price_return",
     title="Local PIT fixture",
 )
 encoded = json.dumps(specification, sort_keys=True, separators=(",", ":")).encode()

@@ -5,13 +5,14 @@ use std::ffi::OsString;
 
 use anyhow::{Context as _, Result, bail};
 use bytes::Bytes;
+use market_squawk_adapter_coinbase::CoinbaseMarketDecodeOutcome;
 use market_squawk_domain::{
     ConnectionGeneration, DataQuality, LiveEventClass, SourceIdentifier, Timestamp,
 };
 use market_squawk_platform::{ConfigOverrides, ConfigSources};
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode, CurrentSourceSession,
-    DecodeOutcome, MarketDecoder, NetworkAccessPolicy, RawFrameFactory, SessionId, SourceClass,
+    NetworkAccessPolicy, RawFrameFactory, SessionId, SourceClass,
     SourceMetadata, SourceMetadataInput, TransportFrameKind,
 };
 use serde::{Deserialize, Serialize};
@@ -21,11 +22,11 @@ use super::composition::ProductionCoinbaseProfile;
 use crate::AppConfig;
 
 const COINBASE_CONFIG: &str = r#"{
-  "endpoint":"wss://ws-feed.exchange.coinbase.com",
+  "endpoint":"wss://advanced-trade-ws.coinbase.com",
   "event_classes":["book_snapshot","book_delta","trade"],
   "depth":"price_level",
   "freshness_ms":5000,
-  "max_frame_bytes":1048576,
+  "max_frame_bytes":16777216,
   "subscription_ack_timeout_ms":5000,
   "control_message_capacity":64,
   "control_byte_capacity":65536,
@@ -34,8 +35,18 @@ const COINBASE_CONFIG: &str = r#"{
     "provider":"coinbase-exchange",
     "basis":"user-reviewed-coinbase-public-interface",
     "evidence_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-    "evidence_reference":"https://docs.cdp.coinbase.com/exchange/websocket-feed/overview",
-    "evidence_version":"reviewed-2026-07-20",
+    "evidence_reference":"https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-overview",
+    "evidence_version":"reviewed-2026-08-08",
+    "effective_from_unix_nanos":1700000000000000000,
+    "effective_until_unix_nanos":1900000000000000000
+  },
+  "reference_authorization":{
+    "mode":"public_interface",
+    "provider":"coinbase-exchange",
+    "basis":"market-squawk-reviewed-coinbase-product-reference",
+    "evidence_sha256":"6d6be28e5a9484c6bbfa75041b382cdaf2bbe387237d1cc4168aa02b59d58bd7",
+    "evidence_reference":"https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/rest-api/public/get-public-product",
+    "evidence_version":"reviewed-2026-09-23",
     "effective_from_unix_nanos":1700000000000000000,
     "effective_until_unix_nanos":1900000000000000000
   },
@@ -169,12 +180,13 @@ fn decode_count(
     let validated = session
         .validate_live_frame(&frame)
         .context("Coinbase release fixture frame authority failed")?;
-    let DecodeOutcome::Data(batch) = decoder
-        .decode(&validated)
+    let CoinbaseMarketDecodeOutcome::Market(handoff) = decoder
+        .decode_market_handoff(&validated)
         .context("production Coinbase decoder failed")?
     else {
         bail!("production Coinbase decoder did not produce market data");
     };
+    let batch = handoff.typed_batch();
     if batch.observations().len() != 1
         || batch
             .observations()

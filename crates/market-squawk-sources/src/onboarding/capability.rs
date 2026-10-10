@@ -189,7 +189,7 @@ pub struct RatePolicyDescriptor {
     enforcement: Option<RateEnforcementContract>,
 }
 
-/// Serialized request authority consumed unchanged by portal disclosure and runtime enforcement.
+/// Serialized rate controls. Capabilities retain admission evidence; profiles expose current enforcement.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 struct RateEnforcementContract {
@@ -314,7 +314,6 @@ impl RatePolicyDescriptor {
         if let Some(enforcement) = &self.enforcement
             && (!nonzero_digest(enforcement.scope_evidence_digest)
                 || enforcement.endpoint_class.as_str().is_empty()
-                || enforcement.budget.window_count() == 0
                 || enforcement.budget.max_concurrent() == 0
                 || enforcement.budget.backoff().maximum_nanos() == 0)
         {

@@ -6,11 +6,17 @@ mod config;
 mod input;
 mod journal;
 mod paths;
+mod persistent_endpoint;
 mod raw_record;
 mod secrets;
+mod tls;
+
+pub use persistent_endpoint::persistent_endpoint_identity;
+pub use tls::{TlsProviderCapability, TlsProviderError, install_ring_tls_provider};
 
 pub use authority_state::{
-    AuthorityCommitContext, AuthorityStateSnapshot, LocalAuthorityStateStore,
+    AuthorityCommitContext, AuthorityStateSnapshot, InstalledServiceInstanceGuard,
+    InstalledServiceSelectedWorkspaceGuard, LocalAuthorityStateStore,
     LocalAuthorityStateStoreError,
 };
 #[cfg(feature = "capture-benchmark")]
@@ -38,35 +44,46 @@ pub use capture::{
 #[cfg(all(feature = "capture-test", debug_assertions))]
 pub use capture::{CaptureReceiverTestCoordinationError, ProcessCaptureHelperTestBehavior};
 pub use config::{
-    AppConfig, COINBASE_EXCHANGE_ENDPOINT, CoinbaseAuthorizationAttestation,
+    AppConfig, COINBASE_ADVANCED_TRADE_MARKET_DATA_ENDPOINT, CoinbaseAuthorizationAttestation,
     CoinbaseConfigurationError, CoinbaseControlLimits, CoinbaseInstrumentMapping,
     CoinbaseSourceConfig, ConfigError, ConfigOrigin, ConfigOverrides, ConfigProvenance,
     ConfigSetting, ConfigSources, EffectiveConfig, EffectiveConfigView, EffectiveSettingView,
     KRAKEN_WEBSOCKET_V2_ENDPOINT, KrakenAuthorizationAttestation, KrakenConfigurationError,
-    KrakenInstrumentMapping, KrakenSourceConfig, SecretError, SecretProvider, SecretReference,
-    SecretValue,
+    KrakenInstrumentMapping, KrakenSourceConfig, RECOMMENDED_PUBLIC_BTC_USD_INSTRUMENT_ID,
+    SecretError, SecretProvider, SecretReference, SecretValue,
 };
 pub use input::{
-    BoundedInput, ControlledInputFileError, InputFileCapability, InputFileError, InputFileIdentity,
-    InputReadCheckpoint, InputReadControl, InputReadControlError, InputReadPass,
-    UserAuthorizedInputRoot, UserOwnedInputAuthority, UserOwnedInputEvidence,
-    UserOwnedInputRootIdentityDigest, VerifiedInputFile,
+    BoundedInput, ControlledImportInputRoot, ControlledInputFileError, InputFileCapability,
+    InputFileError, InputFileIdentity, InputReadCheckpoint, InputReadControl,
+    InputReadControlError, InputReadPass, UserAuthorizedInputRoot, UserOwnedInputAuthority,
+    UserOwnedInputEvidence, UserOwnedInputRootIdentityDigest, VerifiedInputFile,
 };
 pub use journal::{
     JournalError, JournalReader, JournalReplayAuthority, JournalSinkConstructionError,
-    JournalSinkLimits, JournalWriter,
+    JournalSinkLimits, JournalWriter, PendingResearchObject, ResearchObjectAdmission,
+    ResearchObjectCheckpointClaim, ResearchObjectChunkReceipt, ResearchObjectClaim,
+    ResearchObjectControl, ResearchObjectControlError, ResearchObjectControlPoint,
+    ResearchObjectReceipt, SealedResearchJournalFrameReceipt, SealedResearchJournalRecoveryReport,
+    SealedResearchJournalSegment, SealedResearchJournalSegmentClaim,
+    SealedResearchJournalSegmentReceipt, SealedResearchJournalStore,
+    SealedResearchJournalStoreError, SealedResearchRawClaim, SealedResearchRawObjectKind,
+    SealedResearchRecoveryAdmission, SealedResearchRecoverySession, SealedResearchRecoveryTurn,
+    VerifiedResearchObject,
 };
 pub use paths::{
     ArtifactPathError, ArtifactRoot, CatalogFileGuard, CatalogLocation, CatalogRestoreScanGuard,
     CatalogRestoreStage, CatalogRestoreTarget, CatalogWriterGuard, ConfiguredJournalRead,
-    ConfiguredJournalReadTarget, ControlRoot, InstalledCatalogFile, JournalFileFormat,
-    JournalOpenError, JournalSelectionError, LocalPaths, PathError, ResolvedArtifactPath,
+    ConfiguredJournalReadTarget, ControlRoot, DecisionDatabaseFileGuard, DecisionDatabaseLocation,
+    DecisionDatabaseWriterGuard, InstalledCatalogFile, JobDatabaseFileGuard, JobDatabaseLocation,
+    JobDatabaseWriterGuard, JournalFileFormat, JournalOpenError, JournalSelectionError, LocalPaths,
+    PathError, ResolvedArtifactPath,
 };
 pub use raw_record::{RawCaptureRecord, RawCaptureRecordError};
 pub use secrets::{
-    EncryptedFileFallbackStatus, EncryptedFileSecretFallback, EncryptedFileSecretStore,
-    EncryptedFileUnlockCapability, LocalSecretStoreError, OsKeyringSecretStore,
-    PreferredSecretStore, RotationAuthority, RotationOutcome, SecretBackend, SecretCancellation,
+    AccessControlledSecretStore, EncryptedFileFallbackStatus, EncryptedFileSecretFallback,
+    EncryptedFileSecretStore, EncryptedFileUnlockCapability, LocalSecretStoreError,
+    OsKeyringSecretStore, PreferredSecretStore, RotationAuthority, RotationOutcome,
+    SecretAccessPolicy, SecretAccessState, SecretAccessStatus, SecretBackend, SecretCancellation,
     SecretDeadlineCapability, SecretDeletionDisposition, SecretGeneration,
     SecretInteractionCapability, SecretInteractionPolicy, SecretKey, SecretMutationDisposition,
     SecretMutationEffect, SecretMutationFailure, SecretMutationKind, SecretMutationPlan,

@@ -32,13 +32,26 @@ pub(crate) fn evidence(byte: u8) -> ExactPayloadEvidence {
 pub(crate) fn config() -> TestResult<CoinbaseExchangeConfig> {
     config_with_channels(vec![
         CoinbaseChannel::Level2,
-        CoinbaseChannel::Matches,
-        CoinbaseChannel::Heartbeat,
+        CoinbaseChannel::MarketTrades,
+        CoinbaseChannel::Heartbeats,
     ])
 }
 
 pub(crate) fn config_with_channels(
     channels: Vec<CoinbaseChannel>,
+) -> TestResult<CoinbaseExchangeConfig> {
+    config_with_channels_and_mapping(
+        channels,
+        CoinbaseProductMapping::try_new(
+            ProviderProduct::new(identifier("BTC-USD")?),
+            InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?,
+        )?,
+    )
+}
+
+pub(crate) fn config_with_channels_and_mapping(
+    channels: Vec<CoinbaseChannel>,
+    mapping: CoinbaseProductMapping,
 ) -> TestResult<CoinbaseExchangeConfig> {
     let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
     let authorization = AuthorizationGrant::new(
@@ -59,14 +72,10 @@ pub(crate) fn config_with_channels(
             1_000,
         )?,
     )?;
-    let mapping = CoinbaseProductMapping::try_new(
-        ProviderProduct::new(identifier("BTC-USD")?),
-        InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?,
-    )?;
     Ok(CoinbaseExchangeConfig::try_new(
         SourceId::try_from("coinbase-exchange-public")?,
         RevisionBoundPayloadEvidence::new(
-            MetadataRevision::new(identifier("exchange-v1-2026-07-20")?),
+            MetadataRevision::new(identifier("advanced-trade-v1-2026-08-08")?),
             evidence(3),
         ),
         authorization,
@@ -83,7 +92,7 @@ pub(crate) fn config_with_channels(
         )?,
         budget,
         CoinbaseTransportLimits::try_new(
-            256 * 1024,
+            market_squawk_sources::MAX_RAW_FRAME_BYTES,
             Duration::from_secs(5),
             Duration::from_secs(5),
         )?,

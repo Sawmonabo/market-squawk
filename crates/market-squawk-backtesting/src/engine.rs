@@ -25,7 +25,10 @@ use crate::fills::{
 use crate::strategy::BacktestStrategy;
 
 mod accounting;
+mod history;
+use history::RunHistory;
 
+pub(crate) use accounting::RecommendationAccounting;
 use accounting::{ShadowPortfolio, reconcile};
 
 /// Exact initial account state supplied to Task 16 reconciliation.
@@ -120,6 +123,17 @@ impl BacktestRequest {
     #[must_use]
     pub const fn object_graph_digest(&self) -> Sha256Digest {
         self.dataset.object_graph_digest()
+    }
+
+    /// Returns the exact decision-time interval that was admitted for this request.
+    ///
+    /// This is intentionally derived from the sealed dataset rather than caller input so cohort
+    /// generation can bind each member to the same partition the engine will execute.
+    #[must_use]
+    pub fn dataset_partition(&self) -> Option<crate::TrialDatasetPartition> {
+        let starts_at = self.dataset.observations.first()?.decision_at;
+        let ends_at = self.dataset.observations.last()?.decision_at;
+        crate::TrialDatasetPartition::try_new(starts_at, ends_at).ok()
     }
 
     /// Returns the exact research execution-assumption identity.
@@ -286,7 +300,7 @@ impl BacktestContext<'_> {
 /// Detailed bounded run result retained before controlled artifact publication.
 #[derive(Clone, Debug)]
 pub struct BacktestRun {
-    fills: Box<[ResearchFill]>,
+    fills: RunHistory,
     portfolio: PortfolioRevision,
     no_action_count: usize,
     accounting_reconciliation: AccountingReconciliation,
@@ -297,8 +311,17 @@ pub struct BacktestRun {
 impl BacktestRun {
     /// Returns deterministic research fills.
     #[must_use]
-    pub fn fills(&self) -> &[ResearchFill] {
-        &self.fills
+    pub fn fills(&self) -> Result<Vec<ResearchFill>, BacktestError> {
+        self.fills.iter().collect()
+    }
+    pub fn equity_marks(&self) -> impl Iterator<Item = Result<Decimal, BacktestError>> + '_ {
+        self.fills.marks()
+    }
+    pub fn fill_count(&self) -> usize {
+        self.fills.len()
+    }
+    pub fn fill_iter(&self) -> impl Iterator<Item = Result<ResearchFill, BacktestError>> + '_ {
+        self.fills.iter()
     }
 
     /// Returns Task 16's immutable reconciled account revision.
@@ -336,42 +359,73 @@ pub(crate) struct BacktestPerformanceStatistics {
     pub(crate) observations: usize,
     pub(crate) skewness: f64,
     pub(crate) excess_kurtosis: f64,
+    pub(crate) maximum_drawdown: Decimal,
 }
 
 impl BacktestPerformanceStatistics {
-    fn from_equity_marks(marks: &[Decimal]) -> Result<Self, BacktestError> {
-        let returns = marks
-            .windows(2)
-            .map(|window| {
-                let opening = window[0];
-                if opening.is_zero() {
-                    return Err(BacktestError::PerformanceMetrics);
-                }
-                window[1]
-                    .checked_sub(opening)
-                    .and_then(|change| change.checked_div(opening))
-                    .and_then(|value| rust_decimal::prelude::ToPrimitive::to_f64(&value))
-                    .filter(|value| value.is_finite())
-                    .ok_or(BacktestError::PerformanceMetrics)
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        if returns.len() < 3 {
+    fn from_equity_marks(marks: &RunHistory) -> Result<Self, BacktestError> {
+        let mut peak = marks
+            .marks()
+            .next()
+            .transpose()?
+            .filter(|mark| *mark > Decimal::ZERO)
+            .ok_or(BacktestError::PerformanceMetrics)?;
+        let mut maximum_drawdown = Decimal::ZERO;
+        for mark in marks.marks().skip(1) {
+            let mark = mark?;
+            if mark > peak {
+                peak = mark;
+                continue;
+            }
+            let drawdown = peak
+                .checked_sub(mark)
+                .and_then(|decline| decline.checked_div(peak))
+                .ok_or(BacktestError::PerformanceMetrics)?;
+            maximum_drawdown = maximum_drawdown.max(drawdown);
+        }
+        // Recompute the same Decimal-to-f64 return on each pass. This preserves the
+        // original summation order and rounding without retaining a second full vector.
+        let returns = || {
+            marks
+                .marks()
+                .scan(None, |previous, mark| {
+                    let mark = match mark {
+                        Ok(mark) => mark,
+                        Err(error) => return Some(Some(Err(error))),
+                    };
+                    let opening = previous.replace(mark);
+                    Some(opening.map(|opening: Decimal| {
+                        if opening.is_zero() {
+                            return Err(BacktestError::PerformanceMetrics);
+                        }
+                        mark.checked_sub(opening)
+                            .and_then(|change| change.checked_div(opening))
+                            .and_then(|value| rust_decimal::prelude::ToPrimitive::to_f64(&value))
+                            .filter(|value| value.is_finite())
+                            .ok_or(BacktestError::PerformanceMetrics)
+                    }))
+                })
+                .flatten()
+        };
+        let observations = marks.mark_count().saturating_sub(1);
+        // Validate even a short path, as the previous collecting implementation did.
+        let total =
+            returns().try_fold(0.0, |total, value| Ok::<_, BacktestError>(total + value?))?;
+        if observations < 3 {
             return Ok(Self {
                 sharpe: 0.0,
-                observations: returns.len(),
+                observations,
                 skewness: 0.0,
                 excess_kurtosis: 0.0,
+                maximum_drawdown,
             });
         }
-        let count = returns.len() as f64;
-        let mean = returns.iter().sum::<f64>() / count;
-        let squared = returns
-            .iter()
-            .map(|value| {
-                let deviation = value - mean;
-                deviation * deviation
-            })
-            .sum::<f64>();
+        let count = observations as f64;
+        let mean = total / count;
+        let squared = returns().try_fold(0.0, |total, value| {
+            let deviation = value? - mean;
+            Ok::<_, BacktestError>(total + deviation * deviation)
+        })?;
         let sample_variance = squared / (count - 1.0);
         let population_variance = squared / count;
         let standard_deviation = sample_variance.sqrt();
@@ -382,16 +436,16 @@ impl BacktestPerformanceStatistics {
         };
         let (skewness, excess_kurtosis) = if population_variance > 0.0 {
             let population_standard_deviation = population_variance.sqrt();
-            let third = returns
-                .iter()
-                .map(|value| ((value - mean) / population_standard_deviation).powi(3))
-                .sum::<f64>()
-                / count;
-            let fourth = returns
-                .iter()
-                .map(|value| ((value - mean) / population_standard_deviation).powi(4))
-                .sum::<f64>()
-                / count;
+            let third = returns().try_fold(0.0, |total, value| {
+                Ok::<_, BacktestError>(
+                    total + ((value? - mean) / population_standard_deviation).powi(3),
+                )
+            })? / count;
+            let fourth = returns().try_fold(0.0, |total, value| {
+                Ok::<_, BacktestError>(
+                    total + ((value? - mean) / population_standard_deviation).powi(4),
+                )
+            })? / count;
             (third, fourth - 3.0)
         } else {
             (0.0, 0.0)
@@ -402,9 +456,10 @@ impl BacktestPerformanceStatistics {
         {
             Ok(Self {
                 sharpe,
-                observations: returns.len(),
+                observations,
                 skewness,
                 excess_kurtosis,
+                maximum_drawdown,
             })
         } else {
             Err(BacktestError::PerformanceMetrics)
@@ -436,15 +491,20 @@ impl BacktestEngine {
         strategy: &mut dyn BacktestStrategy,
         cancellation: &CancellationToken,
     ) -> Result<BacktestRun, BacktestError> {
+        if request.dataset.daily_history.is_some() {
+            return Err(BacktestError::InvalidDataset);
+        }
         let mut clock = EventTimeClock::default();
         let mut simulator = ResearchFillSimulator::new(request.assumptions, request.seed);
         let mut pending = Vec::<PendingIntent>::new();
-        let mut fills = Vec::<ResearchFill>::new();
+        let mut fills = RunHistory::new(request.dataset.observations.operation_scratch())?;
         let mut no_action_count = 0_usize;
         let mut latest_prices = BTreeMap::<InstrumentId, (Money, Timestamp)>::new();
-        let mut equity_marks = vec![request.portfolio.initial_cash.amount()];
+        fills.mark(request.portfolio.initial_cash.amount())?;
 
-        for observation in &request.dataset.observations {
+        for observation in request.dataset.observations.iter() {
+            let observation = observation?;
+            let observation = &observation;
             if cancellation.is_cancelled() {
                 return Err(BacktestError::Cancelled);
             }
@@ -541,7 +601,7 @@ impl BacktestEngine {
                         .get()
                         .checked_sub(fill.quantity().get())
                         .ok_or(BacktestError::AccountingMismatch)?;
-                    fills.push(fill);
+                    fills.push(fill)?;
                     if residual == 0 || immediate {
                         pending.remove(index);
                     } else {
@@ -576,10 +636,10 @@ impl BacktestEngine {
                 }
             }
             if let Some(equity) = shadow.marked_equity(&latest_prices, observation.decision_at)? {
-                equity_marks.push(equity.amount());
+                fills.mark(equity.amount())?;
             }
         }
-        let portfolio = reconcile(request, &fills)?;
+        let portfolio = reconcile(request, &fills, cancellation)?;
         let final_at = request
             .dataset
             .observations
@@ -592,10 +652,11 @@ impl BacktestEngine {
         } else {
             return Err(BacktestError::AccountingMismatch);
         };
-        let performance = BacktestPerformanceStatistics::from_equity_marks(&equity_marks)?;
-        let result_digest = result_digest(request, &fills, &portfolio, no_action_count);
+        let performance = BacktestPerformanceStatistics::from_equity_marks(&fills)?;
+        let result_digest = result_digest(request, &fills, &portfolio, no_action_count)?;
+        fills.finish()?;
         Ok(BacktestRun {
-            fills: fills.into_boxed_slice(),
+            fills,
             portfolio,
             no_action_count,
             accounting_reconciliation,
@@ -630,14 +691,15 @@ fn corporate_action_invalidates_pending(
 
 fn result_digest(
     request: &BacktestRequest,
-    fills: &[ResearchFill],
+    fills: &RunHistory,
     portfolio: &PortfolioRevision,
     no_action_count: usize,
-) -> Sha256Digest {
+) -> Result<Sha256Digest, BacktestError> {
     let mut hash = Sha256::new();
     hash.update(b"market-squawk/backtest-result/v3");
     hash.update(request.run_input_digest().bytes());
-    for fill in fills {
+    for fill in fills.iter() {
+        let fill = fill?;
         hash.update(fill.intent_digest().as_bytes());
         hash.update(fill.instrument_id().as_uuid().into_bytes());
         hash.update(fill.executed_at().unix_nanos().to_be_bytes());
@@ -652,12 +714,14 @@ fn result_digest(
             .map_or(u64::MAX, |value| value)
             .to_be_bytes(),
     );
-    Sha256Digest::new(hash.finalize().into())
+    Ok(Sha256Digest::new(hash.finalize().into()))
 }
 
 /// Point-in-time, strategy, fill, portfolio, or resource failure.
 #[derive(Debug, Error)]
 pub enum BacktestError {
+    #[error("backtest temporary history storage failed: {0}")]
+    HistoryStorage(#[from] rusqlite::Error),
     #[error("backtest observation is invalid")]
     InvalidObservation,
     #[error("backtest dataset identity or ordering is invalid")]

@@ -8,6 +8,7 @@ impl SharedProviderBudget {
         reason: BudgetUnavailableReason,
         admission: &RuntimeOperationAdmission,
     ) -> BudgetUnavailableReason {
+        let _changed = self.allocation.admission.notify_on_drop();
         let durable_binding = self.allocation.durability.as_ref();
         let durable_admission = match self.validated_durable_admission(admission) {
             Ok(admission) => admission,

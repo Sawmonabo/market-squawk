@@ -4,10 +4,10 @@ use market_squawk_analytics::{
     AnalyticsError, Annualization, DatedMoney, DatedStatisticalInput, DecimalMeasurement,
     DecimalPolicy, ExactDecimalScale, ExactDecimalUnit, ExactRate, FactorObservation,
     FundamentalPeriod, MeasurementUnit, MissingValuePolicy, MonetaryBasis, MonetaryValue,
-    PortfolioAllocation, Quantile, RatePoint, ReturnSeries, ScenarioShock, ShockComposition,
-    StatisticalDispersion, StatisticalInput, StatisticalLocation, StatisticalScale,
-    StatisticalUnit, VarianceConvention, WeightPolicy, WeightedStatisticalInput, alpha_beta,
-    correlation, cumulative_return, discrete_expected_shortfall, earnings_surprise,
+    PortfolioAllocation, PortfolioExposure, Quantile, RatePoint, ReturnSeries, ScenarioShock,
+    ShockComposition, StatisticalDispersion, StatisticalInput, StatisticalLocation,
+    StatisticalScale, StatisticalUnit, VarianceConvention, WeightPolicy, WeightedStatisticalInput,
+    alpha_beta, correlation, cumulative_return, discrete_expected_shortfall, earnings_surprise,
     factor_regression, free_cash_flow_yield, fundamental_growth, historical_var, information_ratio,
     macro_surprise, margin, maximum_drawdown, parametric_var, portfolio_attribution,
     portfolio_exposure, resolve_optional_inputs, scenario_impact, sharpe_ratio, simple_returns,
@@ -475,6 +475,56 @@ fn portfolio_attribution_and_composed_scenarios_remain_exact() -> TestResult {
         exposure.gross().money(),
         Money::new(Decimal::new(1_000, 0), usd)
     );
+    let signed = PortfolioExposure::from_value(monetary(
+        Money::new(Decimal::new(-600, 0), usd),
+        MonetaryBasis::Total,
+    ))
+    .checked_add(allocations[1].market_value())?;
+    assert_eq!(signed.net().money(), Money::new(Decimal::new(-200, 0), usd));
+    assert_eq!(
+        signed.gross().money(),
+        Money::new(Decimal::new(1_000, 0), usd)
+    );
+    assert_eq!(
+        signed.checked_add(monetary(
+            Money::new(Decimal::ONE, Currency::try_from("EUR")?),
+            MonetaryBasis::Total,
+        )),
+        Err(AnalyticsError::CurrencyMismatch)
+    );
+    assert_eq!(
+        signed.checked_add(monetary(
+            Money::new(Decimal::ONE, usd),
+            MonetaryBasis::PerShare
+        )),
+        Err(AnalyticsError::MeasurementUnitMismatch)
+    );
+    // Net remains representable, but absolute gross exposure must reject overflow.
+    let maximum = PortfolioExposure::from_value(monetary(
+        Money::new(Decimal::MAX, usd),
+        MonetaryBasis::Total,
+    ));
+    assert_eq!(
+        maximum.checked_add(monetary(
+            Money::new(-Decimal::ONE, usd),
+            MonetaryBasis::Total
+        )),
+        Err(AnalyticsError::DecimalArithmetic)
+    );
+    assert_eq!(
+        maximum.checked_add(monetary(
+            Money::new(Decimal::new(1, 1), usd),
+            MonetaryBasis::Total
+        )),
+        Err(AnalyticsError::DecimalArithmetic)
+    );
+    assert_eq!(
+        portfolio_exposure(&[]),
+        Err(AnalyticsError::InsufficientHistory {
+            required: 1,
+            actual: 0
+        })
+    );
 
     let shocks = [
         ScenarioShock::try_new("equity", rate(Decimal::new(-1, 1))?)?,
@@ -494,6 +544,59 @@ fn portfolio_attribution_and_composed_scenarios_remain_exact() -> TestResult {
     assert_eq!(
         ScenarioShock::try_new("equity", rate(Decimal::new(-15, 1))?),
         Err(AnalyticsError::ReturnBelowFloor)
+    );
+    let repeated_loss = [
+        ScenarioShock::try_new("equity", rate(Decimal::new(-75, 2))?)?,
+        ScenarioShock::try_new("equity", rate(Decimal::new(-75, 2))?)?,
+    ];
+    assert_eq!(
+        scenario_impact(&allocations, &repeated_loss, ShockComposition::Additive),
+        Err(AnalyticsError::ReturnBelowFloor)
+    );
+    let sequential = scenario_impact(&allocations, &repeated_loss, ShockComposition::Compounded)?;
+    assert_eq!(
+        sequential.total().money(),
+        Money::new(Decimal::new(-5625, 1), usd)
+    );
+    assert_eq!(
+        sequential.contributions()[1].amount().money().amount(),
+        Decimal::ZERO
+    );
+    // The additive floor applies to the final composed price, including offsetting shocks.
+    let mut floor = repeated_loss.to_vec();
+    floor.push(ScenarioShock::try_new("equity", rate(Decimal::new(5, 1))?)?);
+    assert_eq!(
+        scenario_impact(&allocations, &floor, ShockComposition::Additive)?
+            .total()
+            .money(),
+        Money::new(Decimal::new(-600, 0), usd)
+    );
+    let short = [PortfolioAllocation::try_new(
+        "equity",
+        monetary(Money::new(Decimal::new(-600, 0), usd), MonetaryBasis::Total),
+        rate(Decimal::ZERO)?,
+    )?];
+    assert_eq!(
+        scenario_impact(&short, &repeated_loss, ShockComposition::Additive),
+        Err(AnalyticsError::ReturnBelowFloor)
+    );
+    assert_eq!(
+        scenario_impact(&short, &floor, ShockComposition::Additive)?
+            .total()
+            .money(),
+        Money::new(Decimal::new(600, 0), usd)
+    );
+    // A positive terminal price too small to represent must not round to a total loss.
+    let unrepresentable = [
+        ScenarioShock::try_new(
+            "equity",
+            rate(Decimal::from_str_exact("-0.9999999999999999999999999999")?)?,
+        )?,
+        repeated_loss[0].clone(),
+    ];
+    assert_eq!(
+        scenario_impact(&allocations, &unrepresentable, ShockComposition::Compounded),
+        Err(AnalyticsError::DecimalArithmetic)
     );
     Ok(())
 }

@@ -5,6 +5,8 @@ use std::sync::{Mutex, MutexGuard};
 
 use zeroize::Zeroize as _;
 
+#[cfg(target_os = "macos")]
+use super::SecretInteractionPolicy;
 use super::{
     LocalSecretStoreError, SecretBackend, SecretDeletionDisposition, SecretGeneration,
     SecretInteractionCapability, SecretKey, SecretMutationDisposition, SecretMutationFailure,
@@ -53,6 +55,52 @@ impl OsKeyringSecretStore {
         }
         ::keyring::Entry::new(&self.service, reference.locator()).map_err(map_keyring_error)
     }
+
+    #[cfg(target_os = "macos")]
+    fn delete_referenced_entry(&self, reference: &SecretRef) -> Result<(), LocalSecretStoreError> {
+        use security_framework::item::{ItemClass, ItemSearchOptions};
+        use security_framework::os::macos::keychain::{SecKeychain, SecPreferencesDomain};
+
+        if reference.backend() != SecretBackend::AppleKeychain {
+            return Err(LocalSecretStoreError::InvalidReference);
+        }
+        let keychain = SecKeychain::default_for_domain(SecPreferencesDomain::User)
+            .map_err(map_macos_keychain_read_error)?;
+        let mut search = ItemSearchOptions::new();
+        search
+            .keychains(&[keychain])
+            .class(ItemClass::generic_password())
+            .service(&self.service)
+            .account(reference.locator());
+        search.delete().map_err(map_macos_keychain_mutation_error)
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    fn delete_referenced_entry(&self, reference: &SecretRef) -> Result<(), LocalSecretStoreError> {
+        self.referenced_entry(reference)?
+            .delete_credential()
+            .map_err(map_keyring_mutation_error)
+    }
+
+    fn controlled_operation<T>(
+        &self,
+        control: &SecretOperationControl,
+        operation: impl FnOnce() -> Result<T, LocalSecretStoreError>,
+    ) -> Result<T, LocalSecretStoreError> {
+        let capabilities = operation_capabilities(control);
+        control.preflight(capabilities)?;
+        let _lifecycle = self.lock_lifecycle()?;
+        control.preflight(capabilities)?;
+        with_platform_interaction_policy(control, operation)
+    }
+
+    fn legacy_operation<T>(
+        &self,
+        operation: impl FnOnce() -> Result<T, LocalSecretStoreError>,
+    ) -> Result<T, LocalSecretStoreError> {
+        let _lifecycle = self.lock_lifecycle()?;
+        with_platform_default_interaction(operation)
+    }
 }
 
 impl fmt::Debug for OsKeyringSecretStore {
@@ -67,16 +115,15 @@ impl SecretStore for OsKeyringSecretStore {
         control: &SecretOperationControl,
     ) -> Result<SecretStoreCapabilities, LocalSecretStoreError> {
         let capabilities = os_capabilities();
-        control.preflight(capabilities)?;
-        let _lifecycle = self.lock_lifecycle()?;
-        control.preflight(capabilities)?;
-        let probe = SecretKey::try_new("market-squawk", "capability-probe")?;
-        match self.entry(&probe)?.get_secret() {
-            Ok(mut existing) => existing.zeroize(),
-            Err(::keyring::Error::NoEntry) => {}
-            Err(error) => return Err(map_keyring_read_error(error)),
-        }
-        control.read_postflight()?;
+        self.controlled_operation(control, || {
+            let probe = SecretKey::try_new("market-squawk", "capability-probe")?;
+            match self.entry(&probe)?.get_secret() {
+                Ok(mut existing) => existing.zeroize(),
+                Err(::keyring::Error::NoEntry) => {}
+                Err(error) => return Err(map_keyring_read_error(error)),
+            }
+            control.read_postflight()
+        })?;
         Ok(capabilities)
     }
 
@@ -151,25 +198,24 @@ impl SecretStore for OsKeyringSecretStore {
         control: &SecretOperationControl,
     ) -> Result<SecretRef, LocalSecretStoreError> {
         let capabilities = os_capabilities();
-        control.preflight(capabilities)?;
-        let _lifecycle = self.lock_lifecycle()?;
-        control.preflight(capabilities)?;
-        let reference = SecretRef::from_key(key, capabilities.backend(), generation)?;
-        let entry = self.referenced_entry(&reference)?;
-        match entry.get_secret() {
-            Ok(mut existing) => {
-                existing.zeroize();
-                return Err(LocalSecretStoreError::Conflict);
+        self.controlled_operation(control, || {
+            let reference = SecretRef::from_key(key, capabilities.backend(), generation)?;
+            let entry = self.referenced_entry(&reference)?;
+            match entry.get_secret() {
+                Ok(mut existing) => {
+                    existing.zeroize();
+                    return Err(LocalSecretStoreError::Conflict);
+                }
+                Err(::keyring::Error::NoEntry) => {}
+                Err(error) => return Err(map_keyring_read_error(error)),
             }
-            Err(::keyring::Error::NoEntry) => {}
-            Err(error) => return Err(map_keyring_read_error(error)),
-        }
-        entry
-            .set_secret(value.expose_secret().as_bytes())
-            .map_err(map_keyring_mutation_error)?;
-        verify_written(&entry, &value)?;
-        control.mutation_postflight()?;
-        Ok(reference)
+            entry
+                .set_secret(value.expose_secret().as_bytes())
+                .map_err(map_keyring_mutation_error)?;
+            verify_written(&entry, &value)?;
+            control.mutation_postflight()?;
+            Ok(reference)
+        })
     }
 
     fn read(
@@ -177,17 +223,15 @@ impl SecretStore for OsKeyringSecretStore {
         reference: &SecretRef,
         control: &SecretOperationControl,
     ) -> Result<SecretValue, LocalSecretStoreError> {
-        let capabilities = os_capabilities();
-        control.preflight(capabilities)?;
-        let _lifecycle = self.lock_lifecycle()?;
-        control.preflight(capabilities)?;
-        let bytes = self
-            .referenced_entry(reference)?
-            .get_secret()
-            .map_err(map_keyring_read_error)?;
-        let value = decode_secret(bytes)?;
-        control.read_postflight()?;
-        Ok(value)
+        self.controlled_operation(control, || {
+            let bytes = self
+                .referenced_entry(reference)?
+                .get_secret()
+                .map_err(map_keyring_read_error)?;
+            let value = decode_secret(bytes)?;
+            control.read_postflight()?;
+            Ok(value)
+        })
     }
 
     fn replace(
@@ -199,36 +243,36 @@ impl SecretStore for OsKeyringSecretStore {
         control: &SecretOperationControl,
     ) -> Result<SecretRef, LocalSecretStoreError> {
         let capabilities = os_capabilities();
-        control.preflight(capabilities)?;
-        let _lifecycle = self.lock_lifecycle()?;
-        control.preflight(capabilities)?;
-        if current.backend() != capabilities.backend()
-            || candidate_generation <= current.generation()
-            || SecretRef::from_key(key, capabilities.backend(), current.generation())? != *current
-        {
-            return Err(LocalSecretStoreError::Conflict);
-        }
-        let mut current_bytes = self
-            .referenced_entry(current)?
-            .get_secret()
-            .map_err(map_keyring_read_error)?;
-        current_bytes.zeroize();
-        let candidate = SecretRef::from_key(key, capabilities.backend(), candidate_generation)?;
-        let entry = self.referenced_entry(&candidate)?;
-        match entry.get_secret() {
-            Ok(mut existing) => {
-                existing.zeroize();
+        self.controlled_operation(control, || {
+            if current.backend() != capabilities.backend()
+                || candidate_generation <= current.generation()
+                || SecretRef::from_key(key, capabilities.backend(), current.generation())?
+                    != *current
+            {
                 return Err(LocalSecretStoreError::Conflict);
             }
-            Err(::keyring::Error::NoEntry) => {}
-            Err(error) => return Err(map_keyring_read_error(error)),
-        }
-        entry
-            .set_secret(value.expose_secret().as_bytes())
-            .map_err(map_keyring_mutation_error)?;
-        verify_written(&entry, &value)?;
-        control.mutation_postflight()?;
-        Ok(candidate)
+            let mut current_bytes = self
+                .referenced_entry(current)?
+                .get_secret()
+                .map_err(map_keyring_read_error)?;
+            current_bytes.zeroize();
+            let candidate = SecretRef::from_key(key, capabilities.backend(), candidate_generation)?;
+            let entry = self.referenced_entry(&candidate)?;
+            match entry.get_secret() {
+                Ok(mut existing) => {
+                    existing.zeroize();
+                    return Err(LocalSecretStoreError::Conflict);
+                }
+                Err(::keyring::Error::NoEntry) => {}
+                Err(error) => return Err(map_keyring_read_error(error)),
+            }
+            entry
+                .set_secret(value.expose_secret().as_bytes())
+                .map_err(map_keyring_mutation_error)?;
+            verify_written(&entry, &value)?;
+            control.mutation_postflight()?;
+            Ok(candidate)
+        })
     }
 
     fn delete(
@@ -236,27 +280,25 @@ impl SecretStore for OsKeyringSecretStore {
         reference: &SecretRef,
         control: &SecretOperationControl,
     ) -> Result<(), LocalSecretStoreError> {
-        let capabilities = os_capabilities();
-        control.preflight(capabilities)?;
-        let _lifecycle = self.lock_lifecycle()?;
-        control.preflight(capabilities)?;
-        self.referenced_entry(reference)?
-            .delete_credential()
-            .map_err(map_keyring_mutation_error)?;
-        control.mutation_postflight()
+        self.controlled_operation(control, || {
+            self.delete_referenced_entry(reference)?;
+            control.mutation_postflight()
+        })
     }
 
     fn store(&self, key: &SecretKey, value: SecretValue) -> Result<(), LocalSecretStoreError> {
-        let _lifecycle = self.lock_lifecycle()?;
-        self.entry(key)?
-            .set_secret(value.expose_secret().as_bytes())
-            .map_err(map_keyring_error)
+        self.legacy_operation(|| {
+            self.entry(key)?
+                .set_secret(value.expose_secret().as_bytes())
+                .map_err(map_keyring_error)
+        })
     }
 
     fn load(&self, key: &SecretKey) -> Result<SecretValue, LocalSecretStoreError> {
-        let _lifecycle = self.lock_lifecycle()?;
-        let bytes = self.entry(key)?.get_secret().map_err(map_keyring_error)?;
-        decode_secret(bytes)
+        self.legacy_operation(|| {
+            let bytes = self.entry(key)?.get_secret().map_err(map_keyring_error)?;
+            decode_secret(bytes)
+        })
     }
 }
 
@@ -265,6 +307,10 @@ fn map_keyring_error(error: ::keyring::Error) -> LocalSecretStoreError {
 }
 
 fn map_keyring_read_error(error: ::keyring::Error) -> LocalSecretStoreError {
+    #[cfg(target_os = "macos")]
+    if macos_interaction_required(&error) {
+        return LocalSecretStoreError::InteractionRequired;
+    }
     match error {
         ::keyring::Error::NoEntry => LocalSecretStoreError::NotFound,
         ::keyring::Error::NoStorageAccess(_) => LocalSecretStoreError::Locked,
@@ -288,6 +334,10 @@ fn map_keyring_read_error(error: ::keyring::Error) -> LocalSecretStoreError {
 }
 
 fn map_keyring_mutation_error(error: ::keyring::Error) -> LocalSecretStoreError {
+    #[cfg(target_os = "macos")]
+    if macos_interaction_required(&error) {
+        return LocalSecretStoreError::InteractionRequired;
+    }
     match error {
         ::keyring::Error::NoEntry => LocalSecretStoreError::NotFound,
         ::keyring::Error::NoStorageAccess(_) => LocalSecretStoreError::Locked,
@@ -336,7 +386,28 @@ fn verify_written(
 }
 
 const fn os_capabilities() -> SecretStoreCapabilities {
-    SecretStoreCapabilities::new(os_backend(), SecretInteractionCapability::PlatformManaged)
+    let interaction = if cfg!(target_os = "windows") {
+        SecretInteractionCapability::Never
+    } else {
+        SecretInteractionCapability::PlatformManaged
+    };
+    SecretStoreCapabilities::new(os_backend(), interaction)
+}
+
+const fn operation_capabilities(control: &SecretOperationControl) -> SecretStoreCapabilities {
+    #[cfg(target_os = "macos")]
+    if matches!(
+        control.interaction_policy(),
+        SecretInteractionPolicy::Forbid
+    ) {
+        return SecretStoreCapabilities::new(
+            SecretBackend::AppleKeychain,
+            SecretInteractionCapability::Never,
+        );
+    }
+
+    let _ = control;
+    os_capabilities()
 }
 
 const fn os_backend() -> SecretBackend {
@@ -346,5 +417,95 @@ const fn os_backend() -> SecretBackend {
         SecretBackend::WindowsCredentialManager
     } else {
         SecretBackend::SecretService
+    }
+}
+
+#[cfg(target_os = "macos")]
+static KEYCHAIN_INTERACTION: Mutex<()> = Mutex::new(());
+
+#[cfg(target_os = "macos")]
+fn with_platform_interaction_policy<T>(
+    control: &SecretOperationControl,
+    operation: impl FnOnce() -> Result<T, LocalSecretStoreError>,
+) -> Result<T, LocalSecretStoreError> {
+    use security_framework::os::macos::keychain::SecKeychain;
+
+    let _serialization = KEYCHAIN_INTERACTION
+        .lock()
+        .map_err(|_| LocalSecretStoreError::WriterUnavailable)?;
+    control.preflight(operation_capabilities(control))?;
+    let _interaction_guard = if matches!(
+        control.interaction_policy(),
+        SecretInteractionPolicy::Forbid
+    ) {
+        Some(
+            SecKeychain::disable_user_interaction()
+                .map_err(|_| LocalSecretStoreError::ProviderUnavailable)?,
+        )
+    } else {
+        None
+    };
+    operation()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn with_platform_interaction_policy<T>(
+    _control: &SecretOperationControl,
+    operation: impl FnOnce() -> Result<T, LocalSecretStoreError>,
+) -> Result<T, LocalSecretStoreError> {
+    operation()
+}
+
+#[cfg(target_os = "macos")]
+fn with_platform_default_interaction<T>(
+    operation: impl FnOnce() -> Result<T, LocalSecretStoreError>,
+) -> Result<T, LocalSecretStoreError> {
+    let _serialization = KEYCHAIN_INTERACTION
+        .lock()
+        .map_err(|_| LocalSecretStoreError::WriterUnavailable)?;
+    operation()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn with_platform_default_interaction<T>(
+    operation: impl FnOnce() -> Result<T, LocalSecretStoreError>,
+) -> Result<T, LocalSecretStoreError> {
+    operation()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_interaction_required(error: &::keyring::Error) -> bool {
+    const ERR_SEC_INTERACTION_NOT_ALLOWED: i32 = -25_308;
+
+    let platform_error = match error {
+        ::keyring::Error::PlatformFailure(error) | ::keyring::Error::NoStorageAccess(error) => {
+            error
+        }
+        _ => return false,
+    };
+    platform_error
+        .downcast_ref::<security_framework::base::Error>()
+        .is_some_and(|error| error.code() == ERR_SEC_INTERACTION_NOT_ALLOWED)
+}
+
+#[cfg(target_os = "macos")]
+fn map_macos_keychain_read_error(error: security_framework::base::Error) -> LocalSecretStoreError {
+    match error.code() {
+        -25_300 => LocalSecretStoreError::NotFound,
+        -25_308 => LocalSecretStoreError::InteractionRequired,
+        -25_291 | -25_292 | -25_294 | -25_295 => LocalSecretStoreError::Locked,
+        _ => LocalSecretStoreError::ProviderUnavailable,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn map_macos_keychain_mutation_error(
+    error: security_framework::base::Error,
+) -> LocalSecretStoreError {
+    match error.code() {
+        -25_300 => LocalSecretStoreError::NotFound,
+        -25_308 => LocalSecretStoreError::InteractionRequired,
+        -25_291 | -25_292 | -25_294 | -25_295 => LocalSecretStoreError::Locked,
+        _ => LocalSecretStoreError::IndeterminateCompletion,
     }
 }

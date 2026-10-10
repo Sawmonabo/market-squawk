@@ -21,7 +21,7 @@ use market_squawk_sources::{
 use static_assertions::{assert_impl_all, assert_not_impl_any};
 
 use crate::common::{
-    TestResult, direct_metadata, direct_metadata_with_instruments, exact_evidence,
+    TestResult, acquire_budget, direct_metadata, direct_metadata_with_instruments, exact_evidence,
     next_timestamp_after, now_timestamp, source_identifier,
 };
 
@@ -515,17 +515,17 @@ fn two_sources_with_one_scope_share_concurrency_and_cooldown() -> TestResult {
     )?;
     let first_budget = take_live_budget(&mut registry, &first, "shared-budget-first")?;
     let second_budget = take_live_budget(&mut registry, &second, "shared-budget-second")?;
-    let permit = match first_budget.try_acquire() {
+    let permit = match acquire_budget(&first_budget) {
         BudgetDecision::Ready(permit) => permit,
         other => return Err(format!("unexpected first budget decision: {other:?}").into()),
     };
     assert!(matches!(
-        second_budget.try_acquire(),
+        acquire_budget(&second_budget),
         BudgetDecision::Unavailable(_)
     ));
     permit.release();
     assert!(matches!(
-        second_budget.try_acquire(),
+        acquire_budget(&second_budget),
         BudgetDecision::Ready(_)
     ));
     Ok(())
@@ -573,19 +573,19 @@ fn process_coordinator_interns_registry_and_restored_budget_allocations() -> Tes
     let restored_budget = take_live_budget(&mut restored, &restored_source, "interner-restored")?;
     assert!(first_budget.shares_allocation_with(&restored_budget));
 
-    let permit = match first_budget.try_acquire() {
+    let permit = match acquire_budget(&first_budget) {
         BudgetDecision::Ready(permit) => permit,
         other => return Err(format!("unexpected coordinated acquire: {other:?}").into()),
     };
     assert!(matches!(
-        second_budget.try_acquire(),
+        acquire_budget(&second_budget),
         BudgetDecision::Unavailable(
             market_squawk_sources::BudgetUnavailableReason::ConcurrencyExhausted
         )
     ));
     permit.release();
     assert!(matches!(
-        second_budget.try_acquire(),
+        acquire_budget(&second_budget),
         BudgetDecision::Ready(_)
     ));
 
@@ -596,11 +596,11 @@ fn process_coordinator_interns_registry_and_restored_budget_allocations() -> Tes
         other => return Err(format!("unexpected coordinated cooldown: {other:?}").into()),
     };
     assert!(matches!(
-        first_budget.try_acquire(),
+        acquire_budget(&first_budget),
         BudgetDecision::WaitUntil(deadline) if deadline == cooldown
     ));
     assert!(matches!(
-        restored_budget.try_acquire(),
+        acquire_budget(&restored_budget),
         BudgetDecision::WaitUntil(deadline) if deadline == cooldown
     ));
     Ok(())
@@ -641,12 +641,12 @@ fn account_aliases_and_locator_metadata_cannot_multiply_one_credential_budget() 
     let second_budget = take_live_budget(&mut second, &second_source, "account-alias-second")?;
     assert!(first_budget.shares_allocation_with(&second_budget));
 
-    let permit = match first_budget.try_acquire() {
+    let permit = match acquire_budget(&first_budget) {
         BudgetDecision::Ready(permit) => permit,
         other => return Err(format!("unexpected account acquire: {other:?}").into()),
     };
     assert!(matches!(
-        second_budget.try_acquire(),
+        acquire_budget(&second_budget),
         BudgetDecision::Unavailable(
             market_squawk_sources::BudgetUnavailableReason::ConcurrencyExhausted
         )
@@ -738,11 +738,11 @@ fn public_bridge_declaration_fails_without_merging_existing_allocations() -> Tes
         Err(RegistryError::BudgetCoordinator)
     ));
     assert!(!first_budget.shares_allocation_with(&second_budget));
-    let first_permit = match first_budget.try_acquire() {
+    let first_permit = match acquire_budget(&first_budget) {
         BudgetDecision::Ready(permit) => permit,
         other => return Err(format!("first bridge allocation changed: {other:?}").into()),
     };
-    let second_permit = match second_budget.try_acquire() {
+    let second_permit = match acquire_budget(&second_budget) {
         BudgetDecision::Ready(permit) => permit,
         other => return Err(format!("second bridge allocation changed: {other:?}").into()),
     };
@@ -1015,15 +1015,23 @@ fn process_coordinator_rejects_conflicting_restored_policy() -> TestResult {
 }
 
 #[test]
-fn coordinated_budget_proof_controls_health_and_queued_authority() -> TestResult {
-    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
-    let registered = registry.register(
-        direct_metadata_for_provider(
-            "budget-source",
-            "budget-revision",
-            "budget-authority-test-provider",
-            "wss://budget-authority.example.test/feed",
-        )?,
+fn received_data_survives_request_capacity_changes() -> TestResult {
+    let metadata = remote_metadata_alias(
+        "budget-source",
+        "budget-revision",
+        "budget-authority-test-provider",
+        &["wss://budget-authority.example.test/feed"],
+        None,
+        4,
+    )?;
+    let [instrument] = metadata.coverage().instruments().instruments() else {
+        return Err("budget fixture requires one covered instrument".into());
+    };
+    let instrument = *instrument;
+    let native_routes = [(instrument, "BTC-USD")];
+    let (mut registry, registered) = crate::common::register_fixture_source(
+        metadata,
+        &native_routes,
         Timestamp::from_unix_nanos(1),
     )?;
     let session = registry.begin_session(
@@ -1037,25 +1045,97 @@ fn coordinated_budget_proof_controls_health_and_queued_authority() -> TestResult
     capture_control.mark_healthy()?;
     let mut reporter = registry.take_current_health_reporter(&session)?;
     let budget = session.budget().ok_or("remote session budget missing")?;
-    let first_health_at = now_timestamp()?;
-    let qualified_health_at = next_timestamp_after(first_health_at)?;
-    let cooling_health_at = next_timestamp_after(qualified_health_at)?;
-    let disabled_health_at = next_timestamp_after(cooling_health_at)?;
+    let snapshot_with_budget = |at: Timestamp, budget_health: BudgetHealth| {
+        let healthy = healthy_snapshot(&session, at.unix_nanos())?;
+        Ok::<_, Box<dyn std::error::Error>>(SourceHealthSnapshot::try_new(
+            &session,
+            at,
+            healthy.connection(),
+            Some(at),
+            Some(at),
+            Some(at),
+            FreshnessPolicy::try_new(
+                5_000_000_000,
+                1_000_000_000,
+                2_000_000_000,
+                1_000_000_000,
+                100_000_000,
+            )?,
+            healthy.stream_integrity(),
+            healthy.capture_integrity(),
+            healthy.authorization().clone(),
+            healthy.coverage().clone(),
+            budget_health,
+            None,
+            Vec::new(),
+        )?)
+    };
 
-    let permit = match budget.try_acquire() {
+    let permit = match acquire_budget(budget) {
         BudgetDecision::Ready(permit) => permit,
         other => return Err(format!("unexpected budget decision: {other:?}").into()),
     };
+    assert!(matches!(
+        acquire_budget(budget),
+        BudgetDecision::Unavailable(
+            market_squawk_sources::BudgetUnavailableReason::ConcurrencyExhausted
+        )
+    ));
+    let first_health_at = now_timestamp()?;
     registry.record_health(
         &session,
         reporter.report(healthy_snapshot(&session, first_health_at.unix_nanos())?)?,
     )?;
-    assert!(matches!(
-        registry.validate_current_authority(&session),
-        Err(RegistryError::HealthNotQualified)
-    ));
-    permit.release();
+    let first = registry
+        .validate_current_authority(&session)?
+        .try_current_lease()?;
+    first.validate_at(first_health_at)?;
 
+    let active_request = permit.active_lease();
+    let active_health_at = next_timestamp_after(first_health_at)?;
+    registry.record_health(
+        &session,
+        reporter.report_with_active_request(
+            healthy_snapshot(&session, active_health_at.unix_nanos())?,
+            &active_request,
+        )?,
+    )?;
+    let released_owner = registry
+        .validate_current_authority(&session)?
+        .try_current_lease()?;
+    released_owner.validate_at(active_health_at)?;
+    permit.release();
+    assert_eq!(
+        released_owner.validate_at(active_health_at),
+        Err(RegistryError::HealthNotQualified)
+    );
+    assert!(matches!(
+        reporter.report_with_active_request(
+            healthy_snapshot(&session, active_health_at.unix_nanos())?,
+            &active_request,
+        ),
+        Err(RegistryError::BudgetAuthorityMismatch)
+    ));
+
+    // Established owners release concurrency while retaining their independent lifetimes.
+    let mut dropped_transport = match acquire_budget(budget) {
+        BudgetDecision::Ready(permit) => permit,
+        other => return Err(format!("transport admission failed: {other:?}").into()),
+    };
+    dropped_transport
+        .complete_transport_handshake()
+        .map_err(|reason| format!("transport handshake failed: {reason:?}"))?;
+    let dropped_request = dropped_transport.active_lease();
+    let mut retained_transport = match acquire_budget(budget) {
+        BudgetDecision::Ready(permit) => permit,
+        other => return Err(format!("second transport admission failed: {other:?}").into()),
+    };
+    retained_transport
+        .complete_transport_handshake()
+        .map_err(|reason| format!("second transport handshake failed: {reason:?}"))?;
+    let retained_request = retained_transport.active_lease();
+
+    let qualified_health_at = next_timestamp_after(active_health_at)?;
     registry.record_health(
         &session,
         reporter.report(healthy_snapshot(
@@ -1063,10 +1143,58 @@ fn coordinated_budget_proof_controls_health_and_queued_authority() -> TestResult
             qualified_health_at.unix_nanos(),
         )?)?,
     )?;
-    let queued = registry
+    let authority = registry.validate_current_authority(&session)?;
+    let queued = authority.try_current_lease()?;
+    let identity = authority.selected_provider_identity(
+        &market_squawk_domain::VenueId::try_from("coinbase")?,
+        instrument,
+    )?;
+    let committed = queued.commit_provider_observation(identity, qualified_health_at)?;
+    let dropped_health_at = next_timestamp_after(qualified_health_at)?;
+    registry.record_health(
+        &session,
+        reporter.report_with_active_request(
+            healthy_snapshot(&session, dropped_health_at.unix_nanos())?,
+            &dropped_request,
+        )?,
+    )?;
+    let dropped_owner = registry
         .validate_current_authority(&session)?
         .try_current_lease()?;
-    assert!(queued.validate_at(qualified_health_at).is_ok());
+    let retained_health_at = next_timestamp_after(dropped_health_at)?;
+    registry.record_health(
+        &session,
+        reporter.report_with_active_request(
+            healthy_snapshot(&session, retained_health_at.unix_nanos())?,
+            &retained_request,
+        )?,
+    )?;
+    let retained_owner = registry
+        .validate_current_authority(&session)?
+        .try_current_lease()?;
+
+    // The fourth request consumes the window; releasing its slot does not refund that charge.
+    let competing = match acquire_budget(budget) {
+        BudgetDecision::Ready(permit) => permit,
+        other => return Err(format!("competing admission failed: {other:?}").into()),
+    };
+    assert!(matches!(
+        acquire_budget(budget),
+        BudgetDecision::WaitUntil(_)
+    ));
+    queued.validate_at(qualified_health_at)?;
+    dropped_owner.validate_at(dropped_health_at)?;
+    retained_owner.validate_at(retained_health_at)?;
+    competing.release();
+    assert!(matches!(
+        acquire_budget(budget),
+        BudgetDecision::WaitUntil(_)
+    ));
+    queued.validate_at(qualified_health_at)?;
+    committed.validate_publication()?;
+    registry
+        .validate_current_authority(&session)?
+        .try_current_lease()?;
 
     assert!(matches!(
         budget.apply_retry_after(RetryAfter::Delay(
@@ -1074,28 +1202,119 @@ fn coordinated_budget_proof_controls_health_and_queued_authority() -> TestResult
         )),
         BudgetDecision::WaitUntil(_)
     ));
+    assert!(matches!(
+        acquire_budget(budget),
+        BudgetDecision::WaitUntil(_)
+    ));
+    queued.validate_at(qualified_health_at)?;
+    dropped_owner.validate_at(dropped_health_at)?;
+    retained_owner.validate_at(retained_health_at)?;
+    committed.validate_publication()?;
+    let cooling_health_at = next_timestamp_after(retained_health_at)?;
+    let cooling = BudgetHealth::CoolingDown {
+        until: cooling_health_at.checked_add_nanos(60_000_000_000)?,
+    };
+    registry.record_health(
+        &session,
+        reporter.report(snapshot_with_budget(cooling_health_at, cooling)?)?,
+    )?;
+    registry
+        .validate_current_authority(&session)?
+        .try_current_lease()?;
+    let owner_cooling_at = next_timestamp_after(cooling_health_at)?;
+    registry.record_health(
+        &session,
+        reporter.report_with_active_request(
+            snapshot_with_budget(owner_cooling_at, cooling)?,
+            &retained_request,
+        )?,
+    )?;
+    registry
+        .validate_current_authority(&session)?
+        .try_current_lease()?;
+
+    assert!(matches!(budget.disable(), BudgetDecision::Unavailable(_)));
+    assert!(matches!(
+        acquire_budget(budget),
+        BudgetDecision::Unavailable(_)
+    ));
+    let disabled_health_at = next_timestamp_after(owner_cooling_at)?;
+    registry.record_health(
+        &session,
+        reporter.report(snapshot_with_budget(
+            disabled_health_at,
+            BudgetHealth::Unavailable,
+        )?)?,
+    )?;
+    registry
+        .validate_current_authority(&session)?
+        .try_current_lease()?;
+    let owner_disabled_at = next_timestamp_after(disabled_health_at)?;
+    registry.record_health(
+        &session,
+        reporter.report_with_active_request(
+            snapshot_with_budget(owner_disabled_at, BudgetHealth::Unavailable)?,
+            &retained_request,
+        )?,
+    )?;
+    registry
+        .validate_current_authority(&session)?
+        .try_current_lease()?;
+    queued.validate_at(qualified_health_at)?;
+    dropped_owner.validate_at(dropped_health_at)?;
+    retained_owner.validate_at(retained_health_at)?;
+    committed.validate_publication()?;
+
+    let (mut foreign_registry, foreign_registered) = crate::common::register_fixture_source(
+        direct_metadata_for_provider(
+            "foreign-budget-source",
+            "foreign-budget-revision",
+            "foreign-budget-provider",
+            "wss://foreign-budget.example.test/feed",
+        )?,
+        &native_routes,
+        Timestamp::from_unix_nanos(1),
+    )?;
+    let foreign_budget = take_live_budget(
+        &mut foreign_registry,
+        &foreign_registered,
+        "foreign-budget-session",
+    )?;
+    let foreign_permit = match acquire_budget(&foreign_budget) {
+        BudgetDecision::Ready(permit) => permit,
+        other => return Err(format!("foreign admission failed: {other:?}").into()),
+    };
+    assert!(matches!(
+        reporter.report_with_active_request(
+            healthy_snapshot(&session, disabled_health_at.unix_nanos())?,
+            &foreign_permit.active_lease(),
+        ),
+        Err(RegistryError::BudgetAuthorityMismatch)
+    ));
+    foreign_permit.release();
+
+    drop(dropped_transport);
+    assert_eq!(
+        dropped_owner.validate_at(dropped_health_at),
+        Err(RegistryError::HealthNotQualified)
+    );
+    queued.validate_at(qualified_health_at)?;
+    retained_owner.validate_at(retained_health_at)?;
+    committed.validate_publication()?;
+    registry.end_session(&session, now_timestamp()?)?;
     assert_eq!(
         queued.validate_at(qualified_health_at),
         Err(RegistryError::HealthNotQualified)
     );
-    registry.record_health(
-        &session,
-        reporter.report(healthy_snapshot(&session, cooling_health_at.unix_nanos())?)?,
-    )?;
-    assert!(matches!(
-        registry.validate_current_authority(&session),
+    assert_eq!(
+        retained_owner.validate_at(retained_health_at),
         Err(RegistryError::HealthNotQualified)
-    ));
-
-    assert!(matches!(budget.disable(), BudgetDecision::Unavailable(_)));
-    registry.record_health(
-        &session,
-        reporter.report(healthy_snapshot(&session, disabled_health_at.unix_nanos())?)?,
-    )?;
-    assert!(matches!(
-        registry.validate_current_authority(&session),
+    );
+    assert_eq!(
+        committed.validate_publication(),
         Err(RegistryError::HealthNotQualified)
-    ));
+    );
+    drop(retained_transport);
     Ok(())
 }
 

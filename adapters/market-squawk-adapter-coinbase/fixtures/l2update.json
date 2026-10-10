@@ -1,1 +1,1 @@
-{"type":"l2update","product_id":"BTC-USD","time":"2026-07-20T12:00:00.123456Z","changes":[["buy","100.10","1.5000"],["sell","100.20","0"]]}
+{"channel":"l2_data","client_id":"","timestamp":"2026-08-08T12:00:00.223456Z","sequence_num":1,"events":[{"type":"update","product_id":"BTC-USD","updates":[{"side":"bid","event_time":"2026-08-08T12:00:00.223456Z","price_level":"100.10","new_quantity":"1.5000"},{"side":"offer","event_time":"2026-08-08T12:00:00.223456Z","price_level":"100.20","new_quantity":"0"}]}]}

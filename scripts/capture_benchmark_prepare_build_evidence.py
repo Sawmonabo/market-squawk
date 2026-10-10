@@ -83,6 +83,9 @@ BUILD_SUPPORT_TREE_RELATIVE = (
     Path("build_support/reader.rs"),
 )
 BUILD_SUPPORT_TREE_DOMAIN = b"market-squawk/capture-build-support-tree/v1\0"
+MEASURED_SOURCE_CLOSURE_DOMAIN = (
+    b"market-squawk/capture-measured-source-closure/v1\0"
+)
 BASELINE_LOCK_RELATIVE = Path(
     "docs/reports/performance/2026-07-17-q2-a4-standard-channel-baseline.lock.json"
 )
@@ -95,6 +98,18 @@ BACKEND_SOURCE_RELATIVE = {
 }
 PINNED_RUSTC_RELEASE = "1.97.1"
 PINNED_RUSTC_COMMIT = "8bab26f4f68e0e26f0bb7960be334d5b520ea452"
+VERIFICATION_BINDING_FIELDS = {
+    "host_gate_shell_sha256",
+    "host_gate_python_sha256",
+    "host_gate_process_sha256",
+    "host_gate_evidence_io_sha256",
+    "host_gate_cli_sha256",
+    "host_gate_schema_sha256",
+    "host_gate_execution_sha256",
+    "host_gate_observation_sha256",
+    "host_gate_measured_sha256",
+    "build_evidence_python_sha256",
+}
 
 
 def strict_json(value: bytes) -> dict[str, Any]:
@@ -274,7 +289,8 @@ def sanitized_build_environment(
 
 
 def validate_current_bindings(bindings: dict[str, Any], current: dict[str, Any]) -> None:
-    if set(current) != {
+    expected = {
+        "measured_source_closure_sha256",
         "source_inventory_sha256",
         "cargo_lock_sha256",
         "workspace_manifest_sha256",
@@ -304,7 +320,11 @@ def validate_current_bindings(bindings: dict[str, Any], current: dict[str, Any])
         "criterion_sha256",
         "observer_sha256",
         "immutable_module_sha256",
-    } or any(bindings.get(field) != value for field, value in current.items()):
+    }
+    if set(current) != expected or any(
+        bindings.get(field) != current[field]
+        for field in expected - VERIFICATION_BINDING_FIELDS
+    ):
         raise GateError("embedded build binding differs from the current clean tree")
 
 
@@ -570,12 +590,30 @@ def build_support_tree_hash(repository: Path) -> str:
     return digest.hexdigest()
 
 
+def measured_source_closure_hash(components: list[tuple[str, str]]) -> str:
+    components.sort(key=lambda component: component[0])
+    if any(
+        left[0] == right[0]
+        for left, right in zip(components, components[1:], strict=False)
+    ):
+        raise GateError("measured source closure contains a duplicate identity")
+    digest = hashlib.sha256(MEASURED_SOURCE_CLOSURE_DOMAIN)
+    for identity, value in components:
+        for component in (identity.encode("utf-8"), value.encode("utf-8")):
+            digest.update(len(component).to_bytes(8, "big"))
+            digest.update(component)
+    return digest.hexdigest()
+
+
 def recompute_current_bindings(
     repository: Path,
     cargo_sha256: str,
     git_sha256: str,
     rustc_sha256: str,
     evidence_backend: str = "standard",
+    baseline_lock_sha256: str | None = None,
+    baseline_manifest_sha256: str | None = None,
+    baseline_measured_code_head: str | None = None,
 ) -> dict[str, Any]:
     platform = rust_files(repository / "crates/market-squawk-platform/src")
     domain = rust_files(repository / "crates/market-squawk-domain/src")
@@ -592,17 +630,112 @@ def recompute_current_bindings(
         for name, filename in IMMUTABLE_MODULES.items()
     }
     backend_binding = benchmark_backend_binding(repository, evidence_backend)
+    cargo_lock_sha256 = current_file_hash(repository / "Cargo.lock", repository)
+    workspace_manifest_sha256 = current_file_hash(repository / "Cargo.toml", repository)
+    rust_toolchain_sha256 = current_file_hash(
+        repository / "rust-toolchain.toml", repository
+    )
+    package_manifest_sha256 = current_file_hash(
+        repository / "crates/market-squawk-platform/Cargo.toml", repository
+    )
+    domain_manifest_sha256 = current_file_hash(
+        repository / "crates/market-squawk-domain/Cargo.toml", repository
+    )
+    build_script_sha256 = current_file_hash(
+        repository / "crates/market-squawk-platform/build.rs", repository
+    )
+    build_support_sha256 = build_support_tree_hash(repository)
+    platform_source_sha256 = tree_hash(repository, platform)
+    domain_source_sha256 = tree_hash(repository, domain)
+    source_inventory_sha256 = inventory.hexdigest()
+    entrypoint_sha256 = current_file_hash(
+        repository / "crates/market-squawk-platform/benches/capture_admission.rs",
+        repository,
+    )
+    criterion_sha256 = current_file_hash(
+        repository / "crates/market-squawk-platform/benches/capture_admission_criterion.rs",
+        repository,
+    )
+    observer_sha256 = current_file_hash(
+        repository
+        / "crates/market-squawk-platform/src/capture/benchmark_support/observer.rs",
+        repository,
+    )
+    backend_sources = {
+        identity: current_file_hash(
+            repository / "crates/market-squawk-platform" / relative, repository
+        )
+        for identity, relative in BACKEND_SOURCE_RELATIVE.items()
+    }
+    if (
+        backend_sources[evidence_backend]
+        != backend_binding["selected_backend_source_sha256"]
+    ):
+        raise GateError("capture benchmark backend source changed during closure binding")
+    measured_source_components = [
+        ("Cargo.lock", cargo_lock_sha256),
+        ("Cargo.toml", workspace_manifest_sha256),
+        ("rust-toolchain.toml", rust_toolchain_sha256),
+        ("crates/market-squawk-platform/Cargo.toml", package_manifest_sha256),
+        ("crates/market-squawk-domain/Cargo.toml", domain_manifest_sha256),
+        ("crates/market-squawk-platform/build.rs", build_script_sha256),
+        (
+            "crates/market-squawk-platform/build-support-tree-v1",
+            build_support_sha256,
+        ),
+        ("crates/market-squawk-platform/src/**/*.rs", platform_source_sha256),
+        ("crates/market-squawk-domain/src/**/*.rs", domain_source_sha256),
+        ("rust-source-inventory", source_inventory_sha256),
+        (
+            "crates/market-squawk-platform/benches/capture_admission.rs",
+            entrypoint_sha256,
+        ),
+        (
+            "crates/market-squawk-platform/benches/capture_admission/backend.rs",
+            backend_binding["backend_dispatcher_sha256"],
+        ),
+        (
+            "crates/market-squawk-platform/benches/capture_admission/backend/standard.rs",
+            backend_sources["standard"],
+        ),
+        (
+            "crates/market-squawk-platform/benches/capture_admission/backend/candidate.rs",
+            backend_sources["candidate"],
+        ),
+        (
+            "crates/market-squawk-platform/benches/capture_admission_criterion.rs",
+            criterion_sha256,
+        ),
+        (
+            "crates/market-squawk-platform/src/capture/benchmark_support/observer.rs",
+            observer_sha256,
+        ),
+        ("capture-benchmark-backend", evidence_backend),
+    ]
+    measured_source_components.extend(
+        (
+            "crates/market-squawk-platform/benches/capture_admission/" + filename,
+            immutable[name],
+        )
+        for name, filename in IMMUTABLE_MODULES.items()
+    )
+    for name, value in (
+        ("baseline-lock-sha256", baseline_lock_sha256),
+        ("baseline-manifest-sha256", baseline_manifest_sha256),
+        ("baseline-measured-code-head", baseline_measured_code_head),
+    ):
+        if value is not None:
+            measured_source_components.append((name, value))
     return {
-        "source_inventory_sha256": inventory.hexdigest(),
-        "cargo_lock_sha256": current_file_hash(repository / "Cargo.lock", repository),
-        "workspace_manifest_sha256": current_file_hash(repository / "Cargo.toml", repository),
-        "package_manifest_sha256": current_file_hash(
-            repository / "crates/market-squawk-platform/Cargo.toml", repository
+        "measured_source_closure_sha256": measured_source_closure_hash(
+            measured_source_components
         ),
-        "build_script_sha256": current_file_hash(
-            repository / "crates/market-squawk-platform/build.rs", repository
-        ),
-        "build_support_sha256": build_support_tree_hash(repository),
+        "source_inventory_sha256": source_inventory_sha256,
+        "cargo_lock_sha256": cargo_lock_sha256,
+        "workspace_manifest_sha256": workspace_manifest_sha256,
+        "package_manifest_sha256": package_manifest_sha256,
+        "build_script_sha256": build_script_sha256,
+        "build_support_sha256": build_support_sha256,
         "cargo_executable_sha256": cargo_sha256,
         "git_executable_sha256": git_sha256,
         "rustc_executable_sha256": rustc_sha256,
@@ -636,22 +769,12 @@ def recompute_current_bindings(
         "build_evidence_python_sha256": current_file_hash(
             repository / "scripts/capture_benchmark_prepare_build_evidence.py", repository
         ),
-        "platform_source_sha256": tree_hash(repository, platform),
-        "domain_source_sha256": tree_hash(repository, domain),
-        "entrypoint_sha256": current_file_hash(
-            repository / "crates/market-squawk-platform/benches/capture_admission.rs",
-            repository,
-        ),
+        "platform_source_sha256": platform_source_sha256,
+        "domain_source_sha256": domain_source_sha256,
+        "entrypoint_sha256": entrypoint_sha256,
         **backend_binding,
-        "criterion_sha256": current_file_hash(
-            repository / "crates/market-squawk-platform/benches/capture_admission_criterion.rs",
-            repository,
-        ),
-        "observer_sha256": current_file_hash(
-            repository
-            / "crates/market-squawk-platform/src/capture/benchmark_support/observer.rs",
-            repository,
-        ),
+        "criterion_sha256": criterion_sha256,
+        "observer_sha256": observer_sha256,
         "immutable_module_sha256": immutable,
     }
 
@@ -773,11 +896,11 @@ def runner_bindings(executable: Path) -> dict[str, Any]:
         "queue_transport",
         "queue_private_storage_accounting",
         "build_profile",
-        "measured_code_head",
         "clean_build_enforced",
         "build_environment_policy",
         "build_command_sha256",
         "build_environment_sha256",
+        "measured_source_closure_sha256",
         "source_inventory_sha256",
         "cargo_lock_sha256",
         "workspace_manifest_sha256",
@@ -787,16 +910,6 @@ def runner_bindings(executable: Path) -> dict[str, Any]:
         "cargo_executable_sha256",
         "git_executable_sha256",
         "rustc_executable_sha256",
-        "host_gate_shell_sha256",
-        "host_gate_python_sha256",
-        "host_gate_process_sha256",
-        "host_gate_evidence_io_sha256",
-        "host_gate_cli_sha256",
-        "host_gate_schema_sha256",
-        "host_gate_execution_sha256",
-        "host_gate_observation_sha256",
-        "host_gate_measured_sha256",
-        "build_evidence_python_sha256",
         "platform_source_sha256",
         "domain_source_sha256",
         "entrypoint_sha256",
@@ -829,7 +942,6 @@ def runner_bindings(executable: Path) -> dict[str, Any]:
             "candidate": ("candidate_fixed_ring", "exact"),
         }[value["evidence_backend"]]
         or value["build_profile"] != PROFILE
-        or not is_git_head(value["measured_code_head"])
         or value["clean_build_enforced"] is not True
         or value["build_environment_policy"] != BUILD_ENVIRONMENT_POLICY
         or not is_lower_digest(value["build_command_sha256"])
@@ -844,7 +956,6 @@ def runner_bindings(executable: Path) -> dict[str, Any]:
         "queue_transport",
         "queue_private_storage_accounting",
         "build_profile",
-        "measured_code_head",
         "clean_build_enforced",
         "build_environment_policy",
         "build_command_sha256",
@@ -1369,8 +1480,6 @@ def main() -> int:
                 cargo_artifact, _message = parse_cargo_artifact(cargo_json, repository)
                 executable_bytes = artifact_bytes(cargo_artifact, repository)
                 bindings = runner_bindings(cargo_artifact)
-                if bindings["measured_code_head"] != git_head:
-                    raise GateError("embedded build head differs from the clean current head")
                 if (
                     bindings["build_command_sha256"] != command_sha256
                     or bindings["build_environment_sha256"] != environment_sha256
@@ -1390,6 +1499,9 @@ def main() -> int:
                     git_sha256,
                     rustc_sha256,
                     parsed.benchmark_backend,
+                    baseline["lock_sha256"] if baseline is not None else None,
+                    baseline["manifest_sha256"] if baseline is not None else None,
+                    baseline["baseline_head"] if baseline is not None else None,
                 )
                 validate_current_bindings(bindings, current_bindings)
                 if baseline is not None:
@@ -1411,6 +1523,14 @@ def main() -> int:
                 evidence = dict(bindings)
                 evidence.update(
                     {
+                        field: current_bindings[field]
+                        for field in VERIFICATION_BINDING_FIELDS
+                    }
+                )
+                evidence.update(
+                    {
+                        # The exact clean candidate identity is evidence, never a Cargo input.
+                        "measured_code_head": git_head,
                         "cargo_target": TARGET,
                         "benchmark_feature": FEATURE,
                         "git_tree_clean": True,

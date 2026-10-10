@@ -1,27 +1,30 @@
 //! Account-scoped Coinbase Direct runtime supervision.
 //!
-//! Startup completes every credential, metadata, registry, capture, route, and product allocation
-//! before a single product task may open a provider connection. Each product task is the sole
-//! mutable owner of its registry and book generation; the account owner retains cross-process
-//! exclusion, onboarding currentness, cancellation, and coordinated cleanup.
+//! Account startup completes credential, metadata, and bounded product admission before product
+//! tasks begin. Each task seals its original product reference and selects native catalog identity
+//! before its live session, then owns registry, capture, route, and book generation cleanup. The
+//! account owner retains cross-process exclusion, onboarding currentness, and cancellation.
 
+mod coordinator;
 mod evidence;
 mod output;
 mod product;
+mod reference;
 
 use std::mem::size_of;
 use std::sync::{
     Arc,
     atomic::{AtomicBool, Ordering},
 };
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use market_squawk_adapter_coinbase::{CoinbaseDirectHmacSigner, CoinbaseDirectSigningError};
-use market_squawk_live::{LiveRuntimeConfig, LiveSnapshotReader, RouteActionHook};
+use market_squawk_live::{LiveRuntimeConfig, LiveSnapshotReader, RouteActionHook, ShardKey};
 use market_squawk_platform::{
     CaptureProcessInfrastructureLimits, DestinationFenceRegistryInitializationError,
     initialize_capture_process_infrastructure,
 };
+use market_squawk_sources::SourceMetadata;
 use thiserror::Error;
 use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 use tokio::task::{JoinError, JoinSet};
@@ -29,16 +32,32 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     ProviderOnboardingError,
-    live_runtime::{LiveRuntimeComposition, LiveRuntimeCompositionError},
-    provider_activation::CoinbaseDirectAccountActivation,
+    application::{CryptoPublicationRendezvousLimits, MarketEventDurableRead},
+    live_runtime::LiveRuntimeCompositionError,
+    live_source::order_level::OrderLevelDirectory,
+    provider_activation::{
+        CoinbaseDirectAccountActivation, CoinbaseMarketPublicationPackage,
+        ProviderAdapterActivationError,
+    },
 };
 
+use coordinator::DirectAccountCoordinator;
+pub use coordinator::DirectAccountCoordinatorError;
+pub(crate) use evidence::try_build_product_metadata_set;
 use evidence::try_build_product_spec;
 pub use output::CoinbaseDirectOutputFailure;
 pub use product::CoinbaseDirectProductRuntimeError;
 use product::{ProductReady, ProductRuntimeSpec, run_product};
 
-use super::{composition::SupervisorDropCancellation, route_actor::RouteBufferLimits};
+use super::{
+    composition::{
+        CRYPTO_PUBLICATION_CHANNEL_CAPACITY, CRYPTO_PUBLICATION_RETAINED_FRAMES,
+        CoinbasePublicationSupervisor, CoinbasePublicationSupervisorError,
+        ProductionLiveRuntimeOwner, SupervisorDropCancellation, committed_research_exports,
+    },
+    route_actor::RouteBufferLimits,
+    sink::CoinbaseCapturedPublicationIngress,
+};
 
 const ONBOARDING_CURRENTNESS_INTERVAL: Duration = Duration::from_secs(1);
 type ProductTaskOutput = (usize, Result<(), CoinbaseDirectProductRuntimeError>);
@@ -48,8 +67,13 @@ type ProductJoinOutcome = Option<Result<ProductTaskOutput, JoinError>>;
 #[derive(Debug)]
 pub struct CoinbaseDirectLiveRuntime {
     supervisor_cancellation: SupervisorDropCancellation,
+    publication_cancellation: SupervisorDropCancellation,
     supervisor_live: Arc<AtomicBool>,
-    live: LiveRuntimeComposition,
+    publication: Vec<CoinbasePublicationSupervisor>,
+    live: ProductionLiveRuntimeOwner,
+    durable_reads: Arc<[MarketEventDurableRead]>,
+    metadata: Arc<[SourceMetadata]>,
+    routes: Arc<[ShardKey]>,
     supervisor: tokio::task::JoinHandle<Result<(), CoinbaseDirectSupervisorError>>,
     shutdown_deadline: Duration,
 }
@@ -58,11 +82,52 @@ impl CoinbaseDirectLiveRuntime {
     /// Reports whether the account supervisor still owns a live Direct product set.
     pub(crate) fn is_healthy(&self) -> bool {
         self.supervisor_live.load(Ordering::Acquire)
+            && !self.publication.is_empty()
+            && self.publication.iter().all(|owner| owner.is_healthy())
     }
 
     /// Returns authority-free immutable snapshot access.
     pub fn snapshots(&self) -> LiveSnapshotReader {
         self.live.snapshots()
+    }
+
+    /// Returns every exact source-metadata record retained by this account runtime.
+    pub(crate) fn metadata(&self) -> Arc<[SourceMetadata]> {
+        Arc::clone(&self.metadata)
+    }
+
+    /// Returns the exact route topology retained by this account runtime.
+    pub(crate) fn routes(&self) -> Arc<[ShardKey]> {
+        Arc::clone(&self.routes)
+    }
+
+    /// Returns the exact provider-neutral durable market reads owned by this runtime.
+    pub(crate) fn durable_reads(&self) -> Arc<[MarketEventDurableRead]> {
+        Arc::clone(&self.durable_reads)
+    }
+
+    /// Installs one complete disabled action-hook group without reconnecting the account source.
+    pub async fn prepare_action_hooks(
+        &mut self,
+        hooks: Vec<RouteActionHook>,
+        cancellation: CancellationToken,
+    ) -> Result<market_squawk_live::PreparedLiveActionHookGroup, CoinbaseDirectSupervisorError>
+    {
+        self.live
+            .prepare_action_hooks(hooks, cancellation)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Removes the exact disabled dynamic action-hook group from the running actors.
+    pub async fn reap_action_hooks(
+        &mut self,
+        cancellation: CancellationToken,
+    ) -> Result<market_squawk_live::LiveActionHookReapReceipt, CoinbaseDirectSupervisorError> {
+        self.live
+            .reap_action_hooks(cancellation)
+            .await
+            .map_err(Into::into)
     }
 
     /// Cancels every product, reaps capture and route workers, then releases credential authority.
@@ -84,6 +149,27 @@ impl CoinbaseDirectLiveRuntime {
                     Some(CoinbaseDirectSupervisorError::SupervisorShutdownDeadline)
                 }
             };
+        self.publication_cancellation.cancel();
+        let publication_deadline = Instant::now()
+            .checked_add(self.shutdown_deadline)
+            .unwrap_or_else(Instant::now);
+        let publication = shutdown_publication_supervisors(
+            std::mem::take(&mut self.publication),
+            publication_deadline,
+        )
+        .await
+        .err();
+        let supervisor = match (supervisor, publication) {
+            (None, None) => None,
+            (Some(error), None) => Some(error),
+            (None, Some(error)) => Some(error.into()),
+            (Some(primary), Some(cleanup)) => {
+                Some(CoinbaseDirectSupervisorError::PublicationAndCleanup {
+                    primary: Box::new(primary),
+                    cleanup: Box::new(cleanup),
+                })
+            }
+        };
         let live = self.live.shutdown().await;
         match (supervisor, live) {
             (None, Ok(_shutdown)) => Ok(()),
@@ -98,43 +184,21 @@ impl CoinbaseDirectLiveRuntime {
 }
 
 impl CoinbaseDirectAccountActivation {
-    /// Starts Direct products on the bounded live runtime after atomic account preflight.
-    ///
-    /// # Errors
-    ///
-    /// Returns without network access when any product, credential, queue, capture, registry, or
-    /// live-route prerequisite cannot be admitted.
-    pub async fn start_live(
+    /// Starts Direct products with one shared generation-owned order-level read directory.
+    pub(crate) async fn start_live_with_order_level(
         self,
         runtime_config: LiveRuntimeConfig,
+        order_level: OrderLevelDirectory,
         cancellation: CancellationToken,
     ) -> Result<CoinbaseDirectLiveRuntime, CoinbaseDirectSupervisorError> {
-        start_account(self, runtime_config, None, cancellation).await
-    }
-
-    /// Starts Direct products only after exact execution action hooks are installed per route.
-    ///
-    /// This is the source-side composition seam used by paper execution. It preserves the same
-    /// centralized strategy, current-authority, risk, dispatcher, and execution chain as public
-    /// sources.
-    ///
-    /// # Errors
-    ///
-    /// Returns without provider network access when hook or product preflight fails.
-    pub async fn start_live_with_action_hooks(
-        self,
-        runtime_config: LiveRuntimeConfig,
-        action_hooks: Vec<RouteActionHook>,
-        cancellation: CancellationToken,
-    ) -> Result<CoinbaseDirectLiveRuntime, CoinbaseDirectSupervisorError> {
-        start_account(self, runtime_config, Some(action_hooks), cancellation).await
+        start_account(self, runtime_config, order_level, cancellation).await
     }
 }
 
 async fn start_account(
     mut activation: CoinbaseDirectAccountActivation,
     runtime_config: LiveRuntimeConfig,
-    action_hooks: Option<Vec<RouteActionHook>>,
+    order_level: OrderLevelDirectory,
     cancellation: CancellationToken,
 ) -> Result<CoinbaseDirectLiveRuntime, CoinbaseDirectSupervisorError> {
     activation.require_current().await?;
@@ -155,7 +219,56 @@ async fn start_account(
     if specs.len() != product_count {
         return Err(CoinbaseDirectSupervisorError::ActivationTopology);
     }
-    let routes = specs.iter().map(|spec| spec.route().clone()).collect();
+    let mut metadata = Vec::new();
+    metadata
+        .try_reserve_exact(specs.len())
+        .map_err(|_error| CoinbaseDirectSupervisorError::AllocationFailed)?;
+    metadata.extend(specs.iter().map(|spec| spec.metadata().clone()));
+    let metadata: Arc<[SourceMetadata]> = metadata.into();
+    let mut retained_routes = Vec::new();
+    retained_routes
+        .try_reserve_exact(specs.len())
+        .map_err(|_error| CoinbaseDirectSupervisorError::AllocationFailed)?;
+    retained_routes.extend(specs.iter().map(|spec| spec.route().route().clone()));
+    let retained_routes: Arc<[ShardKey]> = retained_routes.into();
+    let routes = specs
+        .iter()
+        .map(|spec| spec.route().clone())
+        .collect::<Vec<_>>();
+
+    let (publication_packages, publication_cancellation) = activation.take_market_publication()?;
+    let publication_start_guard = SupervisorDropCancellation::new(publication_cancellation.clone());
+    if publication_packages.len() != specs.len() {
+        publication_cancellation.cancel();
+        return Err(CoinbaseDirectSupervisorError::ActivationTopology);
+    }
+    let mut durable_reads = Vec::new();
+    durable_reads
+        .try_reserve_exact(publication_packages.len())
+        .map_err(|_error| CoinbaseDirectSupervisorError::AllocationFailed)?;
+    durable_reads.extend(
+        publication_packages
+            .iter()
+            .map(|package| package.durable_read().clone()),
+    );
+    let durable_reads: Arc<[MarketEventDurableRead]> = durable_reads.into();
+
+    let publication_capacity = std::num::NonZeroUsize::new(CRYPTO_PUBLICATION_CHANNEL_CAPACITY)
+        .ok_or(CoinbaseDirectSupervisorError::PublicationBounds)?;
+    let maximum_message_bytes = usize::try_from(runtime_config.maximum_message_bytes().get())
+        .map_err(|_| CoinbaseDirectSupervisorError::PublicationBounds)?;
+    let publication_retained_bytes = maximum_message_bytes
+        .checked_mul(CRYPTO_PUBLICATION_RETAINED_FRAMES)
+        .and_then(std::num::NonZeroUsize::new)
+        .ok_or(CoinbaseDirectSupervisorError::PublicationBounds)?;
+    let (committed_exports, committed_receivers) =
+        committed_research_exports(&routes, publication_capacity, publication_retained_bytes)
+            .map_err(|_| CoinbaseDirectSupervisorError::PublicationBounds)?;
+    let publication_limits = CryptoPublicationRendezvousLimits::new(
+        publication_capacity,
+        publication_retained_bytes,
+        activation.app_config().source_shutdown(),
+    );
 
     let secret = activation
         .onboarding()
@@ -176,25 +289,38 @@ async fn start_account(
         runtime_config.mailbox_count_per_shard(),
         runtime_config.maximum_message_bytes(),
     );
-    let live = match action_hooks {
-        Some(action_hooks) => {
-            LiveRuntimeComposition::start_with_action_hooks(runtime_config, routes, action_hooks)
-                .await?
-        }
-        None => LiveRuntimeComposition::start(runtime_config, routes).await?,
-    };
-    start_on_live_runtime(
+    let live = ProductionLiveRuntimeOwner::start_with_research_exports(
+        runtime_config,
+        routes,
+        Vec::new(),
+        committed_exports,
+    )
+    .await?;
+    let started = start_on_live_runtime(
         activation,
         specs,
+        metadata,
+        retained_routes,
         signer,
         app_config,
         admission,
         capture_process,
         route_buffer_limits,
         live,
+        publication_packages,
+        committed_receivers,
+        publication_capacity,
+        publication_limits,
+        publication_cancellation,
+        durable_reads,
+        Some(order_level),
         cancellation,
     )
-    .await
+    .await;
+    if started.is_ok() {
+        publication_start_guard.disarm();
+    }
+    started
 }
 
 #[allow(
@@ -204,16 +330,43 @@ async fn start_account(
 async fn start_on_live_runtime(
     activation: CoinbaseDirectAccountActivation,
     specs: Vec<ProductRuntimeSpec>,
+    metadata: Arc<[SourceMetadata]>,
+    routes: Arc<[ShardKey]>,
     signer: Arc<CoinbaseDirectHmacSigner>,
     app_config: market_squawk_platform::AppConfig,
     admission: crate::provider_activation::CoinbaseDirectRuntimeAdmission,
     capture_process: market_squawk_platform::CaptureProcessInfrastructure,
     route_buffer_limits: RouteBufferLimits,
-    live: LiveRuntimeComposition,
+    live: ProductionLiveRuntimeOwner,
+    publication_packages: Vec<CoinbaseMarketPublicationPackage>,
+    committed_receivers: Vec<market_squawk_live::CommittedResearchMarketObservationReceiver>,
+    publication_capacity: std::num::NonZeroUsize,
+    publication_limits: CryptoPublicationRendezvousLimits,
+    publication_cancellation: CancellationToken,
+    durable_reads: Arc<[MarketEventDurableRead]>,
+    order_level: Option<OrderLevelDirectory>,
     cancellation: CancellationToken,
 ) -> Result<CoinbaseDirectLiveRuntime, CoinbaseDirectSupervisorError> {
     let live_ingress = live.production_ingress();
     let shutdown_deadline = app_config.source_shutdown();
+    let publication_start = start_publication_supervisors(
+        &specs,
+        publication_packages,
+        committed_receivers,
+        publication_capacity,
+        publication_limits,
+        publication_cancellation.clone(),
+        shutdown_deadline,
+    )
+    .await;
+    let (publication, publication_ingresses) = match publication_start {
+        Ok(started) => started,
+        Err(startup) => {
+            publication_cancellation.cancel();
+            return rollback_live_start(startup, live).await;
+        }
+    };
+    let publication_terminal = publication_cancellation.clone();
     let (startup_sender, startup_receiver) = oneshot::channel();
     let supervisor_cancellation = cancellation.clone();
     let terminal_cancellation = cancellation.clone();
@@ -230,6 +383,9 @@ async fn start_on_live_runtime(
             capture_process,
             route_buffer_limits,
             live_ingress,
+            publication_ingresses,
+            publication_terminal,
+            order_level,
             supervisor_cancellation,
             startup_sender,
         )
@@ -239,22 +395,154 @@ async fn start_on_live_runtime(
     });
     tokio::select! {
         startup = startup_receiver => match startup {
-            Ok(()) => Ok(CoinbaseDirectLiveRuntime {
-                supervisor_cancellation: SupervisorDropCancellation::new(cancellation),
-                supervisor_live,
-                live,
-                supervisor,
-                shutdown_deadline,
-            }),
+            Ok(()) => require_healthy_start(CoinbaseDirectLiveRuntime {
+                    supervisor_cancellation: SupervisorDropCancellation::new(cancellation),
+                    publication_cancellation: SupervisorDropCancellation::new(
+                        publication_cancellation,
+                    ),
+                    supervisor_live,
+                    publication,
+                    live,
+                    durable_reads,
+                    metadata,
+                    routes,
+                    supervisor,
+                    shutdown_deadline,
+                }).await,
             Err(_closed) => {
                 let startup = map_supervisor_outcome(supervisor.await);
-                rollback_live_start(startup, live).await
+                rollback_direct_start(
+                    startup,
+                    publication,
+                    publication_cancellation,
+                    live,
+                    shutdown_deadline,
+                ).await
             }
         },
         outcome = &mut supervisor => {
             let startup = map_supervisor_outcome(outcome);
-            rollback_live_start(startup, live).await
+            rollback_direct_start(
+                startup,
+                publication,
+                publication_cancellation,
+                live,
+                shutdown_deadline,
+            ).await
         }
+    }
+}
+
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each product retains one exact package, captured ingress, and committed export"
+)]
+async fn start_publication_supervisors(
+    specs: &[ProductRuntimeSpec],
+    packages: Vec<CoinbaseMarketPublicationPackage>,
+    committed_receivers: Vec<market_squawk_live::CommittedResearchMarketObservationReceiver>,
+    maximum_inflight: std::num::NonZeroUsize,
+    limits: CryptoPublicationRendezvousLimits,
+    cancellation: CancellationToken,
+    shutdown_timeout: Duration,
+) -> Result<
+    (
+        Vec<CoinbasePublicationSupervisor>,
+        Vec<CoinbaseCapturedPublicationIngress>,
+    ),
+    CoinbaseDirectSupervisorError,
+> {
+    if cancellation.is_cancelled()
+        || specs.is_empty()
+        || specs.len() != packages.len()
+        || specs.len() != committed_receivers.len()
+        || specs.iter().zip(&packages).any(|(spec, package)| {
+            package
+                .durable_read()
+                .point_in_time_selector()
+                .source_surface()
+                != spec.metadata().source_id()
+        })
+    {
+        return Err(CoinbaseDirectSupervisorError::ActivationTopology);
+    }
+    let mut supervisors = Vec::new();
+    let mut ingresses = Vec::new();
+    supervisors
+        .try_reserve_exact(specs.len())
+        .map_err(|_error| CoinbaseDirectSupervisorError::AllocationFailed)?;
+    ingresses
+        .try_reserve_exact(specs.len())
+        .map_err(|_error| CoinbaseDirectSupervisorError::AllocationFailed)?;
+    for (package, committed) in packages.into_iter().zip(committed_receivers) {
+        let (ingress, receiver) = CoinbaseCapturedPublicationIngress::try_channel(
+            maximum_inflight,
+            Arc::new(tokio::sync::Semaphore::new(maximum_inflight.get())),
+        );
+        match CoinbasePublicationSupervisor::start(
+            package,
+            receiver,
+            vec![committed],
+            maximum_inflight,
+            limits,
+            cancellation.clone(),
+        ) {
+            Ok(supervisor) => {
+                supervisors.push(supervisor);
+                ingresses.push(ingress);
+            }
+            Err(startup) => {
+                cancellation.cancel();
+                let deadline = Instant::now()
+                    .checked_add(shutdown_timeout)
+                    .unwrap_or_else(Instant::now);
+                let cleanup = shutdown_publication_supervisors(supervisors, deadline)
+                    .await
+                    .err();
+                return Err(match cleanup {
+                    None => startup.into(),
+                    Some(cleanup) => CoinbaseDirectSupervisorError::PublicationAndCleanup {
+                        primary: Box::new(startup.into()),
+                        cleanup: Box::new(cleanup),
+                    },
+                });
+            }
+        }
+    }
+    Ok((supervisors, ingresses))
+}
+
+async fn require_healthy_start(
+    runtime: CoinbaseDirectLiveRuntime,
+) -> Result<CoinbaseDirectLiveRuntime, CoinbaseDirectSupervisorError> {
+    if runtime.is_healthy() {
+        return Ok(runtime);
+    }
+    let startup = CoinbaseDirectSupervisorError::PublicationExitedBeforeStartup;
+    match runtime.shutdown().await {
+        Ok(()) => Err(startup),
+        Err(cleanup) => Err(CoinbaseDirectSupervisorError::StartupAndCleanup {
+            startup: Box::new(startup),
+            cleanup: Box::new(cleanup),
+        }),
+    }
+}
+
+async fn shutdown_publication_supervisors(
+    supervisors: Vec<CoinbasePublicationSupervisor>,
+    deadline: Instant,
+) -> Result<(), CoinbasePublicationSupervisorError> {
+    let mut first_error = None;
+    for supervisor in supervisors {
+        if let Err(error) = supervisor.shutdown(deadline).await
+            && first_error.is_none()
+        {
+            first_error = Some(error);
+        }
+    }
+    match first_error {
+        Some(error) => Err(error),
+        None => Ok(()),
     }
 }
 
@@ -287,6 +575,9 @@ async fn run_account(
     capture_process: market_squawk_platform::CaptureProcessInfrastructure,
     route_buffer_limits: RouteBufferLimits,
     live_ingress: market_squawk_live::LiveRuntimeIngress,
+    publication_ingresses: Vec<CoinbaseCapturedPublicationIngress>,
+    publication_terminal: CancellationToken,
+    order_level: Option<OrderLevelDirectory>,
     cancellation: CancellationToken,
     startup: oneshot::Sender<()>,
 ) -> Result<(), CoinbaseDirectSupervisorError> {
@@ -305,18 +596,38 @@ async fn run_account(
     let (ready_sender, mut ready_receiver) =
         mpsc::channel(admission.supervisor_queue_records().get());
     let (start_sender, start_receiver) = watch::channel(false);
+    if publication_ingresses.len() != product_count {
+        return Err(CoinbaseDirectSupervisorError::ActivationTopology);
+    }
+    let coordinator = DirectAccountCoordinator::try_new(
+        &specs
+            .iter()
+            .map(ProductRuntimeSpec::slot)
+            .collect::<Vec<_>>(),
+        cancellation.clone(),
+    )
+    .map_err(|_| CoinbaseDirectSupervisorError::ActivationTopology)?;
+    let mut publication_ingresses = publication_ingresses.into_iter();
     let mut products = JoinSet::new();
     for spec in specs {
         let slot = spec.slot();
+        let task_publication = publication_ingresses
+            .next()
+            .ok_or(CoinbaseDirectSupervisorError::ActivationTopology)?;
         let task_config = app_config.clone();
         let provider_rate = activation.provider_rate().clone();
+        let catalog_reader = activation.catalog_reader();
+        let catalog_synchronizer = activation.catalog_synchronizer();
+        let research_service = activation.research_service();
         let account_subject = activation.account_subject().clone();
         let task_signer = Arc::clone(&signer);
         let task_ready = ready_sender.clone();
         let task_start = start_receiver.clone();
         let task_cancellation = cancellation.child_token();
         let task_ingress = live_ingress.clone();
+        let task_order_level = order_level.clone();
         let task_bootstrap_slots = Arc::clone(&bootstrap_slots);
+        let task_coordinator = coordinator.clone();
         products.spawn(async move {
             (
                 slot,
@@ -324,20 +635,34 @@ async fn run_account(
                     spec,
                     task_config,
                     provider_rate,
+                    catalog_reader,
+                    catalog_synchronizer,
+                    research_service,
                     account_subject,
                     admission,
                     capture_process,
                     task_ingress,
+                    task_publication,
+                    task_order_level,
                     route_buffer_limits,
                     task_signer,
                     task_ready,
                     task_start,
                     task_bootstrap_slots,
+                    task_coordinator,
                     task_cancellation,
                 )
                 .await,
             )
         });
+    }
+    if publication_ingresses.next().is_some() {
+        return stop_products(
+            products,
+            cancellation,
+            Some(CoinbaseDirectSupervisorError::ActivationTopology),
+        )
+        .await;
     }
     drop(ready_sender);
     drop(start_receiver);
@@ -345,50 +670,89 @@ async fn run_account(
 
     let mut observed = [false; crate::provider_activation::COINBASE_DIRECT_MAXIMUM_SUBSCRIPTIONS];
     let mut ready_count = 0;
-    while ready_count < product_count {
-        tokio::select! {
-            biased;
-            () = cancellation.cancelled() => {
-                return stop_products(products, cancellation, None).await;
-            }
-            outcome = products.join_next() => {
-                let primary = product_outcome(outcome);
-                return stop_products(products, cancellation, Some(primary)).await;
-            }
-            ready = ready_receiver.recv() => {
-                let Some(ready) = ready else {
+    let mut ready_epoch = None;
+    loop {
+        while ready_count < product_count {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => {
+                    return stop_products(products, cancellation, None).await;
+                }
+                () = publication_terminal.cancelled() => {
                     return stop_products(
                         products,
                         cancellation,
-                        Some(CoinbaseDirectSupervisorError::StartupQueueClosed),
-                    ).await;
-                };
-                let Some(slot) = observed.get_mut(ready.slot) else {
-                    return stop_products(
-                        products,
-                        cancellation,
-                        Some(CoinbaseDirectSupervisorError::ActivationTopology),
-                    ).await;
-                };
-                if *slot {
-                    return stop_products(
-                        products,
-                        cancellation,
-                        Some(CoinbaseDirectSupervisorError::DuplicateReady),
+                        Some(CoinbaseDirectSupervisorError::PublicationExitedBeforeStartup),
                     ).await;
                 }
-                *slot = true;
-                ready_count += 1;
+                outcome = products.join_next() => {
+                    let primary = product_outcome(outcome);
+                    return stop_products(products, cancellation, Some(primary)).await;
+                }
+                ready = ready_receiver.recv() => {
+                    let Some(ready) = ready else {
+                        return stop_products(
+                            products,
+                            cancellation,
+                            Some(CoinbaseDirectSupervisorError::StartupQueueClosed),
+                        ).await;
+                    };
+                    match ready_epoch {
+                        Some(current) if ready.epoch < current => continue,
+                        Some(current) if ready.epoch > current => {
+                            observed.fill(false);
+                            ready_count = 0;
+                            ready_epoch = Some(ready.epoch);
+                        }
+                        None => ready_epoch = Some(ready.epoch),
+                        Some(_) => {}
+                    }
+                    let Some(slot) = observed.get_mut(ready.slot) else {
+                        return stop_products(
+                            products,
+                            cancellation,
+                            Some(CoinbaseDirectSupervisorError::ActivationTopology),
+                        ).await;
+                    };
+                    if *slot {
+                        return stop_products(
+                            products,
+                            cancellation,
+                            Some(CoinbaseDirectSupervisorError::DuplicateReady),
+                        ).await;
+                    }
+                    *slot = true;
+                    ready_count += 1;
+                }
             }
         }
-    }
-    if let Err(error) = activation.require_current().await {
-        return stop_products(
-            products,
-            cancellation,
-            Some(CoinbaseDirectSupervisorError::Onboarding(error)),
-        )
-        .await;
+        let Some(epoch) = ready_epoch else {
+            return stop_products(
+                products,
+                cancellation,
+                Some(CoinbaseDirectSupervisorError::ActivationTopology),
+            )
+            .await;
+        };
+        if !coordinator.is_current_epoch(epoch).await {
+            observed.fill(false);
+            ready_count = 0;
+            continue;
+        }
+        if let Err(error) = activation.require_current().await {
+            return stop_products(
+                products,
+                cancellation,
+                Some(CoinbaseDirectSupervisorError::Onboarding(error)),
+            )
+            .await;
+        }
+        if !coordinator.is_current_epoch(epoch).await {
+            observed.fill(false);
+            ready_count = 0;
+            continue;
+        }
+        break;
     }
     if start_sender.send(true).is_err() {
         return stop_products(
@@ -414,6 +778,13 @@ async fn run_account(
             biased;
             () = cancellation.cancelled() => {
                 return stop_products(products, cancellation, None).await;
+            }
+            () = publication_terminal.cancelled() => {
+                return stop_products(
+                    products,
+                    cancellation,
+                    Some(CoinbaseDirectSupervisorError::PublicationExited),
+                ).await;
             }
             outcome = products.join_next() => {
                 let primary = product_outcome(outcome);
@@ -499,7 +870,7 @@ fn map_supervisor_outcome(
 
 async fn rollback_live_start(
     startup: CoinbaseDirectSupervisorError,
-    live: LiveRuntimeComposition,
+    live: ProductionLiveRuntimeOwner,
 ) -> Result<CoinbaseDirectLiveRuntime, CoinbaseDirectSupervisorError> {
     match live.shutdown().await {
         Ok(_shutdown) => Err(startup),
@@ -508,6 +879,30 @@ async fn rollback_live_start(
             rollback,
         }),
     }
+}
+
+async fn rollback_direct_start(
+    startup: CoinbaseDirectSupervisorError,
+    publication: Vec<CoinbasePublicationSupervisor>,
+    publication_cancellation: CancellationToken,
+    live: ProductionLiveRuntimeOwner,
+    shutdown_timeout: Duration,
+) -> Result<CoinbaseDirectLiveRuntime, CoinbaseDirectSupervisorError> {
+    publication_cancellation.cancel();
+    let deadline = Instant::now()
+        .checked_add(shutdown_timeout)
+        .unwrap_or_else(Instant::now);
+    let startup = match shutdown_publication_supervisors(publication, deadline)
+        .await
+        .err()
+    {
+        None => startup,
+        Some(cleanup) => CoinbaseDirectSupervisorError::PublicationAndCleanup {
+            primary: Box::new(startup),
+            cleanup: Box::new(cleanup),
+        },
+    };
+    rollback_live_start(startup, live).await
 }
 
 /// Coinbase Direct account construction, supervision, or coordinated shutdown failure.
@@ -522,6 +917,9 @@ pub enum CoinbaseDirectSupervisorError {
     /// The configured startup queue cannot retain one ready signal per product.
     #[error("Coinbase Direct startup queue bounds are insufficient")]
     StartupQueueBounds,
+    /// The shared committed-publication queues cannot satisfy their fixed retained-memory bound.
+    #[error("Coinbase Direct publication bounds are invalid")]
+    PublicationBounds,
     /// The startup queue closed before every product completed preflight.
     #[error("Coinbase Direct startup queue closed")]
     StartupQueueClosed,
@@ -553,6 +951,14 @@ pub enum CoinbaseDirectSupervisorError {
         /// Cleanup failure.
         cleanup: Box<Self>,
     },
+    /// Account/product shutdown and the durable publication supervisor both failed.
+    #[error("Coinbase Direct runtime and publication cleanup both failed")]
+    PublicationAndCleanup {
+        /// Primary account or startup failure.
+        primary: Box<Self>,
+        /// Durable publication cleanup failure.
+        cleanup: Box<CoinbasePublicationSupervisorError>,
+    },
     /// No product retained the account start receiver.
     #[error("Coinbase Direct account startup barrier closed")]
     StartupBarrierClosed,
@@ -562,6 +968,20 @@ pub enum CoinbaseDirectSupervisorError {
     /// The supervisor exited before publishing the startup barrier.
     #[error("Coinbase Direct supervisor exited before startup")]
     SupervisorExitedBeforeStartup,
+    /// A durable publication worker exited before the runtime became externally reachable.
+    #[error("Coinbase Direct publication exited before startup")]
+    PublicationExitedBeforeStartup,
+    /// A durable publication worker exited while the Direct generation was running.
+    #[error("Coinbase Direct publication exited")]
+    PublicationExited,
+    /// Startup rejection and coordinated cleanup both failed.
+    #[error("Coinbase Direct startup rejection and cleanup both failed")]
+    StartupAndCleanup {
+        /// Exact startup rejection.
+        startup: Box<Self>,
+        /// Exact cleanup failure.
+        cleanup: Box<Self>,
+    },
     /// Supervisor shutdown exceeded the configured deadline.
     #[error("Coinbase Direct supervisor shutdown deadline elapsed")]
     SupervisorShutdownDeadline,
@@ -590,6 +1010,12 @@ pub enum CoinbaseDirectSupervisorError {
     /// Provider onboarding authority is no longer current.
     #[error(transparent)]
     Onboarding(#[from] ProviderOnboardingError),
+    /// The exact registered durable publication generation could not be acquired.
+    #[error(transparent)]
+    PublicationActivation(#[from] ProviderAdapterActivationError),
+    /// The durable raw/committed publication supervisor failed.
+    #[error(transparent)]
+    Publication(#[from] CoinbasePublicationSupervisorError),
     /// Credential envelope or signing-capability construction failed.
     #[error(transparent)]
     Signing(#[from] CoinbaseDirectSigningError),

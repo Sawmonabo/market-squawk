@@ -35,7 +35,9 @@ pub enum BacktestStrategyClass {
     ModelBacked,
 }
 
-/// Sealed receipt derived from exact source-closure, executable, and canonical configuration bytes.
+/// Sealed receipt binding source evidence, build metadata, and canonical configuration bytes.
+///
+/// Build metadata records provenance; its digest does not attest executable contents.
 #[derive(Clone, Debug)]
 pub struct BacktestBuildReceipt {
     build_id: SourceIdentifier,
@@ -52,14 +54,14 @@ impl BacktestBuildReceipt {
         class: BacktestStrategyClass,
         strategy_name: SourceIdentifier,
         source_closure: &[u8],
-        executable: &[u8],
+        build_metadata: &[u8],
         canonical_configuration: &[u8],
     ) -> Result<Self, BacktestAdmissionError> {
         if source_closure.is_empty()
-            || executable.is_empty()
+            || build_metadata.is_empty()
             || canonical_configuration.is_empty()
             || source_closure.len() > MAX_BUILD_EVIDENCE_BYTES
-            || executable.len() > MAX_BUILD_EVIDENCE_BYTES
+            || build_metadata.len() > MAX_BUILD_EVIDENCE_BYTES
             || canonical_configuration.len() > MAX_CONFIGURATION_BYTES
         {
             return Err(BacktestAdmissionError::InvalidBuildEvidence);
@@ -69,14 +71,14 @@ impl BacktestBuildReceipt {
             &[source_closure],
         );
         let code_digest = digest_parts(
-            b"market-squawk/backtest-executable/v1",
-            &[source_closure, executable],
+            b"market-squawk/backtest-build-metadata/v1",
+            &[source_closure, build_metadata],
         );
         let configuration_digest = digest_parts(
             b"market-squawk/backtest-canonical-configuration/v1",
             &[canonical_configuration],
         );
-        let code_name = SourceIdentifier::try_from(format!("{}-executable", build_id.as_str()))
+        let code_name = SourceIdentifier::try_from(format!("{}-build-metadata", build_id.as_str()))
             .map_err(|_| BacktestAdmissionError::InvalidBuildEvidence)?;
         let receipt = Self {
             build_id,

@@ -42,8 +42,37 @@ struct FixtureRecord {
 }
 
 #[test]
-fn import_preserves_exact_records_normalizes_typed_portfolio_and_replays_for_data() -> TestResult {
+fn preview_normalizes_without_promoting_raw_or_active_source_state() -> TestResult {
     let fixture: FixtureManifest = serde_json::from_slice(FIXTURE)?;
+    let batch = batch(&fixture.records, "portfolio-preview")?;
+    let archive = tempfile::tempdir()?;
+    let mut source = PortfolioExtractionSource::try_new(
+        SourceId::try_from(SOURCE_ID)?,
+        MetadataRevision::new(SourceIdentifier::try_from(METADATA_REVISION)?),
+        DataQuality::DirectUnverified,
+        LocalAuthorityStateStore::try_open(archive.path())?,
+        None,
+        PortfolioImportLimits::standard(),
+    )?;
+
+    let preview = source.preview_batch(&batch)?;
+    assert_eq!(preview.disposition(), ImportDisposition::Applied);
+    assert_eq!(preview.transactions().len(), 5);
+    assert!(source.raw_records().is_empty());
+
+    let committed = source.import_batch(&batch)?;
+    assert_eq!(committed.disposition(), ImportDisposition::Applied);
+    assert_eq!(source.raw_records().len(), fixture.records.len());
+    Ok(())
+}
+
+#[test]
+fn import_preserves_exact_records_normalizes_typed_portfolio_and_replays_for_data() -> TestResult {
+    let mut fixture: FixtureManifest = serde_json::from_slice(FIXTURE)?;
+    let mut account_payload: serde_json::Value =
+        serde_json::from_str(&fixture.records[0].payload)?;
+    account_payload["record"]["settlement_available_cash"] = serde_json::json!("-125.25");
+    fixture.records[0].payload = serde_json::to_string(&account_payload)?;
     let batch = batch(&fixture.records, "portfolio-statement")?;
     let credential = SecretReference::try_from("keyring:brokerage-account-token")?;
     let archive = tempfile::tempdir()?;
@@ -88,6 +117,58 @@ fn import_preserves_exact_records_normalizes_typed_portfolio_and_replays_for_dat
     );
     assert_eq!(imported.accounts()[0].currency().as_str(), "USD");
     assert_eq!(imported.accounts()[0].as_of().unix_nanos(), 100);
+    let settled_cash = imported.accounts()[0]
+        .settlement_available_cash()
+        .ok_or("supplied settled cash absent")?;
+    assert_eq!(settled_cash.amount().to_string(), "-125.25");
+    assert_eq!(settled_cash.currency(), imported.accounts()[0].currency());
+    assert_eq!(
+        imported.accounts()[0].source_reference(),
+        first.source_reference()
+    );
+    assert_eq!(imported.accounts()[1].settlement_available_cash(), None);
+    let expected_accounts = imported.accounts().to_vec();
+
+    let canonical = imported
+        .normalized_batch()
+        .records()
+        .iter()
+        .map(|record| serde_json::from_slice::<ResearchObservation>(record.payload()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let settled_scalars = canonical
+        .iter()
+        .filter_map(|observation| match observation {
+            ResearchObservation::AlternativeData(value)
+                if value.dataset().as_str() == "portfolio-accounts"
+                    && value.field().as_str() == "settlement_available_cash" =>
+            {
+                Some(value)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(settled_scalars.len(), 1);
+    let settled_scalar = settled_scalars[0];
+    assert_eq!(settled_scalar.value(), settled_cash.amount());
+    assert_eq!(
+        settled_scalar.unit().map(SourceIdentifier::as_str),
+        Some("USD")
+    );
+    let balance_scalar = canonical
+        .iter()
+        .find_map(|observation| match observation {
+            ResearchObservation::AlternativeData(value)
+                if value.dataset().as_str() == "portfolio-accounts"
+                    && value.field().as_str() == "cash_balance"
+                    && value.context().provenance().source_identifier().as_str()
+                        == "account-taxable" =>
+            {
+                Some(value)
+            }
+            _ => None,
+        })
+        .ok_or("original account cash balance scalar absent")?;
+    assert_eq!(settled_scalar.context(), balance_scalar.context());
     assert_eq!(
         imported.holdings()[0].instrument_id(),
         "11111111-1111-4111-8111-111111111111".parse::<InstrumentId>()?
@@ -175,6 +256,7 @@ fn import_preserves_exact_records_normalizes_typed_portfolio_and_replays_for_dat
 
     let replayed = source.import_batch(&batch)?;
     assert_eq!(replayed.disposition(), ImportDisposition::Replay);
+    assert_eq!(replayed.accounts(), expected_accounts.as_slice());
     assert_eq!(source.raw_records().len(), fixture.records.len());
     assert_eq!(
         extraction_batch_digest(replayed.normalized_batch())?,
@@ -197,8 +279,13 @@ fn import_preserves_exact_records_normalizes_typed_portfolio_and_replays_for_dat
         PortfolioImportLimits::standard(),
     )?;
     assert_eq!(restarted.raw_records().len(), fixture.records.len());
+    assert_eq!(
+        restarted.raw_records()[0].bytes().as_ref(),
+        fixture.records[0].payload.as_bytes()
+    );
     let restarted_replay = restarted.import_batch(&batch)?;
     assert_eq!(restarted_replay.disposition(), ImportDisposition::Replay);
+    assert_eq!(restarted_replay.accounts(), expected_accounts.as_slice());
     assert_eq!(
         extraction_batch_digest(restarted_replay.normalized_batch())?,
         normalized_digest
@@ -223,6 +310,10 @@ fn duplicate_broker_ids_fail_after_raw_archive_and_corrections_supersede_without
         Err(market_squawk_adapter_portfolio::PortfolioImportError::AccountMismatch)
     ));
     assert_eq!(source.raw_records().len(), 1);
+    assert!(matches!(
+        source.restore_published_batch(&unbound),
+        Err(market_squawk_adapter_portfolio::PortfolioImportError::AccountMismatch)
+    ));
 
     let duplicate_archive = tempfile::tempdir()?;
     let mut source = open_source(duplicate_archive.path())?;
@@ -307,6 +398,42 @@ fn duplicate_broker_ids_fail_after_raw_archive_and_corrections_supersede_without
     );
     drop(corrected);
 
+    drop(source);
+    let mut source = open_source(correction_archive.path())?;
+    let historical = source.restore_published_batch(&original_batch)?;
+    assert_eq!(historical.disposition(), ImportDisposition::Replay);
+    assert_eq!(
+        historical.transactions()[0].amount().amount().to_string(),
+        "10"
+    );
+    assert_eq!(
+        source
+            .active_record(&stable_record_id)
+            .ok_or("active correction absent")?
+            .revision_number(),
+        revision_two
+    );
+    assert!(source.import_batch(&original_batch).is_err());
+
+    let recovered_archive = tempfile::tempdir()?;
+    let mut recovered = open_source(recovered_archive.path())?;
+    recovered.restore_published_batch(&original_batch)?;
+    drop(recovered);
+    let mut recovered = open_source(recovered_archive.path())?;
+    recovered.restore_published_batch(&original_batch)?;
+    let recovered_correction = recovered.restore_published_batch(&correction_batch)?;
+    assert_eq!(
+        recovered_correction.transactions()[0]
+            .amount()
+            .amount()
+            .to_string(),
+        "10.25"
+    );
+    assert_eq!(
+        recovered.active_record(&stable_record_id),
+        source.active_record(&stable_record_id)
+    );
+
     let non_increasing = [FixtureRecord {
         revision: "statement-3".to_owned(),
         payload: raw_transaction_payload(
@@ -345,9 +472,13 @@ fn observation_revision(observation: &ResearchObservation) -> RevisionNumber {
         ResearchObservation::Filing(value) => value.context().time().revision(),
         ResearchObservation::Fundamental(value) => value.context().time().revision(),
         ResearchObservation::Macro(value) => value.context().time().revision(),
+        ResearchObservation::MarketBar(value) => value.context().time().revision(),
+        ResearchObservation::FundNav(value) => value.context().time().revision(),
+        ResearchObservation::MarketCalendar(value) => value.context().time().revision(),
         ResearchObservation::PortfolioPosition(value) => value.context().time().revision(),
         ResearchObservation::Transaction(value) => value.context().time().revision(),
         ResearchObservation::CorporateAction(value) => value.context().time().revision(),
+        ResearchObservation::CorporateActionSource(value) => value.context().time().revision(),
         ResearchObservation::AlternativeData(value) => value.context().time().revision(),
         ResearchObservation::UniverseMembership(value) => value.context().time().revision(),
     }

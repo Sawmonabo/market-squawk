@@ -32,6 +32,26 @@ impl CapturedDecodedProviderBatch {
         self.batch.evidence()
     }
 
+    /// Returns a conservative complete charge for retaining this captured batch outside the
+    /// synchronous decode call.
+    ///
+    /// The decoded batch reports all of its owned and shared dynamic allocations. The additional
+    /// inline wrapper charge covers the capture receipt, whose contract permits no unfunded
+    /// dynamic allocation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::DecodeError::RetainedSizeOverflow`] if the complete charge overflows.
+    pub fn retained_bytes(&self) -> Result<usize, crate::DecodeError> {
+        let wrapper_bytes = std::mem::size_of::<Self>()
+            .checked_sub(std::mem::size_of::<DecodedProviderBatch>())
+            .ok_or(crate::DecodeError::RetainedSizeOverflow)?;
+        self.batch
+            .retained_bytes()?
+            .checked_add(wrapper_bytes)
+            .ok_or(crate::DecodeError::RetainedSizeOverflow)
+    }
+
     pub(crate) fn into_parts(self) -> (DecodedProviderBatch, CaptureAdmissionReceipt) {
         (self.batch, self.receipt)
     }

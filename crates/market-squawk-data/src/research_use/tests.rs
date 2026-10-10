@@ -164,7 +164,7 @@ fn contracts_canonicalize_bounded_authority_and_seal_permits() -> Result<(), Box
     assert_eq!(
         ResearchUseAuthorityEvidence::try_new(
             source_a.clone(),
-            [99; 32],
+            [0; 32],
             [7; 32],
             EvidenceDigest::new(DigestAlgorithm::Sha256, [5; 32]),
             None,

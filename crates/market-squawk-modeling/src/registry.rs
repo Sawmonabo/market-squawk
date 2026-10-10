@@ -41,6 +41,20 @@ struct RegistryState {
 }
 
 impl ModelRegistry {
+    /// Creates a read-only empty image with no model slots or admission capacity.
+    #[must_use]
+    pub fn empty() -> Self {
+        let fixed = size_of::<Self>() + size_of::<RegistryState>();
+        Self {
+            state: RwLock::new(RegistryState {
+                slots: Box::new([]),
+                len: 0,
+                retained_bytes: fixed,
+            }),
+            retained_byte_limit: NonZeroUsize::new(fixed).unwrap_or(NonZeroUsize::MIN),
+        }
+    }
+
     /// Creates an empty registry with fixed slot and retained-byte ceilings.
     ///
     /// # Errors

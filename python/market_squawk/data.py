@@ -24,11 +24,12 @@ from ._data_validation import (
     ComponentIdentity,
     DatasetIdentity,
     DatasetIntegrityError,
+    PopulationEvidence,
+    _population,
     SplitCounts,
     SplitPolicy,
     UtcNanoseconds,
     _component,
-    _decoded_row_group_bound,
     _digest,
     _export,
     _path_parts,
@@ -39,6 +40,7 @@ from ._data_validation import (
     _row_group_workspace_bound,
     _split_counts,
     _split_policy,
+    _study_policy,
     _validate_schema,
 )
 from .finance import OperationContext
@@ -57,9 +59,15 @@ class DatasetResult:
     split_policy: SplitPolicy
     split_counts: SplitCounts
     missing_value_policy: str
+    population: PopulationEvidence
     complete: bool
     _receipt: Any = field(repr=False, compare=False)
     _descriptor_bytes: bytes = field(repr=False, compare=False)
+
+    @property
+    def product_contract(self) -> str:
+        """Exact catalog-verified recipe and independently authorized consumer use."""
+        return self._receipt.product_contract
 
     @property
     def dataset_id(self) -> str:
@@ -235,13 +243,16 @@ def open_dataset(
     export_sha256: str,
     as_of: UtcNanoseconds | datetime,
     *,
+    product_contract: str,
     max_rows: int = DEFAULT_MAX_ROWS,
     max_bytes: int = DEFAULT_MAX_BYTES,
     context: OperationContext,
 ) -> DatasetResult:
-    """Read one exact Task 11 export and its explicitly named content-addressed objects."""
+    """Read one export under its exact native recipe and authorized consumer contract."""
 
     export_digest = _digest(export_sha256)
+    if not isinstance(product_contract, str):
+        raise DatasetIntegrityError("dataset product contract must be an exact native identity")
     if not 1 <= max_rows <= DEFAULT_MAX_ROWS or not 1 <= max_bytes <= DEFAULT_MAX_BYTES:
         raise DatasetIntegrityError("dataset result limits are invalid")
     if not isinstance(context, OperationContext):
@@ -251,13 +262,18 @@ def open_dataset(
         receipt, native_descriptor = _native.open_dataset_admission(
             str(Path(root)),
             export_sha256,
+            product_contract,
             cutoff.unix_nanos,
             max_rows,
             max_bytes,
             context,
         )
-    except (OSError, ValueError) as error:
+    except OSError:
+        raise
+    except ValueError as error:
         raise DatasetIntegrityError("native catalog admission rejected the dataset") from error
+    if receipt.product_contract != product_contract:
+        raise DatasetIntegrityError("native dataset product contract differs from the request")
     export_bytes = bytes(native_descriptor)
     if len(export_bytes) > min(MAX_EXPORT_BYTES, max_bytes):
         raise DatasetIntegrityError("Task 11 export exceeds the retained-byte bound")
@@ -278,7 +294,9 @@ def open_dataset(
         components = tuple(_component(value) for value in manifest["components"])
         split_policy = _split_policy(manifest["split_policy"])
         expected_counts = _split_counts(manifest["split_counts"])
-        validator = _RowValidator(components, split_policy, expected_counts)
+        study = _study_policy(manifest["study"])
+        population = _population(manifest["dataset"], study, expected_counts)
+        validator = _RowValidator(components, split_policy, expected_counts, study, population, manifest["dataset"]["price_input_origin"])
         selected_rows: list[Mapping[str, Any]] = []
         selected_retained = 0
         for item in objects:
@@ -298,6 +316,9 @@ def open_dataset(
                     - len(object_bytes),
                     expected_rows=item["row_count"],
                 )
+                # File-level authority lives in the embedded Arrow schema; decoded
+                # row groups do not necessarily retain that schema metadata.
+                _validate_schema(parquet_file.schema_arrow, manifest["dataset"])
                 lineage = hashlib.sha256()
                 lineage.update(b"market-squawk/feature-label-object-lineage/v1")
                 lineage.update(_digest(manifest["dataset"]["build_spec_sha256"]))
@@ -317,11 +338,14 @@ def open_dataset(
                             "dataset decoded row group exceeds the retained-byte bound"
                         )
                     row_group_table = parquet_file.read_row_group(row_group_index)
-                    if row_group_table.nbytes > _decoded_row_group_bound(row_group.num_rows):
+                    if row_group_table.nbytes > workspace:
                         raise DatasetIntegrityError(
                             "dataset decoded row group violated its admitted bound"
                         )
-                    _validate_schema(row_group_table.schema, manifest["dataset"])
+                    if not row_group_table.schema.equals(
+                        parquet_file.schema_arrow, check_metadata=False
+                    ):
+                        raise DatasetIntegrityError("dataset Arrow field schema is unsupported")
                     validator.validate_table(row_group_table)
                     object_rows += row_group_table.num_rows
                     for index in range(row_group_table.num_rows):
@@ -337,12 +361,25 @@ def open_dataset(
                         ):
                             raise DatasetIntegrityError("dataset row lineage is invalid")
                         lineage.update(row_lineage)
-                        if row["cutoff_at"].unix_nanos <= cutoff.unix_nanos:
+                        if (
+                            row["source_selection_as_of"].unix_nanos <= cutoff.unix_nanos
+                            and (
+                                row["component_kind"] != "label"
+                                or (
+                                    row["label_selection_as_of"] is not None
+                                    and row["label_selection_as_of"].unix_nanos <= cutoff.unix_nanos
+                                )
+                            )
+                        ):
                             if len(selected_rows) >= max_rows:
                                 raise DatasetIntegrityError(
                                     "dataset result exceeds its requested row bound"
                                 )
-                            next_retained = selected_retained + SELECTED_ROW_RETAINED_BYTES
+                            epoch_bytes = row["input_epoch_json"]
+                            next_retained = (
+                                selected_retained + SELECTED_ROW_RETAINED_BYTES
+                                + (0 if epoch_bytes is None else len(epoch_bytes))
+                            )
                             if (
                                 control_retained
                                 + len(object_bytes)
@@ -382,6 +419,8 @@ def open_dataset(
             selection_sha256=receipt.selection_sha256,
             selection_as_of_unix_nanos=receipt.as_of_unix_nanos,
             selected_component_rows=len(rows),
+            study=_study_policy(manifest["study"]),
+            split_policy=split_policy,
         )
         return DatasetResult(
             export_sha256=export_sha256,
@@ -393,7 +432,8 @@ def open_dataset(
             split_policy=split_policy,
             split_counts=expected_counts,
             missing_value_policy=manifest["missing_value_policy"],
-            complete=cutoff.unix_nanos >= split_policy.test_end_unix_nanos,
+            population=population,
+            complete=len(rows) == total_rows,
             _receipt=receipt,
             _descriptor_bytes=export_bytes,
         )
@@ -429,11 +469,13 @@ def _verify_dataset_receipt(
         selection_sha256=dataset._receipt.selection_sha256,
         selection_as_of_unix_nanos=dataset._receipt.as_of_unix_nanos,
         selected_component_rows=len(dataset.rows),
+        study=_study_policy(manifest["study"]),
+        split_policy=_split_policy(manifest["split_policy"]),
     )
     expected_components = tuple(_component(value) for value in manifest["components"])
     expected_policy = _split_policy(manifest["split_policy"])
     expected_counts = _split_counts(manifest["split_counts"])
-    expected_complete = dataset._receipt.as_of_unix_nanos >= expected_policy.test_end_unix_nanos
+    expected_complete = len(dataset.rows) == sum(item["row_count"] for item in manifest["objects"])
     if (
         dataset.export_sha256 != dataset._receipt.export_sha256
         or dataset.identity != expected_identity
@@ -441,6 +483,7 @@ def _verify_dataset_receipt(
         or dataset.as_of.unix_nanos != dataset._receipt.as_of_unix_nanos
         or dataset.components != expected_components
         or dataset.split_policy != expected_policy
+        or dataset.population != _population(source, expected_identity.study, expected_counts)
         or dataset.split_counts != expected_counts
         or dataset.missing_value_policy != manifest["missing_value_policy"]
         or dataset.complete != expected_complete

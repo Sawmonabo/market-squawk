@@ -1,6 +1,6 @@
 //! Python-produced bundle authority verification shared by the validator and local application.
 
-use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
+use std::num::{NonZeroU16, NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::Path;
 use std::str::FromStr;
 use std::time::Instant;
@@ -11,18 +11,22 @@ use market_squawk_analytics::{
 };
 use market_squawk_data::{
     CatalogEndpointIdentity, ComponentKind, ComponentScope, CorporateActionSensitivity,
-    FeatureLabelComponentSpec, PythonDatasetCatalogError, PythonDatasetSelection,
+    DatasetTargetHorizon, FeatureDatasetProductContract, FeatureLabelComponentSpec,
+    FeatureLabelMeasurement, FinancialAmountBasis, FinancialAmountRole, FinancialShareConvention,
+    FixedHorizonOriginBasis, PythonDatasetCatalogError, PythonDatasetSelection,
     PythonDatasetVerificationLimits, Sha256Digest, verify_python_dataset,
 };
-use market_squawk_domain::{ModelId, RoundingPolicy, Timestamp};
+use market_squawk_domain::{Currency, FundamentalCadence, ModelId, RoundingPolicy, Timestamp};
 use serde::Deserialize;
 use sha2::{Digest as _, Sha256};
 use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    BundleError, BundleExpectations, BundleId, BundleMetadataRef, ControlledModelRoot, ModelBundle,
-    ModelOutputSemantics, TrainingDatasetIdentity, TrainingPeriod, VerifiedTrainingEnvironment,
+    BundleError, BundleExpectations, BundleId, BundleMetadataRef, ConfiguredTrainingEnvironment,
+    ControlledModelRoot, ForecastCentralStatistic, ForecastEstimatorProfile, ForecastMeasurement,
+    ForecastOutputBinding, ForecastTargetMeaning, ForecastTrainingObjective, ForecastTransform,
+    ModelBundle, ModelOutputSemantics, TrainingDatasetIdentity, TrainingPeriod,
 };
 
 /// Maximum exact independent authority-document bytes admitted before parsing.
@@ -36,6 +40,7 @@ pub struct PythonDatasetAdmissionAuthority {
     as_of: Timestamp,
     selection_sha256: Sha256Digest,
     catalog_identity: CatalogEndpointIdentity,
+    product_contract: FeatureDatasetProductContract,
 }
 
 impl PythonDatasetAdmissionAuthority {
@@ -49,8 +54,13 @@ impl PythonDatasetAdmissionAuthority {
         as_of: Timestamp,
         selection_sha256: Sha256Digest,
         catalog_identity: CatalogEndpointIdentity,
+        product_contract: FeatureDatasetProductContract,
     ) -> Result<Self, ModelAdmissionError> {
-        if export_sha256.bytes() == [0; 32] || selection_sha256.bytes() == [0; 32] {
+        if export_sha256.bytes() == [0; 32] || selection_sha256.bytes() == [0; 32]
+            || !matches!(product_contract, FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnTrainingV1 | FeatureDatasetProductContract::FinancialAmountFiscalPeriodsTrainingV1
+                | FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonPriceHigherTrainingV1
+                | FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonBenchmarkOutperformanceTrainingV1
+                | FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonProfitAfterCostsTrainingV1) {
             return Err(ModelAdmissionError::InvalidDatasetAuthority);
         }
         Ok(Self {
@@ -58,6 +68,7 @@ impl PythonDatasetAdmissionAuthority {
             as_of,
             selection_sha256,
             catalog_identity,
+            product_contract,
         })
     }
 
@@ -85,6 +96,11 @@ impl PythonDatasetAdmissionAuthority {
         self.catalog_identity
     }
 
+    /// Exact code-owned training recipe independently checked in the catalog.
+    pub const fn product_contract(self) -> FeatureDatasetProductContract {
+        self.product_contract
+    }
+
     fn verify(
         self,
         local_root: &Path,
@@ -95,6 +111,7 @@ impl PythonDatasetAdmissionAuthority {
         let selection = verify_python_dataset(
             local_root,
             self.export_sha256,
+            self.product_contract,
             self.as_of,
             limits,
             deadline,
@@ -236,7 +253,7 @@ pub fn verify_model_candidate(
     authority_sha256: Sha256Digest,
     dataset_root: &Path,
     dataset: PythonDatasetAdmissionAuthority,
-    training_environment: &VerifiedTrainingEnvironment,
+    training_environment: &ConfiguredTrainingEnvironment,
     feature_registry: &ProductionFeatureRegistry,
     dataset_limits: PythonDatasetVerificationLimits,
     deadline: Instant,
@@ -255,6 +272,8 @@ pub fn verify_model_candidate(
         &expectations,
         feature_registry.feature_registry(),
     )?;
+    verify_feature_order(bundle.metadata())?;
+    bundle.verify_probability_sources(&selection)?;
     Ok(ValidatedModelCandidate {
         bundle,
         authority,
@@ -291,6 +310,8 @@ pub fn recover_model_candidate(
         &expectations,
         feature_registry.feature_registry(),
     )?;
+    verify_feature_order(bundle.metadata())?;
+    bundle.verify_probability_sources(&selection)?;
     Ok(ValidatedModelCandidate {
         bundle,
         authority,
@@ -298,11 +319,82 @@ pub fn recover_model_candidate(
     })
 }
 
+/// Reopens the exact durable selection evidence without allocating the model weight artifact.
+/// Initial admission and active inference still require full candidate and backend validation.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "independent persisted dataset and filesystem authorities remain explicit"
+)]
+pub fn recover_model_selection_metadata(
+    root: &ControlledModelRoot,
+    metadata: &BundleMetadataRef,
+    authority_bytes: &[u8],
+    authority_sha256: Sha256Digest,
+    dataset_root: &Path,
+    dataset: PythonDatasetAdmissionAuthority,
+    feature_registry: &ProductionFeatureRegistry,
+    dataset_limits: PythonDatasetVerificationLimits,
+    deadline: Instant,
+    cancellation: &CancellationToken,
+) -> Result<crate::bundle::ModelSelectionMetadata, ModelAdmissionError> {
+    let selection = dataset.verify(dataset_root, dataset_limits, deadline, cancellation)?;
+    let (_, expectations) = authority(authority_bytes, authority_sha256, &selection, None)?;
+    let metadata = ModelBundle::load_selection_metadata(
+        root,
+        metadata,
+        &expectations,
+        feature_registry.feature_registry(),
+    )?;
+    verify_feature_order(metadata.metadata())?;
+    Ok(metadata)
+}
+
+/// Returns whether model metadata names the single admitted V1 coefficient vector exactly.
+#[must_use]
+pub fn has_price_return_macro_context_feature_order_v1(metadata: &crate::ModelMetadata) -> bool {
+    let contract =
+        FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonForwardReturnTrainingV1;
+    let macros = contract.macro_components();
+    let Some((price_return, retained_macros)) = metadata.features().split_first() else {
+        return false;
+    };
+    price_return.key().name() == "research.price-return"
+        && price_return.key().version() == NonZeroU32::MIN
+        && retained_macros.len() == macros.len()
+        && retained_macros
+            .iter()
+            .zip(macros)
+            .enumerate()
+            .all(|(position, (binding, expected))| {
+                usize::from(expected.position()) == position
+                    && binding.key().name() == expected.component_name()
+                    && binding.key().version() == NonZeroU32::MIN
+            })
+}
+
+fn verify_feature_order(metadata: &crate::ModelMetadata) -> Result<(), ModelAdmissionError> {
+    if has_price_return_macro_context_feature_order_v1(metadata)
+        || (matches!(
+            metadata.output_binding().measurement(),
+            ForecastMeasurement::FinancialAmount { .. }
+        ) && matches!(
+            metadata.output_binding().target(),
+            ForecastTargetMeaning::FinancialPeriod { .. }
+        ) && metadata.features().len() == 1
+            && metadata.features()[0].key().name() == "research.reported-financial-amount"
+            && metadata.features()[0].key().version() == NonZeroU32::MIN)
+    {
+        Ok(())
+    } else {
+        Err(ModelAdmissionError::InvalidAuthority)
+    }
+}
+
 fn authority(
     bytes: &[u8],
     expected_sha256: Sha256Digest,
     selection: &PythonDatasetSelection,
-    environment: Option<&VerifiedTrainingEnvironment>,
+    environment: Option<&ConfiguredTrainingEnvironment>,
 ) -> Result<(BundleAuthorityDocument, BundleExpectations), ModelAdmissionError> {
     if bytes.is_empty() || bytes.len() > MAX_BUNDLE_AUTHORITY_BYTES {
         return Err(ModelAdmissionError::InvalidAuthority);
@@ -326,15 +418,14 @@ fn authority(
 fn expectations(
     wire: &ExpectationsWire,
     selection: &PythonDatasetSelection,
-    environment: Option<&VerifiedTrainingEnvironment>,
+    environment: Option<&ConfiguredTrainingEnvironment>,
 ) -> Result<BundleExpectations, ModelAdmissionError> {
-    let output_semantics = match (wire.schema_version, wire.output_semantics.as_deref()) {
-        (5, None) => None,
-        (6, Some("regression")) => Some(ModelOutputSemantics::Regression),
-        (6, Some("binary_probability")) => Some(ModelOutputSemantics::BinaryProbability),
+    let output_semantics = match wire.output_semantics.as_str() {
+        "regression" => ModelOutputSemantics::Regression,
+        "binary_probability" => ModelOutputSemantics::BinaryProbability,
         _ => return Err(ModelAdmissionError::InvalidAuthority),
     };
-    if !matches!(wire.schema_version, 5 | 6)
+    if wire.schema_version != 8
         || wire.label.kind != "label"
         || !dataset_matches_selection(&wire.dataset, selection)?
         || wire.universe_id != selection.identity().universe_id().as_str()
@@ -363,6 +454,9 @@ fn expectations(
                 .map_err(|_| ModelAdmissionError::InvalidAuthority)?,
         )
         .ok_or(ModelAdmissionError::InvalidAuthority)?,
+        selection.split_policy(),
+        selection.study_policy().copied(),
+        selection.source_snapshot_digest(),
     )
     .map_err(|_| ModelAdmissionError::InvalidAuthority)?;
     let scope = match wire.label.scope.as_str() {
@@ -390,48 +484,241 @@ fn expectations(
         BundleId::try_new(&wire.bundle_id).map_err(|_| ModelAdmissionError::InvalidAuthority)?;
     let bundle_version =
         NonZeroU64::new(wire.bundle_version).ok_or(ModelAdmissionError::InvalidAuthority)?;
-    let training_period = TrainingPeriod::try_new(
-        Timestamp::from_unix_nanos(wire.training_period.start_unix_nanos),
-        Timestamp::from_unix_nanos(wire.training_period.end_unix_nanos),
-    )
-    .map_err(|_| ModelAdmissionError::InvalidAuthority)?;
+    let training_period = wire
+        .training_period
+        .decode()
+        .map_err(|_| ModelAdmissionError::InvalidAuthority)?;
     let training_environment_hash = Sha256Digest::new(environment_hash);
     let bundle_metadata_hash = Sha256Digest::new(parse_hex(&wire.bundle_metadata_sha256)?);
     let artifact_hash = Sha256Digest::new(parse_hex(&wire.artifact_sha256)?);
     let training_run_hash = Sha256Digest::new(parse_hex(&wire.training_run_sha256)?);
-    let result = if let Some(output_semantics) = output_semantics {
-        BundleExpectations::try_new_with_output_semantics(
-            model_id,
-            bundle_id,
-            bundle_version,
-            dataset,
-            identity.universe_id().clone(),
-            training_period,
-            label,
-            &wire.training_code_revision,
-            training_environment_hash,
-            bundle_metadata_hash,
-            artifact_hash,
-            training_run_hash,
-            output_semantics,
-        )
-    } else {
-        BundleExpectations::try_new(
-            model_id,
-            bundle_id,
-            bundle_version,
-            dataset,
-            identity.universe_id().clone(),
-            training_period,
-            label,
-            &wire.training_code_revision,
-            training_environment_hash,
-            bundle_metadata_hash,
-            artifact_hash,
-            training_run_hash,
-        )
+    let output_binding = output_binding(
+        &wire.output_measurement,
+        &wire.output_statistic,
+        output_semantics,
+        &label,
+        selection,
+    )?;
+    BundleExpectations::try_new_with_output_binding(
+        model_id,
+        bundle_id,
+        bundle_version,
+        dataset,
+        identity.universe_id().clone(),
+        training_period,
+        label,
+        &wire.training_code_revision,
+        training_environment_hash,
+        bundle_metadata_hash,
+        artifact_hash,
+        training_run_hash,
+        output_binding,
+    )
+    .map_err(|_| ModelAdmissionError::InvalidAuthority)
+}
+
+fn output_binding(
+    wire: &OutputMeasurementWire,
+    statistic_wire: &OutputStatisticWire,
+    output_semantics: ModelOutputSemantics,
+    label: &FeatureLabelComponentSpec,
+    selection: &PythonDatasetSelection,
+) -> Result<ForecastOutputBinding, ModelAdmissionError> {
+    let measurement = match wire {
+        OutputMeasurementWire::Price { currency } => {
+            let encoded = currency.as_str();
+            let currency =
+                Currency::try_from(encoded).map_err(|_| ModelAdmissionError::InvalidAuthority)?;
+            if currency.as_str() != encoded {
+                return Err(ModelAdmissionError::InvalidAuthority);
+            }
+            FeatureLabelMeasurement::Price { currency }
+        }
+        OutputMeasurementWire::Return => FeatureLabelMeasurement::Return,
+        OutputMeasurementWire::FinancialAmount {
+            currency,
+            role,
+            basis,
+            share_convention,
+        } => {
+            let parsed = Currency::try_from(currency.as_str())
+                .map_err(|_| ModelAdmissionError::InvalidAuthority)?;
+            if parsed.as_str() != currency {
+                return Err(ModelAdmissionError::InvalidAuthority);
+            }
+            FeatureLabelMeasurement::FinancialAmount {
+                currency: parsed,
+                role: *role,
+                basis: *basis,
+                share_convention: *share_convention,
+            }
+        }
+        OutputMeasurementWire::Probability => FeatureLabelMeasurement::Probability,
+        OutputMeasurementWire::OtherRegression => FeatureLabelMeasurement::OtherRegression,
     };
-    result.map_err(|_| ModelAdmissionError::InvalidAuthority)
+    if selection.label_measurement(label) != Some(measurement) {
+        return Err(ModelAdmissionError::InvalidAuthority);
+    }
+    let measurement = match measurement {
+        FeatureLabelMeasurement::Price { currency } => ForecastMeasurement::Price { currency },
+        FeatureLabelMeasurement::Return => ForecastMeasurement::Return,
+        FeatureLabelMeasurement::FinancialAmount {
+            currency,
+            role,
+            basis,
+            share_convention,
+        } => ForecastMeasurement::FinancialAmount {
+            currency,
+            role,
+            basis,
+            share_convention,
+        },
+        FeatureLabelMeasurement::Probability => ForecastMeasurement::Probability,
+        FeatureLabelMeasurement::OtherRegression => ForecastMeasurement::OtherRegression,
+    };
+    let expected_target = match (
+        selection.label_target_horizon(label),
+        selection.label_fixed_horizon_origin_basis(label),
+    ) {
+        (Some(DatasetTargetHorizon::ExactElapsed(horizon)), Some(origin_basis)) => {
+            ForecastTargetMeaning::FixedHorizonTerminal {
+                horizon_nanos: u64::try_from(horizon.as_nanos())
+                    .ok()
+                    .and_then(NonZeroU64::new)
+                    .ok_or(ModelAdmissionError::InvalidAuthority)?,
+                origin_basis,
+            }
+        }
+        (
+            Some(DatasetTargetHorizon::FiscalPeriods {
+                cadence,
+                periods_ahead,
+            }),
+            None,
+        ) => ForecastTargetMeaning::FinancialPeriod {
+            cadence,
+            periods_ahead,
+        },
+        (None, None) => ForecastTargetMeaning::Unsupported,
+        _ => return Err(ModelAdmissionError::InvalidAuthority),
+    };
+    let expected_target = match (
+        expected_target,
+        selection.label_probability_event_target(label),
+    ) {
+        (
+            ForecastTargetMeaning::FixedHorizonTerminal {
+                horizon_nanos,
+                origin_basis,
+            },
+            Some(event),
+        ) => ForecastTargetMeaning::FixedHorizonEvent {
+            horizon_nanos,
+            origin_basis,
+            event,
+        },
+        (target, None) => target,
+        _ => return Err(ModelAdmissionError::InvalidAuthority),
+    };
+    let target = match statistic_wire.target {
+        TargetWire::FixedHorizonTerminal {
+            horizon_nanos,
+            origin_basis,
+        } => ForecastTargetMeaning::FixedHorizonTerminal {
+            horizon_nanos: NonZeroU64::new(horizon_nanos)
+                .ok_or(ModelAdmissionError::InvalidAuthority)?,
+            origin_basis,
+        },
+        TargetWire::FixedHorizonEvent {
+            horizon_nanos,
+            origin_basis,
+            event,
+        } => ForecastTargetMeaning::FixedHorizonEvent {
+            horizon_nanos: NonZeroU64::new(horizon_nanos)
+                .ok_or(ModelAdmissionError::InvalidAuthority)?,
+            origin_basis,
+            event,
+        },
+        TargetWire::Unsupported => ForecastTargetMeaning::Unsupported,
+        TargetWire::FinancialPeriod {
+            cadence,
+            periods_ahead,
+        } => ForecastTargetMeaning::FinancialPeriod {
+            cadence,
+            periods_ahead,
+        },
+    };
+    if target != expected_target {
+        return Err(ModelAdmissionError::InvalidAuthority);
+    }
+    let central_statistic = match statistic_wire.statistic.as_str() {
+        "model_estimated_conditional_mean" => {
+            ForecastCentralStatistic::ModelEstimatedConditionalMean
+        }
+        "unavailable" => ForecastCentralStatistic::Unavailable,
+        _ => return Err(ModelAdmissionError::InvalidAuthority),
+    };
+    let target_transform = transform(&statistic_wire.target_transform)?;
+    let output_transform = transform(&statistic_wire.output_transform)?;
+    let objective = match statistic_wire.objective.as_str() {
+        "squared_error" => ForecastTrainingObjective::SquaredError,
+        "binary_cross_entropy" => ForecastTrainingObjective::BinaryCrossEntropy,
+        _ => return Err(ModelAdmissionError::InvalidAuthority),
+    };
+    let estimator = match statistic_wire.estimator {
+        EstimatorWire::SealedDirectLeastSquaresV1 => {
+            ForecastEstimatorProfile::SealedDirectLeastSquaresV1
+        }
+        EstimatorWire::SealedDirectRidgeV1 { ridge_alpha } => {
+            if !ridge_alpha.is_finite() || ridge_alpha < 0.0 {
+                return Err(ModelAdmissionError::InvalidAuthority);
+            }
+            ForecastEstimatorProfile::SealedDirectRidgeV1 {
+                ridge_alpha_bits: ridge_alpha.to_bits(),
+            }
+        }
+        EstimatorWire::SealedOobMeanBlockBootstrapRidgeV1 {
+            ridge_alpha,
+            resampling_block_length,
+            resampling_count,
+            resampling_seed,
+        } => {
+            if !ridge_alpha.is_finite()
+                || ridge_alpha < 0.0
+                || !(1..=100_000).contains(&resampling_block_length)
+                || !(2..=30).contains(&resampling_count)
+            {
+                return Err(ModelAdmissionError::InvalidAuthority);
+            }
+            ForecastEstimatorProfile::SealedOobMeanBlockBootstrapRidgeV1 {
+                ridge_alpha_bits: ridge_alpha.to_bits(),
+                resampling_block_length,
+                resampling_count,
+                resampling_seed,
+            }
+        }
+        EstimatorWire::SealedBinaryLogisticV1 => ForecastEstimatorProfile::SealedBinaryLogisticV1,
+    };
+    ForecastOutputBinding::try_from_admitted_model(
+        output_semantics,
+        measurement,
+        central_statistic,
+        target,
+        target_transform,
+        output_transform,
+        objective,
+        estimator,
+        label.clone(),
+    )
+    .map_err(|_| ModelAdmissionError::InvalidAuthority)
+}
+
+fn transform(value: &str) -> Result<ForecastTransform, ModelAdmissionError> {
+    match value {
+        "identity" => Ok(ForecastTransform::Identity),
+        "logistic" => Ok(ForecastTransform::Logistic),
+        _ => Err(ModelAdmissionError::InvalidAuthority),
+    }
 }
 
 fn dataset_matches_selection(
@@ -455,7 +742,13 @@ fn dataset_matches_selection(
         && wire.selection_as_of_unix_nanos == selection.as_of().unix_nanos()
         && wire.selected_component_rows
             == u64::try_from(selection.selected_rows())
-                .map_err(|_| ModelAdmissionError::InvalidAuthority)?)
+                .map_err(|_| ModelAdmissionError::InvalidAuthority)?
+        && wire.split_policy.matches(selection.split_policy())
+        && crate::metadata::study_matches(
+            wire.study.as_ref(),
+            selection.study_policy(),
+            selection.source_snapshot_digest(),
+        ))
 }
 
 fn parse_hex(value: &str) -> Result<[u8; 32], ModelAdmissionError> {
@@ -487,19 +780,93 @@ const fn nibble(value: u8) -> Option<u8> {
 #[serde(deny_unknown_fields)]
 struct ExpectationsWire {
     schema_version: u32,
-    output_semantics: Option<String>,
+    output_semantics: String,
+    output_measurement: OutputMeasurementWire,
+    output_statistic: OutputStatisticWire,
     model_id: String,
     bundle_id: String,
     bundle_version: u64,
     dataset: DatasetWire,
     universe_id: String,
-    training_period: PeriodWire,
+    training_period: crate::metadata::TrainingPeriodWire,
     label: LabelWire,
     training_code_revision: String,
     training_environment_sha256: String,
     bundle_metadata_sha256: String,
     artifact_sha256: String,
     training_run_sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OutputStatisticWire {
+    statistic: String,
+    target: TargetWire,
+    target_transform: String,
+    output_transform: String,
+    objective: String,
+    estimator: EstimatorWire,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+enum TargetWire {
+    #[serde(rename = "financial_period")]
+    FinancialPeriod {
+        cadence: FundamentalCadence,
+        periods_ahead: NonZeroU16,
+    },
+    #[serde(rename = "fixed_horizon_terminal")]
+    FixedHorizonTerminal {
+        horizon_nanos: u64,
+        origin_basis: FixedHorizonOriginBasis,
+    },
+    #[serde(rename = "fixed_horizon_event")]
+    FixedHorizonEvent {
+        horizon_nanos: u64,
+        origin_basis: FixedHorizonOriginBasis,
+        event: market_squawk_data::ProbabilityEventTarget,
+    },
+    #[serde(rename = "unsupported")]
+    Unsupported,
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+enum EstimatorWire {
+    #[serde(rename = "sealed_direct_least_squares_v1")]
+    SealedDirectLeastSquaresV1,
+    #[serde(rename = "sealed_direct_ridge_v1")]
+    SealedDirectRidgeV1 { ridge_alpha: f64 },
+    #[serde(rename = "sealed_oob_mean_block_bootstrap_ridge_v1")]
+    SealedOobMeanBlockBootstrapRidgeV1 {
+        ridge_alpha: f64,
+        resampling_block_length: u32,
+        resampling_count: u16,
+        resampling_seed: u32,
+    },
+    #[serde(rename = "sealed_binary_logistic_v1")]
+    SealedBinaryLogisticV1,
+}
+
+#[derive(Deserialize)]
+#[serde(tag = "kind", deny_unknown_fields)]
+enum OutputMeasurementWire {
+    #[serde(rename = "financial_amount")]
+    FinancialAmount {
+        currency: String,
+        role: FinancialAmountRole,
+        basis: FinancialAmountBasis,
+        share_convention: Option<FinancialShareConvention>,
+    },
+    #[serde(rename = "price")]
+    Price { currency: String },
+    #[serde(rename = "return")]
+    Return,
+    #[serde(rename = "probability")]
+    Probability,
+    #[serde(rename = "other_regression")]
+    OtherRegression,
 }
 
 #[derive(Deserialize)]
@@ -519,13 +886,8 @@ struct DatasetWire {
     selection_sha256: String,
     universe_sha256: String,
     policy_sha256: String,
-}
-
-#[derive(Deserialize)]
-#[serde(deny_unknown_fields)]
-struct PeriodWire {
-    start_unix_nanos: i64,
-    end_unix_nanos: i64,
+    split_policy: crate::metadata::TrainingSplitWire,
+    study: Option<crate::metadata::TrainingStudyWire>,
 }
 
 #[derive(Deserialize)]

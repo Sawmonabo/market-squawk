@@ -1,9 +1,21 @@
 //! Bounded canonical payload decoding and semantic state reconstruction.
 
+mod forecast;
+pub(crate) use forecast::recover_with_forecasts;
+
 use super::*;
+
+type ForecastSources = BTreeMap<[u8; 32], std::sync::Arc<crate::evidence::ForecastValuationSource>>;
 
 pub(crate) fn recover(
     snapshot: &FairValueCatalogSnapshot,
+) -> Result<RecoveredState, FairValueError> {
+    recover_resolved(snapshot, &ForecastSources::new())
+}
+
+fn recover_resolved(
+    snapshot: &FairValueCatalogSnapshot,
+    forecast_sources: &ForecastSources,
 ) -> Result<RecoveredState, FairValueError> {
     validate_operation_coverage(snapshot)?;
     let mut evidence = BTreeMap::new();
@@ -18,7 +30,7 @@ pub(crate) fn recover(
     for record in snapshot.records() {
         match record.kind() {
             FairValueRecordKind::Evidence => {
-                let value = evidence_from_payload(canonical(record.payload())?)?;
+                let value = evidence_from_payload(canonical(record.payload())?, forecast_sources)?;
                 ensure_id(value.hash().bytes(), record.id())?;
                 insert_unique(&mut evidence, value.hash(), value)?;
             }
@@ -97,11 +109,8 @@ pub(crate) fn recover(
             let measurement = measurements
                 .get(&MeasurementId(*measurement_id))
                 .ok_or(FairValueError::CorruptPersistence)?;
-            let value = ClassificationRuleset::versioned(
-                ruleset_version.unwrap_or(1),
-                *max_quote_age_nanos,
-            )?
-            .classify(measurement)?;
+            let ruleset = current_ruleset_from_payload(*ruleset_version, *max_quote_age_nanos)?;
+            let value = ruleset.classify(measurement)?;
             ensure_id(value.id().bytes(), id.bytes())?;
             insert_unique(&mut decisions, *id, std::sync::Arc::new(value))?;
         }
@@ -167,7 +176,15 @@ pub(crate) fn recover(
         let approved_by = actor(&payload.approved_by)?;
         let approved_at = Timestamp::from_unix_nanos(payload.approved_at_ns);
         let expires_at = Timestamp::from_unix_nanos(payload.expires_at_ns);
-        if approved_at < measurement.prepared_at() || &approved_by == measurement.prepared_by() {
+        if approved_at < measurement.prepared_at()
+            || &approved_by == measurement.prepared_by()
+            || measurement.inputs().iter().any(|input| {
+                input
+                    .evidence()
+                    .derived_exclusive_expiry()
+                    .is_some_and(|expiry| approved_at >= expiry || expires_at > expiry)
+            })
+        {
             return Err(FairValueError::CorruptPersistence);
         }
         if let DecisionBasis::Override { override_id, .. } = decision.basis() {
@@ -225,7 +242,22 @@ pub(crate) fn recover(
     })
 }
 
-fn evidence_from_payload(payload: EvidencePayload) -> Result<FairValueEvidence, FairValueError> {
+fn current_ruleset_from_payload(
+    ruleset_version: u32,
+    max_quote_age_nanos: u64,
+) -> Result<ClassificationRuleset, FairValueError> {
+    let ruleset = ClassificationRuleset::current(max_quote_age_nanos)
+        .map_err(|_| FairValueError::CorruptPersistence)?;
+    if ruleset_version != ruleset.version() {
+        return Err(FairValueError::CorruptPersistence);
+    }
+    Ok(ruleset)
+}
+
+fn evidence_from_payload(
+    payload: EvidencePayload,
+    forecast_sources: &ForecastSources,
+) -> Result<FairValueEvidence, FairValueError> {
     ensure_version(payload.version)?;
     FairValueEvidence::try_from_parts(FairValueEvidenceParts {
         source_id: SourceId::try_from(payload.source_id.as_str())
@@ -233,7 +265,7 @@ fn evidence_from_payload(payload: EvidencePayload) -> Result<FairValueEvidence, 
         source_identifier: SourceIdentifier::try_from(payload.source_identifier.as_str())
             .map_err(|_| FairValueError::CorruptPersistence)?,
         payload_digest: digest(payload.payload_algorithm, payload.payload_digest)?,
-        origin: origin_from_payload(payload.origin)?,
+        origin: origin_from_payload(payload.origin, forecast_sources)?,
         source_timestamp: time(payload.source_timestamp_ns),
         effective_at: time(payload.effective_at_ns),
         published_at: time(payload.published_at_ns),
@@ -250,8 +282,68 @@ fn evidence_from_payload(payload: EvidencePayload) -> Result<FairValueEvidence, 
     })
 }
 
-fn origin_from_payload(value: OriginPayload) -> Result<EvidenceOrigin, FairValueError> {
+fn origin_from_payload(
+    value: OriginPayload,
+    forecast_sources: &ForecastSources,
+) -> Result<EvidenceOrigin, FairValueError> {
     Ok(match value {
+        OriginPayload::ForecastDistribution {
+            source,
+            ordinal,
+            financial_origin,
+        } => {
+            let reference = forecast::reference_from_payload(*source)?;
+            let source = forecast_sources
+                .get(&reference.identity().bytes())
+                .ok_or(FairValueError::Persistence)?;
+            if source.reference() != &reference {
+                return Err(FairValueError::CorruptPersistence);
+            }
+            let selection = match (ordinal, financial_origin) {
+                (Some(index), false) => {
+                    crate::ForecastValuationValueSelection::Outcome(index as usize)
+                }
+                (None, false) => crate::ForecastValuationValueSelection::ConditionalMean,
+                (None, true) => crate::ForecastValuationValueSelection::FinancialOrigin,
+                _ => return Err(FairValueError::CorruptPersistence),
+            };
+            source.selected_amount(selection)?;
+            EvidenceOrigin::ForecastDistribution {
+                evidence: Box::new(crate::evidence::ForecastValuationEvidence {
+                    source: std::sync::Arc::clone(source),
+                    selection,
+                }),
+            }
+        }
+        OriginPayload::PublishedMarket {
+            commit,
+            selection_digest,
+            publication_digest,
+            publication_row,
+            canonical_event_digest,
+            canonical_event,
+            canonical_price_authority,
+            definition_content,
+            definition_audit,
+            knowledge_at_ns,
+            commit_available_at_ns,
+            origin_committed_at_ns,
+        } => EvidenceOrigin::PublishedMarket {
+            evidence: Box::new(crate::evidence::PublishedMarketValuationEvidence {
+                commit: market_event_commit_from_payload(commit)?,
+                selection_digest: digest(1, selection_digest)?,
+                publication_digest: digest(1, publication_digest)?,
+                publication_row,
+                canonical_event_digest: digest(1, canonical_event_digest)?,
+                canonical_event: canonical_event.into_boxed_str(),
+                canonical_price_authority: canonical_price_authority.into_boxed_str(),
+                definition_content: digest(1, definition_content)?,
+                definition_audit: digest(1, definition_audit)?,
+                knowledge_at: Timestamp::from_unix_nanos(knowledge_at_ns),
+                commit_available_at: Timestamp::from_unix_nanos(commit_available_at_ns),
+                origin_committed_at: Timestamp::from_unix_nanos(origin_committed_at_ns),
+            }),
+        },
         OriginPayload::Market {
             venue_id,
             assessment_id,
@@ -262,6 +354,7 @@ fn origin_from_payload(value: OriginPayload) -> Result<EvidenceOrigin, FairValue
             definition_revision,
             activity_policy_hash,
             activity_set_hash,
+            publication,
         } => EvidenceOrigin::Market {
             venue_id: VenueId::try_from(venue_id.as_str())
                 .map_err(|_| FairValueError::CorruptPersistence)?,
@@ -273,6 +366,28 @@ fn origin_from_payload(value: OriginPayload) -> Result<EvidenceOrigin, FairValue
             definition_revision,
             activity_policy_hash,
             activity_set_hash,
+            publication: publication
+                .map(|value| {
+                    Ok::<_, FairValueError>(Box::new(crate::evidence::MarketValuationPublication {
+                        qualified_input_id: InputId(value.qualified_input_id),
+                        qualified_amount: amount_from_payload(value.qualified_amount)?,
+                        commit: market_event_commit_from_payload(value.commit)?,
+                        selection_digest: digest(1, value.selection_digest)?,
+                        publication_digest: digest(1, value.publication_digest)?,
+                        publication_row: value.publication_row,
+                        coordinate_digest: digest(1, value.coordinate_digest)?,
+                        canonical_event_digest: digest(1, value.canonical_event_digest)?,
+                        canonical_event: value.canonical_event.into_boxed_str(),
+                        knowledge_at: Timestamp::from_unix_nanos(value.knowledge_at_ns),
+                        commit_available_at: Timestamp::from_unix_nanos(
+                            value.commit_available_at_ns,
+                        ),
+                        origin_committed_at: Timestamp::from_unix_nanos(
+                            value.origin_committed_at_ns,
+                        ),
+                    }))
+                })
+                .transpose()?,
         },
         OriginPayload::Research {
             manifest,
@@ -333,7 +448,220 @@ fn origin_from_payload(value: OriginPayload) -> Result<EvidenceOrigin, FairValue
             position_quantity: decimal(&quantity_mantissa, quantity_scale)?,
             point_in_time_digest,
         },
+        OriginPayload::Fundamental {
+            manifest,
+            origin_digest,
+            request_digest,
+            selection_digest,
+            result_digest,
+            company_security_digest,
+            canonical_company_security,
+            canonical_company_observation,
+            company_observation_digest,
+            row,
+            canonical_row_digest,
+            knowledge_at_ns,
+            generation_completed_at_ns,
+            canonical_observation,
+        } => EvidenceOrigin::Fundamental {
+            manifest: manifest_from_payload(manifest)?,
+            origin_digest: digest(1, origin_digest)?,
+            request_digest: digest(1, request_digest)?,
+            selection_digest: digest(1, selection_digest)?,
+            result_digest: digest(1, result_digest)?,
+            company_security_digest: digest(1, company_security_digest)?,
+            canonical_company_security: canonical_company_security.into_boxed_str(),
+            canonical_company_observation: canonical_company_observation.into_boxed_str(),
+            company_observation_digest: digest(1, company_observation_digest)?,
+            row,
+            canonical_row_digest: digest(1, canonical_row_digest)?,
+            knowledge_at: Timestamp::from_unix_nanos(knowledge_at_ns),
+            generation_completed_at: Timestamp::from_unix_nanos(generation_completed_at_ns),
+            canonical_observation: canonical_observation.into_boxed_str(),
+        },
+        OriginPayload::AutomaticValuation { receipt } => EvidenceOrigin::AutomaticValuation {
+            receipt: Box::new(automatic_receipt_from_payload(*receipt, forecast_sources)?),
+        },
     })
+}
+
+fn automatic_receipt_from_payload(
+    value: AutomaticReceiptPayload,
+    forecast_sources: &ForecastSources,
+) -> Result<crate::AutomaticValuationMethodReceipt, FairValueError> {
+    use crate::AutomaticValuationIntermediateKind as Step;
+    if value.inputs.len() > 512
+        || (value.admitted_input_manifests.is_empty() && value.admitted_event_inputs.is_empty())
+        || value.admitted_input_manifests.len() > 4096
+        || value.assumptions.len() > 128
+        || value.intermediates.len() > 513
+        || value.peer_identities.len() > 256
+    {
+        return Err(FairValueError::CorruptPersistence);
+    }
+    let inputs = value
+        .inputs
+        .into_iter()
+        .map(|item| {
+            // Automatic outputs cannot recursively become their own method inputs.
+            if matches!(
+                item.evidence.origin,
+                OriginPayload::AutomaticValuation { .. }
+            ) {
+                return Err(FairValueError::CorruptPersistence);
+            }
+            let evidence = evidence_from_payload(item.evidence, forecast_sources)?;
+            let evidence = BTreeMap::from([(evidence.hash(), evidence)]);
+            let mut access = BTreeMap::new();
+            if let Some(payload) = item.market_access {
+                let assessment = access_from_payload(payload)?;
+                access.insert(assessment.id(), std::sync::Arc::new(assessment));
+            }
+            let input = input_from_payload(item.input, &evidence, &access)?;
+            ensure_id(input.id().bytes(), item.input_id)?;
+            crate::PointInTimeValuationInput::try_new(
+                input,
+                digest(1, item.selection_receipt)?,
+                digest(1, item.rights_input_digest)?,
+                Timestamp::from_unix_nanos(item.knowledge_at_ns),
+                Timestamp::from_unix_nanos(item.expires_at_ns),
+            )
+            .map_err(|_| FairValueError::CorruptPersistence)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let assumptions = value
+        .assumptions
+        .into_iter()
+        .map(automatic_assumption_from_payload)
+        .collect::<Result<Vec<_>, _>>()?;
+    let intermediates = value
+        .intermediates
+        .into_iter()
+        .map(|item| {
+            crate::AutomaticValuationIntermediate::try_recover(
+                match item.kind {
+                    1 => Step::DiscountedCashFlow,
+                    2 => Step::DiscountedTerminalValue,
+                    3 => Step::WeightedComparableMultiple,
+                    4 => Step::ComparableSubjectValue,
+                    5 => Step::DiscountedResidualIncome,
+                    6 => Step::ProbabilityWeightedForecast,
+                    _ => return Err(FairValueError::CorruptPersistence),
+                },
+                item.sequence,
+                instrument(&item.instrument_id)?,
+                InputId(item.primary_input),
+                item.secondary_input.map(InputId),
+                decimal(&item.amount_mantissa, item.amount_scale)?,
+                decimal(&item.adjustment_mantissa, item.adjustment_scale)?,
+                decimal(&item.factor_mantissa, item.factor_scale)?,
+                decimal(&item.result_mantissa, item.result_scale)?,
+                digest(1, item.evidence)?,
+            )
+            .map_err(|_| FairValueError::CorruptPersistence)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    crate::AutomaticValuationMethodReceipt::try_recover(
+        crate::automatic::AutomaticValuationRecoveryInput {
+            expected_id: crate::AutomaticValuationIdentity(value.id),
+            expected_input_set_id: crate::AutomaticValuationInputSetIdentity(value.input_set_id),
+            method: match value.method {
+                1 => crate::AutomaticValuationMethod::DiscountedCashFlow,
+                2 => crate::AutomaticValuationMethod::ComparableCompanies,
+                3 => crate::AutomaticValuationMethod::ResidualIncome,
+                4 => crate::AutomaticValuationMethod::ForecastDistribution,
+                _ => return Err(FairValueError::CorruptPersistence),
+            },
+            periods_per_year: value
+                .periods_per_year
+                .map(|periods| NonZeroU32::new(periods).ok_or(FairValueError::CorruptPersistence))
+                .transpose()?,
+            account_id: value
+                .account_id
+                .parse()
+                .map_err(|_| FairValueError::CorruptPersistence)?,
+            instrument_id: instrument(&value.instrument_id)?,
+            company_security: identity_from_payload(&value.company_security)?,
+            peer_identities: value
+                .peer_identities
+                .iter()
+                .map(|identity| identity_from_payload(identity))
+                .collect::<Result<Vec<_>, _>>()?
+                .into_boxed_slice(),
+            rights_decision: market_squawk_data::ResearchUseDecisionDigest::try_from_bytes(
+                value.rights_decision,
+            )
+            .map_err(|_| FairValueError::CorruptPersistence)?,
+            rights_graph: market_squawk_data::ResearchUseGraphDigest::try_from_bytes(
+                value.rights_graph,
+            )
+            .map_err(|_| FairValueError::CorruptPersistence)?,
+            rights_input_digest: digest(1, value.rights_input_digest)?,
+            rights_expires_at: Timestamp::from_unix_nanos(value.rights_expires_at_ns),
+            admitted_input_manifests: value
+                .admitted_input_manifests
+                .into_iter()
+                .map(manifest_from_payload)
+                .collect::<Result<Vec<_>, _>>()?
+                .into_boxed_slice(),
+            admitted_event_inputs: value
+                .admitted_event_inputs
+                .into_iter()
+                .map(event_rights_admission_from_payload)
+                .collect::<Result<Vec<_>, _>>()?
+                .into_boxed_slice(),
+            current_market_input: InputId(value.current_market_input),
+            method_base_input: value.method_base_input.map(InputId),
+            inputs: inputs.into_boxed_slice(),
+            assumptions: assumptions.into_boxed_slice(),
+            macro_assumptions: value
+                .macro_assumptions
+                .map(automatic_macro_assumptions_from_payload)
+                .transpose()?,
+            residual_terminal: value
+                .residual_terminal
+                .map(residual_terminal_from_payload)
+                .transpose()?,
+            intermediates: intermediates.into_boxed_slice(),
+            range: crate::AutomaticValuationRange::try_new(
+                amount_from_payload(value.lower)?,
+                amount_from_payload(value.central)?,
+                amount_from_payload(value.upper)?,
+            )
+            .map_err(|_| FairValueError::CorruptPersistence)?,
+            arithmetic_policy: crate::ValuationArithmeticPolicy::try_new(
+                value.rounding,
+                usize::try_from(value.maximum_periods)
+                    .map_err(|_| FairValueError::CorruptPersistence)?,
+            )
+            .map_err(|_| FairValueError::CorruptPersistence)?,
+            method_selection_receipt: value
+                .method_selection_receipt
+                .map(|value| digest(1, value))
+                .transpose()?,
+            forecast_horizon_nanos: value
+                .forecast_horizon_nanos
+                .map(|horizon| {
+                    std::num::NonZeroU64::new(horizon).ok_or(FairValueError::CorruptPersistence)
+                })
+                .transpose()?,
+            forecast_terminal_at: time(value.forecast_terminal_at_ns),
+            measurement_at: Timestamp::from_unix_nanos(value.measurement_at_ns),
+            calculated_at: Timestamp::from_unix_nanos(value.calculated_at_ns),
+            calculated_by: actor(&value.calculated_by)?,
+            expires_at: Timestamp::from_unix_nanos(value.expires_at_ns),
+        },
+    )
+    .map_err(|_| FairValueError::CorruptPersistence)
+}
+
+fn identity_from_payload(
+    value: &str,
+) -> Result<market_squawk_data::CompanySecurityIdentitySelectionReceipt, FairValueError> {
+    market_squawk_data::CompanySecurityIdentitySelectionReceipt::from_canonical_bytes(
+        value.as_bytes(),
+    )
+    .map_err(|_| FairValueError::CorruptPersistence)
 }
 
 fn input_from_payload(
@@ -351,7 +679,7 @@ fn input_from_payload(
                 .ok_or(FairValueError::CorruptPersistence)
         })
         .transpose()?;
-    ValuationInput::try_from_persisted_v1_spec(ValuationInputSpec {
+    ValuationInput::try_from_spec(ValuationInputSpec {
         subject_instrument_id: instrument(&payload.subject_instrument_id)?,
         reference_instrument_id: instrument(&payload.reference_instrument_id)?,
         relationship: relation_from_tag(payload.relationship)?,
@@ -464,6 +792,7 @@ pub(super) fn amount_payload(value: ValuationAmount) -> AmountPayload {
         decimal_scale: value.money().amount().scale(),
         currency: value.money().currency().as_str().to_owned(),
         accounting_scale: value.scale(),
+        basis: crate::measurement::amount_basis_tag(value.basis()),
     }
 }
 
@@ -475,7 +804,18 @@ fn amount_from_payload(value: AmountPayload) -> Result<ValuationAmount, FairValu
                 .map_err(|_| FairValueError::CorruptPersistence)?,
         ),
         value.accounting_scale,
+        amount_basis_from_tag(value.basis)?,
     )
+}
+
+fn amount_basis_from_tag(value: u8) -> Result<ValuationAmountBasis, FairValueError> {
+    match value {
+        1 => Ok(ValuationAmountBasis::PerInstrumentUnit),
+        2 => Ok(ValuationAmountBasis::ReportingEntityTotal),
+        3 => Ok(ValuationAmountBasis::PositionTotal),
+        4 => Ok(ValuationAmountBasis::TotalCommonEquity),
+        _ => Err(FairValueError::CorruptPersistence),
+    }
 }
 
 pub(super) fn use_assessment_payload(value: &InputUseAssessment) -> UseAssessmentPayload {
@@ -502,6 +842,83 @@ fn use_assessment_from_payload(
         actor(&value.assessed_by)?,
         Timestamp::from_unix_nanos(value.assessed_at_ns),
     )
+}
+
+pub(super) fn market_event_commit_payload(
+    value: &MarketEventCommitRef,
+) -> MarketEventCommitPayload {
+    MarketEventCommitPayload {
+        dataset_id: value.dataset_id().as_str().to_owned(),
+        sequence: value.sequence(),
+        schema_name: value.schema().name().to_owned(),
+        schema_version: value.schema().version().get(),
+        schema_fingerprint: value.schema().fingerprint(),
+        content_hash: value.content_hash().bytes(),
+        available_at_ns: value.available_at().unix_nanos(),
+        publication_digest: value.publication_digest().bytes(),
+        row_count: value.row_count(),
+    }
+}
+
+fn market_event_commit_from_payload(
+    value: MarketEventCommitPayload,
+) -> Result<MarketEventCommitRef, FairValueError> {
+    let schema = DatasetSchemaRef::try_new(
+        value.schema_name,
+        SchemaVersion::new(value.schema_version).map_err(|_| FairValueError::CorruptPersistence)?,
+        value.schema_fingerprint,
+    )
+    .map_err(|_| FairValueError::CorruptPersistence)?;
+    // These are checked coordinates; reopening and rights authorization still verify the catalog.
+    MarketEventCommitRef::try_new(
+        DatasetId::try_from(value.dataset_id.as_str())
+            .map_err(|_| FairValueError::CorruptPersistence)?,
+        value.sequence,
+        schema,
+        Sha256Digest::new(value.content_hash),
+        Timestamp::from_unix_nanos(value.available_at_ns),
+        digest(1, value.publication_digest)?,
+        value.row_count,
+    )
+    .map_err(|_| FairValueError::CorruptPersistence)
+}
+
+fn event_rights_admission_from_payload(
+    value: EventRightsAdmissionPayload,
+) -> Result<crate::automatic::ValuationEventRightsAdmission, FairValueError> {
+    use market_squawk_data::ProviderMarketEventPublicationKind as Kind;
+    let inputs = value
+        .inputs
+        .into_iter()
+        .map(|input| {
+            market_squawk_data::MarketEventUseInput::try_new(
+                digest(1, input.publication_digest)?,
+                match input.publication_kind.as_str() {
+                    "response_market_event" => Kind::ResponseMarketEvent,
+                    "event_microbatch" => Kind::EventMicrobatch,
+                    "composite_response_event" => Kind::CompositeResponseEvent,
+                    _ => return Err(FairValueError::CorruptPersistence),
+                },
+                input.row_ordinal,
+                digest(1, input.coordinate_digest)?,
+                digest(1, input.canonical_event_digest)?,
+                SourceId::try_from(input.source_id.as_str())
+                    .map_err(|_| FairValueError::CorruptPersistence)?,
+                Timestamp::from_unix_nanos(input.origin_committed_at_ns),
+            )
+            .map_err(|_| FairValueError::CorruptPersistence)
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    crate::automatic::ValuationEventRightsAdmission::try_recover(
+        market_event_commit_from_payload(value.commit)?,
+        inputs,
+        digest(1, value.rights_input_digest)?,
+        market_squawk_data::ResearchUseDecisionDigest::try_from_bytes(value.decision_digest)
+            .map_err(|_| FairValueError::CorruptPersistence)?,
+        Timestamp::from_unix_nanos(value.evaluated_at_ns),
+        Timestamp::from_unix_nanos(value.expires_at_ns),
+    )
+    .map_err(|_| FairValueError::CorruptPersistence)
 }
 
 pub(super) fn manifest_payload(value: &DatasetManifestRef) -> ManifestPayload {
@@ -706,4 +1123,101 @@ fn hierarchy_from_tag(value: u8) -> Result<FairValueHierarchy, FairValueError> {
         4 => Ok(FairValueHierarchy::Unclassified),
         _ => Err(FairValueError::CorruptPersistence),
     }
+}
+
+fn automatic_assumption_from_payload(
+    item: AutomaticAssumptionPayload,
+) -> Result<crate::AutomaticValuationAssumption, FairValueError> {
+    use crate::AutomaticValuationAssumptionKind as Assumption;
+
+    crate::AutomaticValuationAssumption::try_new(
+        match item.kind {
+            1 => Assumption::DiscountRate,
+            2 => Assumption::ComparableWeight,
+            3 => Assumption::CostOfEquity,
+            4 => Assumption::ForecastProbability,
+            5 => Assumption::UncertaintyLower,
+            6 => Assumption::UncertaintyUpper,
+            7 => Assumption::TerminalGrowth,
+            _ => return Err(FairValueError::CorruptPersistence),
+        },
+        &item.identifier,
+        decimal(&item.mantissa, item.scale)?,
+        digest(1, item.evidence)?,
+        Timestamp::from_unix_nanos(item.available_at_ns),
+        Timestamp::from_unix_nanos(item.expires_at_ns),
+    )
+    .map_err(|_| FairValueError::CorruptPersistence)
+}
+
+fn automatic_macro_assumptions_from_payload(
+    value: AutomaticMacroAssumptionsPayload,
+) -> Result<crate::FinancialModelMacroAssumptions, FairValueError> {
+    let reference = crate::MacroRateReferenceEvidence::try_new(
+        match value.maturity {
+            1 => crate::MacroRateMaturity::TenYear,
+            2 => crate::MacroRateMaturity::ThirtyYear,
+            _ => return Err(FairValueError::CorruptPersistence),
+        },
+        decimal(&value.annual_yield_mantissa, value.annual_yield_scale)?,
+        digest(1, value.context_identity)?,
+        digest(1, value.evidence_identity)?,
+        Timestamp::from_unix_nanos(value.knowledge_cutoff_ns),
+        value.effective_date_cutoff,
+        Timestamp::from_unix_nanos(value.available_at_ns),
+        Timestamp::from_unix_nanos(value.expires_at_ns),
+    )
+    .map_err(|_| FairValueError::CorruptPersistence)?;
+    let rate = automatic_assumption_from_payload(value.rate)?;
+    let binding = crate::FinancialModelMacroAssumptions::try_new(
+        reference,
+        automatic_assumption_from_payload(value.premium)?,
+        rate.kind(),
+        rate.identifier(),
+    )
+    .map_err(|_| FairValueError::CorruptPersistence)?;
+    let binding = match value.premium_source {
+        Some(bytes) => binding
+            .try_with_premium_source(
+                bytes.into_boxed_slice(),
+                value
+                    .premium_parents
+                    .into_iter()
+                    .map(manifest_from_payload)
+                    .collect::<Result<Vec<_>, _>>()?,
+            )
+            .map_err(|_| FairValueError::CorruptPersistence)?,
+        None if value.premium_parents.is_empty() => binding,
+        None => return Err(FairValueError::CorruptPersistence),
+    };
+    if binding.assumption() != &rate {
+        return Err(FairValueError::CorruptPersistence);
+    }
+    Ok(binding)
+}
+
+fn residual_terminal_from_payload(
+    value: ResidualIncomeTerminalPayload,
+) -> Result<crate::ResidualIncomeTerminalReceipt, FairValueError> {
+    crate::ResidualIncomeTerminalReceipt::try_recover(
+        match value.convention {
+            1 => crate::ResidualIncomeTerminalConvention::ZeroAbnormalEarningsAfterExplicitHorizon,
+            _ => return Err(FairValueError::CorruptPersistence),
+        },
+        NonZeroU32::new(value.terminal_period).ok_or(FairValueError::CorruptPersistence)?,
+        InputId(value.current_book_input),
+        InputId(value.final_income_input),
+        InputId(value.final_opening_book_input),
+        digest(1, value.annual_rate_identity)?,
+        decimal(
+            &value.annual_cost_of_equity_mantissa,
+            value.annual_cost_of_equity_scale,
+        )?,
+        decimal(
+            &value.continuing_value_sensitivity_mantissa,
+            value.continuing_value_sensitivity_scale,
+        )?,
+        digest(1, value.identity)?,
+    )
+    .map_err(|_| FairValueError::CorruptPersistence)
 }

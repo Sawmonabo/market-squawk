@@ -2,11 +2,12 @@
 
 use std::time::Instant;
 
+use crate::virtual_paper::ExecutionAuthority;
 use market_squawk_domain::{
     ApprovalId, BookLevel, DataQuality, InstrumentExecutionTerms, OrderId, OrderSide, PriceTicks,
     RuleVersion, SourceIdentifier, Timestamp,
 };
-use market_squawk_live::{CommittedActionContext, ConsumedLiveAuthority};
+use market_squawk_live::CommittedActionContext;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -140,6 +141,7 @@ pub struct ExecutionMarketReference {
     observed_at: Timestamp,
     source_timestamp: Option<Timestamp>,
     quality: DataQuality,
+    virtual_paper: bool,
     bids: [Option<BookLevel>; MAX_EXECUTION_MARKET_LEVELS_PER_SIDE],
     asks: [Option<BookLevel>; MAX_EXECUTION_MARKET_LEVELS_PER_SIDE],
     bid_count: u8,
@@ -148,6 +150,29 @@ pub struct ExecutionMarketReference {
 }
 
 impl ExecutionMarketReference {
+    pub(crate) fn from_virtual_paper(
+        authority: &market_squawk_live::virtual_paper::ConsumedVirtualPaperAuthority,
+    ) -> Self {
+        let (bids, bid_count) = copy_levels(&[authority.bid()]);
+        let (asks, ask_count) = copy_levels(&[authority.ask()]);
+        Self {
+            execution_terms: authority.terms(),
+            observed_at: authority.received_at(),
+            source_timestamp: Some(authority.source_at()),
+            quality: DataQuality::DirectUnverified,
+            virtual_paper: true,
+            bids,
+            asks,
+            bid_count,
+            ask_count,
+            depth_complete: true,
+        }
+    }
+    /// Whether these explicit increments and original quote are admitted exclusively to simulation.
+    pub const fn is_virtual_paper(self) -> bool {
+        self.virtual_paper
+    }
+
     pub(crate) fn from_committed_context(context: &CommittedActionContext<'_>) -> Self {
         let market = context.market();
         let (bids, bid_count) = copy_levels(market.bids());
@@ -157,6 +182,7 @@ impl ExecutionMarketReference {
             observed_at: market.observed_at(),
             source_timestamp: context.source_timestamp(),
             quality: DataQuality::DirectVerified,
+            virtual_paper: false,
             bids,
             asks,
             bid_count,
@@ -180,6 +206,7 @@ impl ExecutionMarketReference {
             observed_at,
             source_timestamp: Some(observed_at),
             quality: DataQuality::DirectVerified,
+            virtual_paper: false,
             bids,
             asks,
             bid_count,
@@ -203,7 +230,7 @@ impl ExecutionMarketReference {
         self.source_timestamp
     }
 
-    /// Returns the actor-qualified quality, always `DirectVerified` for a constructible value.
+    /// Returns the actor-qualified quality, retaining the original quality for virtual-paper observations.
     pub const fn quality(self) -> DataQuality {
         self.quality
     }
@@ -278,7 +305,7 @@ pub struct ApprovedOrder {
     intent: OrderIntent,
     market: ExecutionMarketReference,
     execution_price_bound: ExecutionPriceBound,
-    authority: ConsumedLiveAuthority,
+    authority: ExecutionAuthority,
     reservation: AccountRiskReservation,
     portfolio_capability: crate::PortfolioReadCapability,
     portfolio: crate::PortfolioRiskBinding,
@@ -408,7 +435,7 @@ pub(crate) fn approved_order_from_risk(
     intent: OrderIntent,
     market: ExecutionMarketReference,
     execution_price_bound: ExecutionPriceBound,
-    authority: ConsumedLiveAuthority,
+    authority: ExecutionAuthority,
     reservation: AccountRiskReservation,
     portfolio_capability: crate::PortfolioReadCapability,
     portfolio: crate::PortfolioRiskBinding,
@@ -437,7 +464,7 @@ pub(crate) struct ApprovedOrderParts {
     pub(crate) intent: OrderIntent,
     pub(crate) market: ExecutionMarketReference,
     pub(crate) execution_price_bound: ExecutionPriceBound,
-    pub(crate) authority: ConsumedLiveAuthority,
+    pub(crate) authority: ExecutionAuthority,
     pub(crate) reservation: AccountRiskReservation,
     pub(crate) portfolio_capability: crate::PortfolioReadCapability,
     pub(crate) portfolio: crate::PortfolioRiskBinding,
@@ -450,7 +477,7 @@ pub(crate) struct ApprovedOrderParts {
 #[derive(Debug, Error)]
 pub(crate) enum ApprovalValidationError {
     #[error("live execution authority is no longer current")]
-    Authority(#[from] market_squawk_live::AuthorityError),
+    Authority(#[from] crate::virtual_paper::ExecutionAuthorityError),
     #[error("account reservation is no longer current")]
     Reservation(#[from] crate::AccountReservationStateError),
     #[error("approved order expired before dispatch")]

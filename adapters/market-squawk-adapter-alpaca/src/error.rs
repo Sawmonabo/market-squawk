@@ -1,0 +1,96 @@
+use thiserror::Error;
+
+/// Alpaca adapter configuration, protocol, or bounded transport failure.
+#[derive(Debug, Error)]
+pub enum AlpacaError {
+    /// A source or provider identity violated the bounded domain grammar.
+    #[error("Alpaca configuration contains an invalid identity")]
+    Identity(#[from] market_squawk_domain::IdentityError),
+    /// Source metadata contradicted the selected Alpaca Basic surface.
+    #[error("Alpaca source metadata is invalid: {0}")]
+    Metadata(#[from] market_squawk_sources::SourceMetadataError),
+    /// An endpoint or request policy was not structurally safe.
+    #[error("Alpaca network policy is invalid: {0}")]
+    NetworkPolicy(#[from] market_squawk_sources::NetworkPolicyError),
+    /// API credentials were empty, unbounded, or unsafe to place in request headers.
+    #[error("Alpaca API credentials are invalid")]
+    InvalidCredentials,
+    /// Only a user-authorized Alpaca Trading API credential is accepted.
+    #[error("Alpaca market data requires user-authorized account evidence")]
+    InvalidAuthorization,
+    /// A configured symbol, mapping, or dataset is invalid or ambiguous.
+    #[error("Alpaca instrument coverage is invalid")]
+    InvalidCoverage,
+    /// The provider's Basic-plan subscription ceiling was exceeded.
+    #[error("Alpaca Basic subscription exceeds its documented symbol limit")]
+    SubscriptionLimit,
+    /// Transport byte or deadline limits were invalid.
+    #[error("Alpaca transport limits are invalid")]
+    InvalidTransportLimits,
+    /// Shared budget metadata does not retain Market Squawk's conservative application ceiling.
+    #[error(
+        "Alpaca shared provider budget does not enforce the 150-request/minute application ceiling"
+    )]
+    InvalidBudget,
+    /// Historical dates, timeframe, adjustment, or page size were invalid.
+    #[error("Alpaca historical request plan is invalid")]
+    InvalidHistoricalPlan,
+    /// JSON or MessagePack subscription construction failed.
+    #[error("Alpaca protocol serialization failed")]
+    Serialization,
+    /// A provider payload violated the selected protocol schema.
+    #[error("Alpaca provider payload is invalid")]
+    Protocol,
+    /// A completed option-chain request returned a non-success HTTP status.
+    #[error("Alpaca option-chain HTTP request failed with status {0}")]
+    OptionChainHttpStatus(u16),
+    /// Exact raw provider responses could not satisfy the shared durable-capture contract.
+    #[error("Alpaca provider response capture material is invalid")]
+    CaptureMaterial,
+    /// The decoder session ended before its sealed publication could rejoin.
+    #[error("Alpaca capture rejoin failed at session currentness: session is not current")]
+    PublicationSessionNotCurrent,
+    /// A sealed publication failed one exact capture or lineage check.
+    #[error("Alpaca capture rejoin failed at {stage:?}: {source}")]
+    CaptureRejoin {
+        /// Static boundary that rejected the publication.
+        stage: AlpacaCaptureRejoinStage,
+        /// Closed capture invariant error; contains no raw payload or credentials.
+        #[source]
+        source: market_squawk_sources::ProviderCaptureError,
+    },
+    /// A bounded allocation failed.
+    #[error("Alpaca bounded allocation failed")]
+    Allocation,
+    /// A remote operation failed without retaining credential material.
+    #[error("Alpaca network operation failed")]
+    Network,
+    /// The provider response crossed the configured post-decompression ceiling.
+    #[error("Alpaca response exceeded its configured byte limit")]
+    BodyTooLarge,
+    /// The caller's operation deadline elapsed.
+    #[error("Alpaca operation deadline elapsed")]
+    DeadlineExceeded,
+    /// Cancellation interrupted the operation.
+    #[error("Alpaca operation was cancelled")]
+    Cancelled,
+}
+
+/// Static stages of the exact sealed Alpaca publication continuation.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AlpacaCaptureRejoinStage {
+    /// Rejoin the exact sealed bootstrap response receipt.
+    ResponseSeal,
+    /// Rejoin the exact sealed stream frame receipt.
+    StreamSeal,
+    /// Restore the admitted canonical event batch.
+    CanonicalBatch,
+    /// Bind response native rows to their canonical events.
+    ResponseNativeLineage,
+    /// Bind stream native rows to their canonical events.
+    StreamNativeLineage,
+    /// Bind response capture ordinals and native lineage to the sealed receipt.
+    ResponseBinding,
+    /// Bind stream capture ordinals and native lineage to the sealed receipt.
+    StreamBinding,
+}

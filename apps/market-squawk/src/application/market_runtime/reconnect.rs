@@ -1,0 +1,334 @@
+//! The existing account-health worker requests exact durable lifecycle recovery.
+
+use super::*;
+use async_trait::async_trait;
+
+#[async_trait]
+pub(crate) trait AccountMarketRuntimeReconnect: Send + Sync {
+    /// A completed public producer can request one exact stale-selection recovery.
+    async fn reconnect_public(
+        &self,
+        provider: SourceIdentifier,
+        session: uuid::Uuid,
+        incarnation: uuid::Uuid,
+        cancellation: CancellationToken,
+    ) -> Result<(), ServiceError>;
+
+    /// Startup needs this worker only when original unfinished recovery intent exists.
+    async fn has_pending(
+        &self,
+        deadline: Instant,
+        cancellation: CancellationToken,
+    ) -> Result<bool, ServiceError>;
+
+    /// Revisit the original durable intent under the lifecycle owner's recovery deadline.
+    async fn resume_pending(
+        &self,
+        surface: AccountMarketSurface,
+        cancellation: CancellationToken,
+    ) -> Result<(), ServiceError>;
+
+    /// Recheck the original coordinates and recover under the lifecycle owner's deadline.
+    async fn reconnect(
+        &self,
+        request: PreparedMarketProviderConfigurationRequest,
+        generation: MarketRuntimeGroupGeneration,
+        cancellation: CancellationToken,
+    ) -> Result<(), ServiceError>;
+
+    /// Recover only a positively classified local publication deadline on this allocation.
+    async fn reconnect_alpaca_publication_deadline(
+        &self,
+        request: PreparedMarketProviderConfigurationRequest,
+        generation: MarketRuntimeGroupGeneration,
+        cancellation: CancellationToken,
+    ) -> Result<(), ServiceError>;
+}
+
+impl MarketRuntimeRegistry {
+    pub(crate) async fn bind_account_reconnect(
+        self: &Arc<Self>,
+        owner: Weak<dyn AccountMarketRuntimeReconnect>,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<(), ServiceError> {
+        let pending = owner
+            .upgrade()
+            .ok_or(ServiceError::Unavailable)?
+            .has_pending(deadline, cancellation.child_token())
+            .await?;
+        self.account_reconnect
+            .set(owner)
+            .map_err(|_| ServiceError::InvalidRequest)?;
+        // Restored pending intent may lack both an entry and a current doctor lease, so it
+        // cannot rely on reaching start_account_group to start this existing worker.
+        if pending {
+            self.ensure_account_health_drain_started(deadline, cancellation)
+                .await?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn recover_unhealthy_account_groups(&self, cancellation: &CancellationToken) {
+        let Ok(deadline) = self.cleanup_deadline() else {
+            return;
+        };
+        let snapshots = match self.unhealthy_account_groups(deadline, cancellation).await {
+            Ok(snapshots) => snapshots,
+            Err(error) => {
+                if !cancellation.is_cancelled() {
+                    tracing::warn!(%error, "account health snapshot unavailable");
+                }
+                return;
+            }
+        };
+        // A blocked renewal must not starve independent account cleanup. Every observed
+        // unrelated generation and each retained recovery operation gets its own turn.
+        for snapshot in snapshots
+            .iter()
+            .filter(|snapshot| !supports_account_reconnect(&snapshot.surface_id))
+        {
+            self.drain_unhealthy_account_snapshot(snapshot, cancellation)
+                .await;
+        }
+        if let Some(owner) = self.account_reconnect.get().and_then(Weak::upgrade) {
+            for surface in [
+                AccountMarketSurface::AlpacaBasic,
+                AccountMarketSurface::SchwabMarketData,
+            ] {
+                if let Err(error) = owner
+                    .resume_pending(surface, cancellation.child_token())
+                    .await
+                    && !cancellation.is_cancelled()
+                {
+                    tracing::warn!(%error, surface = surface.surface_id(),
+                        "pending account lifecycle recovery remains incomplete");
+                }
+            }
+        }
+        for snapshot in snapshots
+            .iter()
+            .filter(|snapshot| supports_account_reconnect(&snapshot.surface_id))
+        {
+            let Ok(deadline) = self.cleanup_deadline() else {
+                return;
+            };
+            match self
+                .reconnect_account_group_generation(snapshot, deadline, cancellation)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    self.drain_unhealthy_account_snapshot(snapshot, cancellation)
+                        .await;
+                }
+                Err(error) => {
+                    // Recovery retains the original allocation; generic removal cannot
+                    // replace its persisted predecessor or manufacture acknowledgement.
+                    if !cancellation.is_cancelled() {
+                        tracing::warn!(%error, surface = %snapshot.surface_id, "account generation recovery remains incomplete");
+                    }
+                }
+            }
+        }
+    }
+
+    async fn drain_unhealthy_account_snapshot(
+        &self,
+        snapshot: &AccountMarketRuntimeHealthSnapshot,
+        cancellation: &CancellationToken,
+    ) {
+        if let Err(error) = self.drain_account_group_generation(snapshot).await
+            && !cancellation.is_cancelled()
+        {
+            tracing::error!(
+                %error,
+                surface = %snapshot.surface_id.as_str(),
+                generation = ?snapshot.group_generation.digest(),
+                "account-market stale generation drain failed"
+            );
+        }
+    }
+
+    /// True means the lifecycle owner handled this notification, including a stale one.
+    async fn reconnect_account_group_generation(
+        &self,
+        snapshot: &AccountMarketRuntimeHealthSnapshot,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<bool, ServiceError> {
+        ensure_active(&self.accepting, deadline, cancellation)?;
+        let Some(owner) = self.account_reconnect.get().and_then(Weak::upgrade) else {
+            return Ok(false);
+        };
+        let (request, publication_deadline) = {
+            let entries = bounded_lock(&self.entries, deadline, cancellation).await?;
+            let Some(entry) = entries.iter().find(|entry| {
+                matches_unhealthy_account_generation(
+                    &snapshot.surface_id,
+                    snapshot.group_generation.digest(),
+                    &entry.surface_id,
+                    entry
+                        .runtime
+                        .account_evidence()
+                        .map(|e| e.group_generation().digest()),
+                    entry.is_healthy(),
+                )
+            }) else {
+                return Ok(true);
+            };
+            let MarketRuntime::Account(group) = &entry.runtime else {
+                return Err(ServiceError::InvalidResult);
+            };
+            let surface = AccountMarketSurface::parse(snapshot.surface_id.as_str())
+                .ok_or(ServiceError::InvalidResult)?;
+            let mut publication_deadline = false;
+            match surface {
+                AccountMarketSurface::AlpacaBasic => {
+                    let lease = group.activation_lease();
+                    let Some(doctor) = lease
+                        .runtime_verification_evidence()
+                        .and_then(market_squawk_sources::RuntimeVerificationEvidence::alpaca_paper_iex_receipt)
+                    else {
+                        return Ok(false);
+                    };
+                    if doctor.exclusive_expires_at() > market_runtime_timestamp()? {
+                        publication_deadline =
+                            group.has_local_alpaca_publication_deadline_failure();
+                        if !publication_deadline {
+                            // An unknown cancellation, authorization or transport failure
+                            // does not authorize automatic recovery.
+                            return Ok(false);
+                        }
+                    }
+                }
+                AccountMarketSurface::SchwabMarketData
+                    if group.schwab_recovery_owner().is_some() => {}
+                AccountMarketSurface::SchwabMarketData | AccountMarketSurface::KrakenLevel3 => {
+                    return Ok(false);
+                }
+            }
+            let evidence = group.evidence();
+            let request = PreparedMarketProviderConfigurationRequest::try_new(
+                surface,
+                evidence.onboarding_session_id(),
+                evidence.public_configuration_digest(),
+                evidence.runtime_verification_receipt_digest(),
+                evidence.credential_generation(),
+            )?;
+            (request, publication_deadline)
+        };
+        // The registry deadline bounds only selection. The lifecycle owner gives the complete
+        // renewal/start/calendar operation its existing recovery budget, independently of drain.
+        // No registry lock spans the lifecycle gate, OAuth continuation or physical drain.
+        if publication_deadline {
+            owner
+                .reconnect_alpaca_publication_deadline(
+                    request,
+                    snapshot.group_generation,
+                    cancellation.child_token(),
+                )
+                .await?;
+        } else {
+            owner
+                .reconnect(
+                    request,
+                    snapshot.group_generation,
+                    cancellation.child_token(),
+                )
+                .await?;
+        }
+        Ok(true)
+    }
+}
+
+impl MarketRuntimeRegistry {
+    /// Only completion notifications enter this path; the account timer never retries it.
+    pub(super) async fn recover_completed_public_sources(&self, cancellation: &CancellationToken) {
+        let Some(owner) = self.account_reconnect.get().and_then(Weak::upgrade) else {
+            return;
+        };
+        let Ok(deadline) = self.cleanup_deadline() else {
+            return;
+        };
+        let snapshots = {
+            let Ok(entries) = bounded_lock(&self.entries, deadline, cancellation).await else {
+                return;
+            };
+            let mut snapshots = Vec::new();
+            if snapshots.try_reserve_exact(entries.len()).is_err() {
+                return;
+            }
+            for entry in entries.iter() {
+                if let MarketRuntime::Public(runtime) = &entry.runtime
+                    && let Some(incarnation) = runtime.completed_incarnation()
+                    && let Some(session) = entry.onboarding_session_id
+                {
+                    snapshots.push((entry.surface_id.clone(), session, incarnation));
+                }
+            }
+            snapshots
+        };
+        for (provider, session, incarnation) in snapshots {
+            if cancellation.is_cancelled() {
+                return;
+            }
+            if let Err(error) = owner
+                .reconnect_public(provider, session, incarnation, cancellation.child_token())
+                .await
+                && !cancellation.is_cancelled()
+            {
+                tracing::warn!(%error, "public catalog-selection recovery remains blocked");
+            }
+        }
+    }
+
+    /// Consume only the notified predecessor. No runtime replacement or healthy generation
+    /// can be selected by this operation, even when a completion notification was delayed.
+    pub(crate) async fn prepare_public_recovery(
+        &self,
+        provider: &SourceIdentifier,
+        session: uuid::Uuid,
+        incarnation: uuid::Uuid,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<Duration>, ServiceError> {
+        let _mutation = bounded_lock(&self.mutation, deadline, cancellation).await?;
+        ensure_active(&self.accepting, deadline, cancellation)?;
+        let (entry, delay) = {
+            let mut entries = bounded_lock(&self.entries, deadline, cancellation).await?;
+            let Some(index) = entries.iter().position(|entry| {
+                &entry.surface_id == provider
+                    && entry.onboarding_session_id == Some(session)
+                    && matches!(&entry.runtime, MarketRuntime::Public(runtime)
+                        if runtime.completed_incarnation() == Some(incarnation))
+            }) else {
+                return Ok(None);
+            };
+            if entries[index].action_hooks_installed {
+                return Err(ServiceError::Unavailable);
+            }
+            let mut delay = Duration::ZERO;
+            for source in entries[index].metadata.iter() {
+                let policy = source.budget_policy().ok_or(ServiceError::Unavailable)?;
+                // Catalog invalidation is not a provider refusal: use the registered delay
+                // without altering shared provider refusal accounting.
+                delay = delay.max(Duration::from_nanos(policy.backoff().delay_nanos(0, 0)));
+            }
+            (entries.swap_remove(index), delay)
+        };
+        // Once consumed, a non-stale or incomplete cleanup cannot become a generic retry
+        // on the next account tick or a duplicate completion notification.
+        entry
+            .shutdown_public_for_reprepare(self.config.source_shutdown())
+            .await?;
+        Ok(Some(delay))
+    }
+}
+
+fn supports_account_reconnect(surface: &SourceIdentifier) -> bool {
+    matches!(
+        AccountMarketSurface::parse(surface.as_str()),
+        Some(AccountMarketSurface::AlpacaBasic | AccountMarketSurface::SchwabMarketData)
+    )
+}

@@ -37,9 +37,7 @@ use super::super::{
         ProductionRawMarketSink, ProductionRawMarketSinkInput, ProductionSinkFailure,
         RouteActivationFailure,
     },
-    subscription_state::{
-        GenerationIdentity, SubscriptionFailure, SubscriptionLimits, SubscriptionStateMachine,
-    },
+    subscription_state::{GenerationIdentity, SubscriptionLimits, SubscriptionStateMachine},
     supervisor::{ProductionSupervisorError, route_worker_cleanup_error},
 };
 use super::budget_free_metadata;
@@ -70,8 +68,51 @@ impl LiveActionHook for ActionInvocationProbe {
     }
 }
 
+#[test]
+fn startup_health_refresh_uses_actual_deadline_and_acknowledgement_time() -> TestResult {
+    use super::super::sink::{health_rebind_due, rebind_at};
+
+    let received_at = Timestamp::from_unix_nanos(10_000_000_000);
+    let acknowledged_at = received_at.checked_add_nanos(400_000_000)?;
+    // Five seconds of configured market age does not enlarge the remaining source/identity
+    // window. At acknowledgement only 600ms of this genuine one-second lease remains.
+    let configured_market_deadline = received_at.checked_add_nanos(5_000_000_000)?;
+    let actual_valid_until = received_at.checked_add_nanos(1_000_000_000)?;
+    let refresh_at = rebind_at(acknowledged_at, actual_valid_until)?;
+    assert_eq!(refresh_at, received_at.checked_add_nanos(700_000_000)?);
+    assert!(refresh_at < configured_market_deadline);
+    assert!(!health_rebind_due(
+        received_at,
+        Some(refresh_at),
+        Some(actual_valid_until)
+    ));
+    let later_acknowledgement = received_at.checked_add_nanos(800_000_000)?;
+    assert!(health_rebind_due(
+        later_acknowledgement,
+        Some(refresh_at),
+        Some(actual_valid_until)
+    ));
+    // Reaching the genuine expiry requires qualification even with a later cached schedule;
+    // a zero remaining interval never grants a synthetic extra nanosecond of authority.
+    assert!(health_rebind_due(
+        actual_valid_until,
+        Some(configured_market_deadline),
+        Some(actual_valid_until)
+    ));
+    assert_eq!(
+        rebind_at(actual_valid_until, actual_valid_until)?,
+        actual_valid_until
+    );
+    assert_eq!(
+        rebind_at(later_acknowledgement, acknowledged_at)?,
+        later_acknowledgement
+    );
+    Ok(())
+}
+
 #[tokio::test]
-async fn capture_receipt_precedes_fail_closed_pre_acknowledgement_data() -> TestResult {
+async fn pre_acknowledgement_snapshot_is_bounded_and_published_only_after_exact_ack() -> TestResult
+{
     let app_config = app_config()?;
     let source_config = app_config
         .coinbase()
@@ -100,8 +141,9 @@ async fn capture_receipt_precedes_fail_closed_pre_acknowledgement_data() -> Test
         })?],
     )
     .await?;
+    let snapshots = runtime.snapshots();
     let live_ingress = runtime.ingress();
-    let dormant = live_ingress.reserve_route(route)?;
+    let dormant = live_ingress.reserve_route(route.clone())?;
     let cancellation = CancellationToken::new();
     let (route_activation, route_worker) =
         spawn_route_activation(dormant, route_buffer_limits()?, cancellation.clone());
@@ -143,39 +185,53 @@ async fn capture_receipt_precedes_fail_closed_pre_acknowledgement_data() -> Test
         SubscriptionLimits::try_new(
             controls.message_capacity().get(),
             controls.byte_capacity().get(),
+            64,
+            32 * 1024 * 1024,
         )?,
     )?;
     assert!(matches!(
         registry.validate_current_authority(&session),
         Err(RegistryError::HealthNotQualified)
     ));
-    let mut sink = ProductionRawMarketSink::try_new(ProductionRawMarketSinkInput {
-        capture: publisher,
-        registry: &mut registry,
-        session: &session,
-        health_reporter,
-        decoder: ProductionMarketDecoder::Coinbase(profile.decoder().clone()),
-        subscription,
-        live_ingress,
-        routes: vec![route_activation],
-    })?;
-
-    let snapshot = frame_factory.try_frame(
-        TransportFrameKind::Text,
-        Bytes::from_static(include_bytes!(
-            "../../../../../adapters/market-squawk-adapter-coinbase/fixtures/snapshot.json"
-        )),
+    let (startup_readiness, mut startup_ready) = tokio::sync::oneshot::channel();
+    let mut sink = ProductionRawMarketSink::try_new_with_startup_readiness(
+        ProductionRawMarketSinkInput {
+            capture: publisher,
+            registry: &mut registry,
+            session: &session,
+            health_reporter,
+            decoder: ProductionMarketDecoder::Coinbase(profile.decoder().clone()),
+            subscription,
+            live_ingress,
+            routes: vec![route_activation],
+        },
+        startup_readiness,
     )?;
+
+    let snapshot = fixture_frame(&mut frame_factory, "snapshot.json")?;
+    if let Err(error) = sink.try_publish(snapshot) {
+        return Err(format!(
+            "pre-acknowledgement snapshot failed with {error:?}: {:?}",
+            sink.terminal_failure()
+        )
+        .into());
+    }
+    assert_eq!(current_book(&snapshots, &route)?, None);
     assert_eq!(
-        sink.try_publish(snapshot),
-        Err(SinkError::CaptureIncomplete)
+        startup_ready.try_recv(),
+        Err(tokio::sync::oneshot::error::TryRecvError::Empty)
     );
-    assert_eq!(
-        sink.terminal_failure(),
-        Some(ProductionSinkFailure::Subscription(
-            SubscriptionFailure::DataBeforeAcknowledgement
-        ))
-    );
+    let acknowledgement = fixture_frame(&mut frame_factory, "subscriptions.json")?;
+    if let Err(error) = sink.try_publish(acknowledgement) {
+        return Err(format!(
+            "subscription acknowledgement failed with {error:?}: {:?}",
+            sink.terminal_failure()
+        )
+        .into());
+    }
+    tokio::time::timeout(Duration::from_secs(1), &mut startup_ready).await??;
+    let _revision = wait_for_book(&snapshots, &route, 10010, 10020).await?;
+    assert_eq!(sink.terminal_failure(), None);
     drop(sink);
 
     cancellation.cancel();
@@ -278,6 +334,8 @@ async fn acknowledged_frames_reach_the_immutable_live_book_without_execution_qua
         SubscriptionLimits::try_new(
             controls.message_capacity().get(),
             controls.byte_capacity().get(),
+            64,
+            32 * 1024 * 1024,
         )?,
     )?;
     assert!(matches!(
@@ -358,11 +416,22 @@ fn fixture_frame(
     frame_factory: &mut market_squawk_sources::RawFrameFactory,
     fixture: &str,
 ) -> TestResult<market_squawk_sources::RawMarketFrame> {
-    let payload = std::fs::read(
+    let mut payload = String::from_utf8(std::fs::read(
         std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../adapters/market-squawk-adapter-coinbase/fixtures")
             .join(fixture),
-    )?;
+    )?)?;
+    let received_at: chrono::DateTime<chrono::Utc> = SystemTime::now().into();
+    let received_at = received_at.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    for fixture_time in [
+        "2026-08-08T12:00:00.123456Z",
+        "2026-08-08T12:00:00.223456Z",
+        "2026-08-08T12:00:00.323456Z",
+        "2026-08-08T12:00:00.423456Z",
+        "2026-08-08T12:00:00.523456Z",
+    ] {
+        payload = payload.replace(fixture_time, &received_at);
+    }
     Ok(frame_factory.try_frame(TransportFrameKind::Text, Bytes::from(payload))?)
 }
 
@@ -415,11 +484,11 @@ fn current_book(
 
 pub(super) fn app_config() -> TestResult<AppConfig> {
     let json = r#"{
-      "endpoint":"wss://ws-feed.exchange.coinbase.com",
+      "endpoint":"wss://advanced-trade-ws.coinbase.com",
       "event_classes":["book_snapshot","book_delta","trade"],
       "depth":"price_level",
       "freshness_ms":5000,
-      "max_frame_bytes":1048576,
+      "max_frame_bytes":16777216,
       "subscription_ack_timeout_ms":5000,
       "control_message_capacity":64,
       "control_byte_capacity":65536,
@@ -428,8 +497,18 @@ pub(super) fn app_config() -> TestResult<AppConfig> {
         "provider":"coinbase-exchange",
         "basis":"user-reviewed-coinbase-public-interface",
         "evidence_sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "evidence_reference":"https://docs.cdp.coinbase.com/exchange/websocket-feed/overview",
-        "evidence_version":"reviewed-2026-07-20",
+        "evidence_reference":"https://docs.cdp.coinbase.com/coinbase-app/advanced-trade-apis/websocket/websocket-overview",
+        "evidence_version":"reviewed-2026-08-08",
+        "effective_from_unix_nanos":1700000000000000000,
+        "effective_until_unix_nanos":1900000000000000000
+      },
+      "reference_authorization":{
+        "mode":"public_interface",
+        "provider":"coinbase-exchange",
+        "basis":"market-squawk-reviewed-coinbase-product-reference",
+        "evidence_sha256":"6d6be28e5a9484c6bbfa75041b382cdaf2bbe387237d1cc4168aa02b59d58bd7",
+        "evidence_reference":"https://docs.cdp.coinbase.com/api-reference/advanced-trade-api/rest-api/public/get-public-product",
+        "evidence_version":"reviewed-2026-09-23",
         "effective_from_unix_nanos":1700000000000000000,
         "effective_until_unix_nanos":1900000000000000000
       },

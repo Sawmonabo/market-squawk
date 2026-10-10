@@ -4,8 +4,68 @@ use std::path::PathBuf;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use market_squawk_platform::JournalFileFormat;
-use rust_decimal::Decimal;
 use uuid::Uuid;
+
+const MAXIMUM_CLI_UNLOCK_BYTES: u64 = 4 * 1024;
+
+/// Secret-free failure from the shared bounded CLI unlock reader.
+#[derive(Debug, thiserror::Error)]
+pub enum CliUnlockInputError {
+    /// Interactive input must not silently consume a pipe without explicit admission.
+    #[error("secure storage unlock requires a terminal or explicit --stdin")]
+    TerminalRequired,
+    /// Reading a bounded input or no-echo terminal failed.
+    #[error("failed to read the secure storage unlock")]
+    Read,
+    /// The input was empty, malformed or exceeded the existing bootstrap secret bound.
+    #[error("secure storage unlock is empty, invalid UTF-8, or exceeds 4096 bytes")]
+    Invalid,
+}
+
+/// Reads explicit standard input or a no-echo terminal for either existing encrypted store.
+///
+/// # Errors
+/// Returns a value-free error for unavailable input, invalid UTF-8 or exceeded bounds.
+pub fn read_encrypted_storage_unlock(
+    explicit_stdin: bool,
+) -> Result<market_squawk_platform::SecretValue, CliUnlockInputError> {
+    use market_squawk_platform::SecretValue;
+    use std::io::{IsTerminal as _, Read as _};
+    use zeroize::Zeroizing;
+
+    if explicit_stdin {
+        let mut bytes = Zeroizing::new(Vec::new());
+        bytes
+            .try_reserve_exact((MAXIMUM_CLI_UNLOCK_BYTES + 1) as usize)
+            .map_err(|_| CliUnlockInputError::Read)?;
+        std::io::stdin()
+            .take(MAXIMUM_CLI_UNLOCK_BYTES + 1)
+            .read_to_end(&mut *bytes)
+            .map_err(|_| CliUnlockInputError::Read)?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) > MAXIMUM_CLI_UNLOCK_BYTES {
+            return Err(CliUnlockInputError::Invalid);
+        }
+        if bytes.last() == Some(&b'\n') {
+            bytes.pop();
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+        }
+        return SecretValue::from_utf8_bytes(std::mem::take(&mut *bytes))
+            .map_err(|_| CliUnlockInputError::Invalid);
+    }
+    if !std::io::stdin().is_terminal() {
+        return Err(CliUnlockInputError::TerminalRequired);
+    }
+    let mut unlock = Zeroizing::new(
+        rpassword::prompt_password("Encrypted storage unlock: ")
+            .map_err(|_| CliUnlockInputError::Read)?,
+    );
+    if u64::try_from(unlock.len()).unwrap_or(u64::MAX) > MAXIMUM_CLI_UNLOCK_BYTES {
+        return Err(CliUnlockInputError::Invalid);
+    }
+    SecretValue::new(std::mem::take(&mut *unlock)).map_err(|_| CliUnlockInputError::Invalid)
+}
 
 /// Market Squawk's complete local command-line surface.
 #[derive(Debug, Parser)]
@@ -14,19 +74,29 @@ use uuid::Uuid;
 #[command(version)]
 pub struct Cli {
     /// Local Market Squawk data root.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub data_dir: Option<PathBuf>,
 
+    /// Explicit installed-service authority root for isolated verification.
+    #[arg(long, global = true, hide = true)]
+    pub installation_data_root: Option<PathBuf>,
+
     /// Explicit local configuration file.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub config: Option<PathBuf>,
 
     /// Local tracing filter.
-    #[arg(long, env = "MARKET_SQUAWK_LOG", default_value = "info", global = true)]
+    #[arg(
+        long,
+        env = "MARKET_SQUAWK_LOG",
+        default_value = "info",
+        global = true,
+        hide = true
+    )]
     pub log: String,
 
     /// Render local tracing as JSON.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub json_logs: bool,
 
     /// Render command results for people or structured consumers.
@@ -34,23 +104,23 @@ pub struct Cli {
     pub output: OutputFormat,
 
     /// Source-task cancellation deadline in milliseconds.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub source_shutdown_ms: Option<u64>,
 
     /// Absolute installed Python training-release root used to verify admitted models.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub training_release_root: Option<PathBuf>,
 
     /// Fixed raw-capture queue depth.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub capture_queue_capacity: Option<usize>,
 
     /// Unified per-channel capture memory ceiling in bytes.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub capture_memory_ceiling_bytes: Option<usize>,
 
     /// Process-wide capture destination-registry memory ceiling in bytes.
-    #[arg(long, global = true)]
+    #[arg(long, global = true, hide = true)]
     pub capture_destination_registry_memory_ceiling_bytes: Option<usize>,
 
     /// Selected operation.
@@ -71,9 +141,11 @@ pub enum OutputFormat {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Initialize controlled local state.
+    #[command(hide = true)]
     Init,
 
     /// Inspect and validate effective configuration.
+    #[command(hide = true)]
     Config {
         /// Configuration operation.
         #[command(subcommand)]
@@ -81,16 +153,61 @@ pub enum Command {
     },
 
     /// Register, inspect, and configure provider sources.
+    #[command(hide = true)]
     Source {
         /// Source operation.
         #[command(subcommand)]
         command: SourceCommand,
     },
 
+    /// Read the bounded unified market view.
+    Market {
+        /// Market operation.
+        #[command(subcommand)]
+        command: MarketCommand,
+    },
+
+    /// Show the economic backdrop or select one saved economic series.
+    EconomicContext {
+        /// List saved economic series and their exact neutral selection IDs.
+        #[arg(long, conflicts_with = "series_id")]
+        list_series: bool,
+        /// Read the latest observation of a saved economic series by its listed ID.
+        #[arg(long, conflicts_with = "list_series")]
+        series_id: Option<String>,
+        /// RFC 3339 instant defining what information was known.
+        #[arg(long, requires = "effective_date_cutoff")]
+        knowledge_cutoff: Option<String>,
+        /// Latest effective date admitted into the context, in YYYY-MM-DD form.
+        #[arg(long, requires = "knowledge_cutoff")]
+        effective_date_cutoff: Option<String>,
+    },
+
+    /// Read a bounded page of saved economic series history.
+    EconomicSeriesHistory {
+        /// Stable series ID returned by economic-context --list-series.
+        #[arg(long)]
+        series_id: String,
+        /// Inclusive first effective date, in YYYY-MM-DD form.
+        #[arg(long)]
+        start_effective_date: String,
+        /// RFC 3339 instant defining what information was known.
+        #[arg(long, requires = "effective_date_cutoff")]
+        knowledge_cutoff: Option<String>,
+        /// Latest effective date admitted into history, in YYYY-MM-DD form.
+        #[arg(long, requires = "knowledge_cutoff")]
+        effective_date_cutoff: Option<String>,
+        /// Last effective period returned by a prior page.
+        #[arg(long)]
+        after_effective_period: Option<String>,
+    },
+
     /// Capture direct Coinbase Exchange data into the local journal.
+    #[command(hide = true)]
     Capture(CaptureArguments),
 
     /// Ingest user-authorized local or provider data.
+    #[command(hide = true)]
     Ingest {
         /// Ingestion operation.
         #[command(subcommand)]
@@ -98,6 +215,7 @@ pub enum Command {
     },
 
     /// Build and inspect immutable analytical datasets.
+    #[command(hide = true)]
     Dataset {
         /// Dataset operation.
         #[command(subcommand)]
@@ -105,6 +223,7 @@ pub enum Command {
     },
 
     /// Query controlled analytical datasets.
+    #[command(hide = true)]
     Query {
         /// Query operation.
         #[command(subcommand)]
@@ -112,17 +231,26 @@ pub enum Command {
     },
 
     /// Inspect and build registered features.
+    #[command(hide = true)]
     Feature {
         /// Feature operation.
         #[command(subcommand)]
         command: FeatureCommand,
     },
 
-    /// Inspect, evaluate, and run admitted local models.
+    /// Inspect and operate low-level model evidence for diagnostics.
+    #[command(name = "diagnostics-model", hide = true)]
     Model {
-        /// Model operation.
+        /// Diagnostic model operation.
         #[command(subcommand)]
         command: ModelCommand,
+    },
+
+    /// Prepare, start, and inspect investment forecasts.
+    Forecast {
+        /// Forecast operation.
+        #[command(subcommand)]
+        command: ForecastCommand,
     },
 
     /// Import, inspect, and analyze portfolios.
@@ -130,6 +258,13 @@ pub enum Command {
         /// Portfolio operation.
         #[command(subcommand)]
         command: PortfolioCommand,
+    },
+
+    /// Start and follow the shared complete investment-analysis workflow.
+    Analysis {
+        /// Workflow, saved-result, or explicit account-setup operation.
+        #[command(subcommand)]
+        command: AnalysisCommand,
     },
 
     /// Run and inspect governed research backtests.
@@ -153,14 +288,48 @@ pub enum Command {
         command: ExecutionCommand,
     },
 
-    /// Create and inspect evidence-bound fair-value measurements.
+    /// Inspect and operate low-level valuation evidence for diagnostics.
+    #[command(name = "diagnostics-fair-value", hide = true)]
     FairValue {
-        /// Fair-value operation.
+        /// Diagnostic valuation operation.
         #[command(subcommand)]
         command: FairValueCommand,
     },
 
+    /// Inspect or start the shared installed application service.
+    #[command(hide = true)]
+    Service {
+        /// Installed-service operation.
+        #[command(subcommand)]
+        command: ServiceCommand,
+    },
+
+    /// Inspect and control durable work owned by the installed service.
+    #[command(hide = true)]
+    Job {
+        /// Durable-job operation.
+        #[command(subcommand)]
+        command: JobCommand,
+    },
+
+    /// Back up, restore, update, inspect logs, and manage typed product settings.
+    #[command(hide = true)]
+    Operations {
+        /// Installed-product operation.
+        #[command(subcommand)]
+        command: OperationsCommand,
+    },
+
+    /// Inspect, preview, and accept the guided first-run setup plan.
+    #[command(hide = true)]
+    Setup {
+        /// Guided setup operation.
+        #[command(subcommand)]
+        command: SetupCommand,
+    },
+
     /// Produce and close exact-head release evidence.
+    #[command(hide = true)]
     Release {
         /// Release operation.
         #[command(subcommand)]
@@ -168,22 +337,20 @@ pub enum Command {
     },
 
     /// Run the local stdio MCP server.
+    #[command(hide = true)]
     Mcp {
-        /// MCP operation. Omitting it retains the v0.1 `mcp` compatibility form.
+        /// MCP operation.
         #[command(subcommand)]
-        command: Option<McpCommand>,
+        command: McpCommand,
     },
 
     /// Report bounded local readiness, configuration provenance, and release blockers.
+    #[command(hide = true)]
     Doctor,
 
     /// Run a deterministic diagnostic feed.
     #[command(hide = true)]
     Mock(MockArguments),
-
-    /// Run the v0.1 paper-bot compatibility command.
-    #[command(hide = true)]
-    PaperBot(PaperBotArguments),
 
     /// Validate the v0.1 immutable diagnostic journal.
     #[command(hide = true)]
@@ -202,6 +369,23 @@ pub enum ConfigCommand {
 /// Provider-source operation.
 #[derive(Debug, Subcommand)]
 pub enum SourceCommand {
+    /// Unlock this workspace's encrypted provider credential storage for the running service.
+    UnlockCredentials {
+        /// Read the bounded unlock from standard input instead of a no-echo terminal prompt.
+        #[arg(long)]
+        stdin: bool,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Import the exact provider credential bundle through the protected installed service.
+    ImportCredentials {
+        /// Filled copy of `market-squawk-provider-credentials.env.example`.
+        bundle: PathBuf,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Register a code-supported provider profile in the local catalog.
     Register {
         /// Code-owned provider identifier.
@@ -215,6 +399,46 @@ pub enum SourceCommand {
         /// Optional provider filter.
         provider: Option<String>,
     },
+    /// Verify the saved source configuration without starting its runtime.
+    Verify {
+        /// Code-owned provider identifier.
+        provider: String,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Start the saved source configuration after its required verification.
+    Start {
+        /// Code-owned provider identifier.
+        provider: String,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Resume the saved source transition after correcting its reported failure.
+    Retry {
+        /// Code-owned provider identifier.
+        provider: String,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Stop source activity while retaining its configuration and stored data.
+    Stop {
+        /// Code-owned provider identifier.
+        provider: String,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Remove a source connection through its normal credential cleanup contract.
+    Remove {
+        /// Code-owned provider identifier.
+        provider: String,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Report explicit provider and instrument coverage.
     Coverage {
         /// Optional provider filter.
@@ -225,14 +449,6 @@ pub enum SourceCommand {
         /// Optional provider filter.
         provider: Option<String>,
     },
-    /// Start or resume evidence-bound local provider onboarding.
-    Setup {
-        /// Code-owned provider identifier.
-        provider: String,
-        /// Explicit local mutation confirmation.
-        #[arg(long)]
-        confirm: bool,
-    },
     /// Activate one evidence-bound provider adapter after onboarding verification.
     Activate {
         /// Confined versioned provider-activation request file.
@@ -241,13 +457,16 @@ pub enum SourceCommand {
         #[arg(long)]
         confirm: bool,
     },
-    /// List exact provider objects without minting ingestion authority.
+    /// Discover exact provider objects and their single-use ingestion receipts.
     Discover {
         /// Active configured provider identifier.
         provider: String,
         /// Exact provider dataset namespace.
         #[arg(long)]
         dataset: String,
+        /// Explicit confirmation to mint bounded ingestion authority.
+        #[arg(long)]
+        confirm: bool,
     },
     /// Inspect one bounded provider page without persisting it as a research dataset.
     Inspect {
@@ -273,6 +492,251 @@ pub enum SourceCommand {
             value_parser = clap::value_parser!(u16).range(1..=1024)
         )]
         max_records: u16,
+    },
+}
+
+/// Unified market-data operation.
+#[derive(Debug, Subcommand)]
+pub enum MarketCommand {
+    /// Read saved starter investments.
+    Collection {
+        /// Also read current market information for the saved collection.
+        #[arg(long)]
+        include_market: bool,
+    },
+    /// Keep or remove a starter investment at the displayed collection revision.
+    SetCollectionChoice {
+        #[arg(long)]
+        expected_revision: u64,
+        #[arg(long)]
+        symbol: String,
+        #[arg(long, action = clap::ArgAction::Set)]
+        kept: bool,
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Acquire reported trading-session information for one product and civil date.
+    GetSessionContext {
+        /// Product whose reported sessions should be acquired.
+        #[arg(long, value_parser = ["equity", "option", "bond", "future", "forex"])]
+        product: String,
+        /// Civil date in YYYY-MM-DD form; no timezone or midnight conversion.
+        #[arg(long)]
+        date: chrono::NaiveDate,
+        /// Authorize acquisition and local evidence publication.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Reopen an exact saved trading-session reference without acquiring newer information.
+    ReadSessionContext {
+        /// JSON file containing the original returned reference object.
+        reference: PathBuf,
+    },
+    /// Admit a durable job to prepare the selected investment's analysis evidence.
+    PrepareInvestmentEvidence {
+        /// JSON request containing the selected investment and resolved financial profile.
+        request: PathBuf,
+        /// Authorize bounded source acquisition and local evidence publication.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Read one exact investment evidence preparation job for the selected investment.
+    InvestmentEvidencePreparation {
+        #[arg(long)]
+        selection_token: String,
+        /// Durable job identity returned by preparation.
+        #[arg(long)]
+        job_id: Uuid,
+        /// Exact one-based execution generation.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        generation: u64,
+    },
+    /// Reopen the completed preparation and its exact original arguments without reacquisition.
+    InvestmentEvidencePreparationResult {
+        #[arg(long)]
+        job_id: Uuid,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        generation: u64,
+    },
+    /// Cancel investment evidence preparation at the exact observed generation and sequence.
+    CancelInvestmentEvidencePreparation {
+        #[arg(long)]
+        selection_token: String,
+        #[arg(long)]
+        job_id: Uuid,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        generation: u64,
+        /// Exact latest event sequence observed by the operator.
+        #[arg(long)]
+        expected_sequence: u64,
+        /// Explicitly authorize cancellation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Check the original evidence preparation start after an uncertain acknowledgement.
+    ReconcileInvestmentEvidencePreparation {
+        /// Original request identity reported by the uncertain start.
+        #[arg(long)]
+        request_id: String,
+        /// Exact lowercase SHA-256 reported with that request identity.
+        #[arg(long)]
+        arguments_sha256: String,
+    },
+    /// Return provider-neutral current-market summaries selected by Market Squawk.
+    Overview {
+        /// Continue from an opaque Market page token.
+        #[arg(long)]
+        page_token: Option<String>,
+    },
+    /// Find investments by ticker, name or admitted identifier.
+    Search {
+        #[arg(long)]
+        query: String,
+        #[arg(long)]
+        page_token: Option<String>,
+    },
+    /// Return current information for one opaque investment selection.
+    Select {
+        #[arg(long)]
+        selection_token: String,
+    },
+    /// Return the selected investment's reference profile and listing information.
+    Profile {
+        #[arg(long)]
+        selection_token: String,
+    },
+    /// Read a page of financial facts, statements, ratios or filings for an investment.
+    Financials {
+        #[arg(long)]
+        selection_token: String,
+        #[arg(long, value_parser = ["facts", "statements", "ratios", "filings"])]
+        section: String,
+        #[arg(long)]
+        cursor: Option<String>,
+        #[arg(long, default_value_t = 32, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
+    /// Release an open financial read; retained investment evidence is unchanged.
+    CloseFinancials {
+        #[arg(long)]
+        selection_token: String,
+        #[arg(long)]
+        read_token: uuid::Uuid,
+    },
+    /// Prepare company financial information for one selected investment as a durable job.
+    PrepareFinancials {
+        #[arg(long)]
+        selection_token: String,
+        /// Authorize source acquisition and local evidence publication.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Read one exact financial preparation job for the selected investment.
+    FinancialPreparation {
+        #[arg(long)]
+        selection_token: String,
+        /// Durable job identity returned by preparation.
+        #[arg(long)]
+        job_id: Uuid,
+        /// Exact one-based execution generation.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        generation: u64,
+    },
+    /// Cancel financial preparation at the exact observed generation and sequence.
+    CancelFinancialPreparation {
+        #[arg(long)]
+        selection_token: String,
+        #[arg(long)]
+        job_id: Uuid,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        generation: u64,
+        /// Exact latest event sequence observed by the operator.
+        #[arg(long)]
+        expected_sequence: u64,
+        /// Explicitly authorize cancellation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Check the original financial start after an uncertain acknowledgement; never start again.
+    ReconcileFinancialPreparation {
+        /// Original request identity reported by the uncertain start.
+        #[arg(long)]
+        request_id: String,
+        /// Exact lowercase SHA-256 reported with that request identity.
+        #[arg(long)]
+        arguments_sha256: String,
+    },
+    /// Prepare adjusted daily history for one selected investment as a durable job.
+    PrepareHistory {
+        #[arg(long)]
+        history_token: String,
+        /// Intended history coverage in calendar days.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(
+            i64::from(market_squawk_adapter_alpaca::ALPACA_HISTORICAL_MIN_LOOKBACK_DAYS)
+                ..=i64::from(market_squawk_adapter_alpaca::ALPACA_HISTORICAL_MAX_LOOKBACK_DAYS)
+        ))]
+        lookback_days: u16,
+        /// Authorize source acquisition and local evidence publication.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Read one exact history preparation job for the selected investment.
+    HistoryPreparation {
+        #[arg(long)]
+        history_token: String,
+        /// Durable job identity returned by preparation.
+        #[arg(long)]
+        job_id: Uuid,
+        /// Exact one-based execution generation.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        generation: u64,
+    },
+    /// Cancel history preparation at the exact observed generation and sequence.
+    CancelHistoryPreparation {
+        #[arg(long)]
+        history_token: String,
+        #[arg(long)]
+        job_id: Uuid,
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        generation: u64,
+        /// Exact latest event sequence observed by the operator.
+        #[arg(long)]
+        expected_sequence: u64,
+        /// Explicitly authorize cancellation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Check the original history start after an uncertain acknowledgement; never start again.
+    ReconcileHistoryPreparation {
+        /// Original request identity reported by the uncertain start.
+        #[arg(long)]
+        request_id: String,
+        /// Exact lowercase SHA-256 reported with that request identity.
+        #[arg(long)]
+        arguments_sha256: String,
+    },
+    /// Return immutable daily history for one opaque investment selection.
+    History {
+        #[arg(long)]
+        history_token: String,
+        /// Inclusive visible timestamp boundary, as exact Unix nanoseconds.
+        #[arg(long, conflicts_with_all = ["start_date", "end_date"])]
+        start_unix_nanos: Option<String>,
+        /// Inclusive visible timestamp boundary, as exact Unix nanoseconds.
+        #[arg(long, conflicts_with_all = ["start_date", "end_date"])]
+        end_unix_nanos: Option<String>,
+        /// Inclusive visible session date in YYYY-MM-DD form.
+        #[arg(long)]
+        start_date: Option<chrono::NaiveDate>,
+        /// Inclusive visible session date in YYYY-MM-DD form.
+        #[arg(long)]
+        end_date: Option<chrono::NaiveDate>,
+        /// Maximum displayed points; underlying historical evidence remains complete.
+        #[arg(long, default_value_t = 1000, value_parser = clap::value_parser!(u16).range(8..=4096))]
+        point_limit: u16,
+        /// Retain the generation selected by the preceding viewport response.
+        #[arg(long)]
+        generation_token: Option<String>,
     },
 }
 
@@ -313,9 +777,12 @@ pub enum IngestCommand {
         provider: String,
         /// Provider object or series identifier.
         object: String,
-        /// Destination dataset identity.
+        /// Exact provider dataset identity returned by discovery.
         #[arg(long)]
         dataset: String,
+        /// Original single-use receipt returned with this exact discovered object.
+        #[arg(long)]
+        discovery_receipt: String,
         /// Explicit local mutation confirmation.
         #[arg(long)]
         confirm: bool,
@@ -381,13 +848,39 @@ pub enum QueryCommand {
         #[arg(long, default_value_t = 1_000)]
         maximum_rows: usize,
     },
-    /// Read one dataset through its immutable manifest authority.
+    /// Read all canonical observations through the latest immutable manifest authority.
     Dataset {
         /// Dataset identity.
         dataset: String,
-        /// Maximum returned rows.
+        /// Complete-result row ceiling; a larger dataset fails rather than returning a preview.
         #[arg(long, default_value_t = 1_000)]
         maximum_rows: usize,
+    },
+    /// Report whether the exact desired FRED/ALFRED generation is ready for local reads.
+    FredAlfredStatus,
+    /// Read one latest-known FRED/ALFRED observation from an exact immutable generation.
+    FredAlfredLatestKnown {
+        /// Exact immutable manifest version returned by `fred-alfred-status`.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        manifest_version: u64,
+        /// Exact immutable schema name returned by `fred-alfred-status`.
+        #[arg(long)]
+        schema_name: String,
+        /// Exact immutable schema version returned by `fred-alfred-status`.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+        schema_version: u16,
+        /// Exact lowercase schema SHA-256 returned by `fred-alfred-status`.
+        #[arg(long)]
+        schema_fingerprint: String,
+        /// Exact lowercase manifest-content SHA-256 returned by `fred-alfred-status`.
+        #[arg(long)]
+        content_hash: String,
+        /// RFC 3339 knowledge cutoff for the point-in-time read.
+        #[arg(long)]
+        knowledge_cutoff: String,
+        /// Effective-date cutoff in YYYY-MM-DD form.
+        #[arg(long)]
+        effective_date_cutoff: String,
     },
 }
 
@@ -410,11 +903,20 @@ pub enum FeatureCommand {
     },
 }
 
-/// Model-registry and inference operation.
+/// Low-level model diagnostic operation.
 #[derive(Debug, Subcommand)]
 pub enum ModelCommand {
-    /// List admitted immutable model bundles.
+    /// List model evidence and its usable analytical limits.
     List,
+    /// List current model-training and forecasting activity.
+    Activity {
+        /// Continue using the cursor returned by the preceding activity page.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum activity records returned.
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
     /// Admit one verified immutable model bundle through a closed request file.
     Admit {
         /// Confined JSON admission request file.
@@ -443,31 +945,210 @@ pub enum ModelCommand {
     },
 }
 
-/// Portfolio operation.
+/// Investment-forecast operation.
 #[derive(Debug, Subcommand)]
-pub enum PortfolioCommand {
-    /// Import and reconcile a confined holdings or transactions export.
-    Import {
-        /// Confined provider export.
-        path: PathBuf,
-        /// Destination account identity.
+pub enum ForecastCommand {
+    /// Show the currently available forecast choices.
+    Options {
+        /// Continue using the cursor returned by the preceding choices page.
         #[arg(long)]
-        account: String,
+        cursor: Option<String>,
+        /// Maximum model choices returned.
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
+    /// Preview one forecast and receive its one-use confirmation token.
+    Preview {
+        /// Opaque model choice returned by `forecast options`.
+        #[arg(long)]
+        model_token: Uuid,
+        /// Opaque history choice returned by `forecast options`.
+        #[arg(long)]
+        history_token: Uuid,
+        /// Opaque investment choice returned by `forecast options`.
+        #[arg(long)]
+        investment_token: Uuid,
+        /// Opaque horizon choice returned by `forecast options`.
+        #[arg(long)]
+        horizon_token: Uuid,
+    },
+    /// Start the forecast accepted in one preparation preview.
+    Start {
+        /// One-use confirmation token returned by `forecast preview`.
+        #[arg(long)]
+        confirmation_token: Uuid,
         /// Explicit local mutation confirmation.
         #[arg(long)]
         confirm: bool,
     },
-    /// Report current holdings.
-    Holdings {
-        /// Exact account identity.
+    /// List current forecasts.
+    List {
+        /// Continue using the cursor returned by the preceding forecasts page.
         #[arg(long)]
-        account: String,
+        cursor: Option<String>,
+        /// Maximum forecasts returned.
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
     },
-    /// Report normalized transactions.
-    Transactions {
-        /// Exact account identity.
+    /// Show one forecast.
+    Show {
+        /// Opaque forecast token returned by `forecast list`.
+        forecast_token: Uuid,
+    },
+    /// Acquire completed later history and source evidence for one saved forecast outcome.
+    PrepareOutcome {
+        /// Opaque token of the exact saved forecast.
+        forecast_token: Uuid,
+        /// Explicit confirmation to acquire and retain later source evidence.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Measure and retain a completed forecast outcome from exact source evidence.
+    MeasureOutcome {
+        /// Closed request containing forecastToken, outcomeManifest, asOfUnixNanos and sourceActionReference.
+        #[arg(long)]
+        request: PathBuf,
+        /// Explicit confirmation to retain measured outcome evidence.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Show the realized outcomes for one forecast.
+    Outcomes {
+        /// Opaque forecast token returned by `forecast list`.
+        forecast_token: Uuid,
+        /// Continue using the cursor returned by the preceding outcomes page.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum outcome records returned.
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
+}
+
+/// Portfolio operation.
+#[derive(Debug, Subcommand)]
+pub enum PortfolioCommand {
+    /// List named portfolios and their opaque product tokens.
+    Accounts {
+        /// Continue using the cursor returned by the preceding portfolio page.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum portfolios returned.
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
+    /// Import a selected portfolio file through review and approval.
+    #[command(name = "import")]
+    ImportFlow {
+        /// Portfolio import step.
+        #[command(subcommand)]
+        command: PortfolioImportCommand,
+    },
+    /// Run the low-level portfolio manifest importer for diagnostics.
+    #[command(name = "diagnostics-import", hide = true)]
+    Import {
+        /// Confined diagnostic manifest.
+        path: PathBuf,
+        /// Destination portfolio identity.
         #[arg(long)]
         account: String,
+        /// Explicit diagnostic mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Report a page of positions from one portfolio snapshot.
+    Holdings {
+        /// Opaque account token returned by portfolio accounts.
+        #[arg(long)]
+        account: String,
+        /// Continue the exact saved snapshot from a previous page.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Positions per page.
+        #[arg(long, default_value_t = 25)]
+        limit: u16,
+    },
+    /// List saved observations for a selected portfolio.
+    Revisions {
+        /// Opaque account token returned by portfolio accounts.
+        #[arg(long)]
+        account: String,
+        /// Continue the same saved history listing.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Saved observations per page.
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
+    /// Compare reported position values between two selected saved observations.
+    Attribution {
+        /// Confined JSON request with accountToken and both saved snapshot tokens.
+        request: PathBuf,
+    },
+    /// Report a page of recorded transactions from one portfolio snapshot.
+    Transactions {
+        /// Opaque account token returned by portfolio accounts.
+        #[arg(long)]
+        account: String,
+        /// Continue the same saved portfolio observation.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Transactions per page.
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
+    /// Calculate a hypothetical change against a selected saved portfolio.
+    Scenario {
+        /// Confined JSON request containing accountToken, snapshotToken and scenario.
+        request: PathBuf,
+    },
+    /// Compare explicit hypothetical changes against the same saved portfolio.
+    ScenarioBatch {
+        /// Confined JSON request containing accountToken, snapshotToken and scenarios.
+        request: PathBuf,
+    },
+    /// Calculate hypothetical allocation changes against a selected saved portfolio.
+    Rebalance {
+        /// Confined JSON request containing accountToken, snapshotToken and explicit proposal.
+        request: PathBuf,
+    },
+    /// Compare a target position using the selected account and current price evidence.
+    PositionImpact {
+        /// Confined JSON request with accountToken, instrumentId, proposedQuantity and scenarioShockPercent.
+        request: PathBuf,
+    },
+    /// Save an existing completed calculation without recalculating it.
+    SavePlanningResult {
+        /// Opaque account token returned by portfolio accounts.
+        #[arg(long)]
+        account: String,
+        /// Original calculation token returned by a planning operation.
+        #[arg(long)]
+        calculation_token: Uuid,
+        /// Confirm saving this result locally.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// List the selected portfolio's saved calculations.
+    PlanningResults {
+        /// Opaque account token returned by portfolio accounts.
+        #[arg(long)]
+        account: String,
+        /// Continue the same saved-result listing.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Saved calculations per page.
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=32))]
+        limit: u16,
+    },
+    /// Reopen the original saved assumptions and calculation.
+    PlanningResult {
+        /// Opaque account token returned by portfolio accounts.
+        #[arg(long)]
+        account: String,
+        /// Saved result token returned by save or list.
+        #[arg(long)]
+        saved_result_token: Uuid,
     },
     /// Measure point-in-time portfolio performance.
     Performance {
@@ -484,36 +1165,168 @@ pub enum PortfolioCommand {
         /// Confined JSON request file.
         request: PathBuf,
     },
+    /// Read portfolio value and historical market-risk inputs for an investment analysis.
+    SelectAnalysisPrerequisites {
+        /// Confined JSON request containing the investment, source cutoff, and resolved profile.
+        request: PathBuf,
+    },
+    /// Reopen the exact saved portfolio and trading-calendar inputs for an investment analysis.
+    ReadAnalysisPrerequisites {
+        /// Confined JSON request containing the saved reference and resolved profile.
+        request: PathBuf,
+    },
+}
+
+/// Reviewed portfolio-import operation.
+#[derive(Debug, Subcommand)]
+pub enum PortfolioImportCommand {
+    /// Review how one selected file will be interpreted before saving it.
+    Preview {
+        /// Selected portfolio file.
+        path: PathBuf,
+        /// Destination portfolio identity.
+        #[arg(long)]
+        account: String,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Approve the selected interpretations from one import review.
+    Approve {
+        /// Opaque review token returned by `portfolio import preview`.
+        #[arg(long)]
+        review_token: Uuid,
+        /// Confined JSON array selecting an interpretation for each reviewed record.
+        #[arg(long)]
+        interpretations: PathBuf,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Save one approved portfolio import.
+    Commit {
+        /// Opaque approval token returned by `portfolio import approve`.
+        #[arg(long)]
+        approval_token: Uuid,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Discard an import review without saving it.
+    Discard {
+        /// Opaque review token returned by `portfolio import preview`.
+        #[arg(long)]
+        review_token: Uuid,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
 }
 
 /// Governed-backtest operation.
 #[derive(Debug, Subcommand)]
 pub enum BacktestCommand {
-    /// Run one admitted point-in-time experiment.
-    Run {
-        /// Confined JSON request file.
-        request: PathBuf,
+    /// Show the currently available investment-test choices.
+    Options,
+    /// Preview one investment test and receive its one-use confirmation token.
+    Preview {
+        /// Opaque history choice returned by `backtest options`.
+        #[arg(long)]
+        history_token: Uuid,
+        /// Opaque period choice returned by `backtest options`.
+        #[arg(long)]
+        period_token: Uuid,
+        /// Opaque method choice returned by `backtest options`.
+        #[arg(long)]
+        method_token: Uuid,
+        /// Opaque trading-cost choice returned by `backtest options`.
+        #[arg(long)]
+        cost_token: Uuid,
+        /// Opaque portfolio choice returned by `backtest options`.
+        #[arg(long)]
+        portfolio_token: Uuid,
+        /// Opaque comparison choice returned by `backtest options`.
+        #[arg(long)]
+        comparison_token: Uuid,
+    },
+    /// Start the investment test accepted in one preparation preview.
+    Start {
+        /// One-use confirmation token returned by `backtest preview`.
+        #[arg(long)]
+        confirmation_token: Uuid,
         /// Explicit local mutation confirmation.
         #[arg(long)]
         confirm: bool,
     },
-    /// Inspect one immutable experiment result.
+    /// List backtest activity and available results.
+    List {
+        /// Continue using the cursor returned by the preceding activity page.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum activity records returned.
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
+    /// Inspect one completed backtest result.
     Show {
-        /// Experiment or run identity.
-        run: String,
+        /// Opaque backtest result token returned by `backtest list`.
+        backtest_token: uuid::Uuid,
     },
 }
 
 /// Paper-bot lifecycle operation.
 #[derive(Debug, Subcommand)]
 pub enum BotCommand {
+    /// List the virtual-cash, estimated-cost, and reporting-currency choices for a virtual account.
+    AccountPreparation,
+    /// Preview a virtual account using each explicitly selected choice.
+    PrepareAccount {
+        /// Opaque virtual-cash choice returned by `bot account-preparation`.
+        #[arg(long)]
+        cash_choice: String,
+        /// Opaque trading-cost choice returned by `bot account-preparation`.
+        #[arg(long)]
+        cost_choice: String,
+        /// Opaque reporting-currency choice returned by `bot account-preparation`.
+        #[arg(long)]
+        currency_choice: String,
+    },
+    /// Create the confirmed virtual account and leave its paper session stopped.
+    CreateAccount {
+        /// One-use confirmation token returned by `bot prepare-account`.
+        #[arg(long)]
+        confirmation_token: String,
+        /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
     /// Report lifecycle, source qualification, risk, and paper state.
     Status,
-    /// Start controlled local paper operation.
+    /// List existing virtual-account settings and available markets and practice modes.
+    Preparation,
+    /// Prepare one short-lived paper-session confirmation.
+    Prepare {
+        /// Opaque market choice returned by `bot preparation`.
+        #[arg(long)]
+        market_choice: String,
+        /// Opaque virtual-cash choice returned by `bot preparation`.
+        #[arg(long)]
+        cash_choice: String,
+        /// Opaque trading-cost choice returned by `bot preparation`.
+        #[arg(long)]
+        cost_choice: String,
+        /// Opaque practice-mode choice returned by `bot preparation`.
+        #[arg(long)]
+        mode_choice: String,
+    },
+    /// Start the exact server-prepared paper session.
     Start {
-        /// Controlled paper-run parameters.
-        #[command(flatten)]
-        paper: PaperBotArguments,
+        /// One-use confirmation token returned by `bot prepare`.
+        #[arg(long)]
+        confirmation_token: String,
+        /// Stop after this many seconds; omit to run until interrupted.
+        #[arg(long)]
+        seconds: Option<u64>,
         /// Explicit local mutation confirmation.
         #[arg(long)]
         confirm: bool,
@@ -536,23 +1349,44 @@ pub enum ExecutionCommand {
     Orders,
     /// List bounded paper fills.
     Fills,
-    /// Cancel one existing paper order through risk-controlled dispatch.
-    Cancel {
-        /// Paper order identity.
-        order: String,
+    /// List active investment plans or select a saved recommendation for a virtual order.
+    Targets {
+        /// Original saved recommendation returned by investment analysis.
+        #[arg(long)]
+        analysis_action_token: Option<Uuid>,
+    },
+    /// Prepare a manual virtual order from an explicit JSON request.
+    PrepareManual {
+        /// Confined request containing the selected target and every order choice.
+        request: PathBuf,
+    },
+    /// Submit one exact prepared manual virtual order.
+    SubmitManual {
+        /// One-use confirmation token returned by `execution prepare-manual`.
+        #[arg(long)]
+        confirmation_token: String,
         /// Explicit local mutation confirmation.
         #[arg(long)]
         confirm: bool,
     },
-    /// Reconcile paper orders, fills, balances, and positions.
-    Reconcile {
+    /// Cancel one existing paper order through risk-controlled dispatch.
+    Cancel {
+        /// Paper order identity.
+        action_token: String,
         /// Explicit local mutation confirmation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Run low-level paper-state reconciliation for diagnostics.
+    #[command(name = "diagnostics-reconcile", hide = true)]
+    Reconcile {
+        /// Explicit diagnostic mutation confirmation.
         #[arg(long)]
         confirm: bool,
     },
 }
 
-/// Fair-value operation.
+/// Low-level valuation diagnostic operation.
 #[derive(Debug, Subcommand)]
 pub enum FairValueCommand {
     /// List bounded immutable measurements.
@@ -617,7 +1451,550 @@ pub enum FairValueCommand {
 #[derive(Debug, Subcommand)]
 pub enum McpCommand {
     /// Serve the bounded local stdio protocol.
-    Serve,
+    Serve {
+        /// Installer-owned MCP client credential used by this stateless relay.
+        #[arg(long, value_enum)]
+        client: McpClientArgument,
+    },
+}
+
+/// Named MCP client registration used by the stateless stdio relay.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum McpClientArgument {
+    /// Claude Code user-level MCP registration.
+    ClaudeCode,
+    /// Codex user-level MCP registration.
+    Codex,
+}
+
+impl From<McpClientArgument> for market_squawk_runtime::NamedClient {
+    fn from(value: McpClientArgument) -> Self {
+        match value {
+            McpClientArgument::ClaudeCode => Self::ClaudeCode,
+            McpClientArgument::Codex => Self::Codex,
+        }
+    }
+}
+
+/// Installed-service operation.
+#[derive(Debug, Subcommand)]
+pub enum ServiceCommand {
+    /// Prove authenticated readiness and show the non-secret bootstrap snapshot.
+    Status,
+    /// Start the verified installed service sibling and wait for authenticated readiness.
+    Start,
+    /// Complete the short-lived owner-authenticated credential bootstrap.
+    Bootstrap {
+        /// Read one bounded unlock from standard input instead of a no-echo terminal prompt.
+        #[arg(long, conflicts_with = "complete_foreground_keyring")]
+        stdin: bool,
+        /// Complete the protected-keyring handoff from this foreground process.
+        #[arg(long)]
+        complete_foreground_keyring: bool,
+    },
+}
+
+/// Durable-job operation.
+#[derive(Debug, Subcommand)]
+pub enum JobCommand {
+    /// List one bounded page of jobs in stable identity order.
+    List {
+        /// Continue using the opaque cursor returned by the preceding job page.
+        #[arg(long)]
+        after_job_id: Option<String>,
+        /// Maximum jobs returned.
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
+        limit: u16,
+    },
+    /// Read one exact generation of a job.
+    Get {
+        /// Durable job identity.
+        job_id: Uuid,
+        /// Exact one-based execution generation.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        generation: u64,
+    },
+    /// Read one bounded event page after an exact generation cursor.
+    Watch {
+        /// Durable job identity.
+        job_id: Uuid,
+        /// Exact one-based execution generation.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        generation: u64,
+        /// Resume strictly after this event sequence; zero begins at the first event.
+        #[arg(long, default_value_t = 0)]
+        after_sequence: u64,
+        /// Maximum events returned.
+        #[arg(long, default_value_t = 100, value_parser = clap::value_parser!(u16).range(1..=1000))]
+        limit: u16,
+    },
+    /// Request cancellation at the exact observed generation and sequence.
+    Cancel {
+        /// Durable job identity.
+        job_id: Uuid,
+        /// Exact one-based execution generation.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        generation: u64,
+        /// Exact latest event sequence observed by the operator.
+        #[arg(long)]
+        expected_sequence: u64,
+        /// Explicitly authorize this mutation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Release a confirmation-gated job at the exact observed generation and sequence.
+    Confirm {
+        /// Durable job identity.
+        job_id: Uuid,
+        /// Exact one-based execution generation.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        generation: u64,
+        /// Exact latest event sequence observed by the operator.
+        #[arg(long)]
+        expected_sequence: u64,
+        /// Bounded reviewer or approval identity.
+        #[arg(long)]
+        confirmation_identity: String,
+        /// Lowercase SHA-256 of the exact confirmation evidence.
+        #[arg(long)]
+        evidence_sha256: String,
+        /// Explicitly authorize this mutation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Start the next admitted retry generation from the exact terminal observation.
+    Retry {
+        /// Durable job identity.
+        job_id: Uuid,
+        /// Exact one-based execution generation.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        generation: u64,
+        /// Exact latest event sequence observed by the operator.
+        #[arg(long)]
+        expected_sequence: u64,
+        /// Explicitly authorize this mutation.
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
+/// Installed-product operational hierarchy.
+#[derive(Debug, Subcommand)]
+pub enum OperationsCommand {
+    /// Create, inspect, verify, retain, and restore product backups.
+    Backup {
+        /// Backup operation.
+        #[command(subcommand)]
+        command: BackupOperationsCommand,
+    },
+    /// List and switch between local workspaces through the service-owned fence.
+    Workspace {
+        /// Workspace operation.
+        #[command(subcommand)]
+        command: WorkspaceOperationsCommand,
+    },
+    /// Check, preview, activate, and roll back immutable program releases.
+    Update {
+        /// Update operation.
+        #[command(subcommand)]
+        command: UpdateOperationsCommand,
+    },
+    /// Query and export bounded redacted structured logs.
+    Logs {
+        /// Log operation.
+        #[command(subcommand)]
+        command: LogOperationsCommand,
+    },
+    /// Inspect, preview, apply, and roll back typed product settings.
+    Settings {
+        /// Settings operation.
+        #[command(subcommand)]
+        command: SettingsOperationsCommand,
+    },
+}
+
+/// Product-backup operation.
+#[derive(Debug, Subcommand)]
+pub enum BackupOperationsCommand {
+    /// List one bounded page of retained product backups.
+    List {
+        /// Continue using the opaque cursor returned by the preceding backup page.
+        #[arg(long)]
+        after_backup_id: Option<String>,
+        /// Maximum backup manifests returned.
+        #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u8).range(1..=64))]
+        limit: u8,
+    },
+    /// Return one exact retained product-backup manifest.
+    Get {
+        /// Exact lowercase backup SHA-256.
+        backup_id: String,
+    },
+    /// Start one durable complete product-backup job.
+    Create {
+        /// Explicitly authorize this mutation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Start durable verification of one exact retained backup.
+    Verify {
+        /// Exact lowercase backup SHA-256.
+        backup_id: String,
+        /// Explicitly authorize this mutation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Preview and apply bounded backup retention.
+    Retention {
+        /// Backup-retention operation.
+        #[command(subcommand)]
+        command: BackupRetentionCommand,
+    },
+    /// Preview and start a fenced restore into a fresh workspace.
+    Restore {
+        /// Restore operation.
+        #[command(subcommand)]
+        command: RestoreCommand,
+    },
+}
+
+/// Backup-retention preview and application.
+#[derive(Debug, Subcommand)]
+pub enum BackupRetentionCommand {
+    /// Preview the exact backups retained and removed by the policy.
+    Preview {
+        /// Number of newest verified backups to retain.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..=128))]
+        keep_latest: u16,
+    },
+    /// Start the durable retention job bound to one exact preview.
+    Apply(OperationsPreviewConfirmationArguments),
+}
+
+/// Restore preview and start.
+#[derive(Debug, Subcommand)]
+pub enum RestoreCommand {
+    /// Preview restoring one exact backup into a fresh fenced workspace.
+    Preview {
+        /// Exact lowercase backup SHA-256.
+        backup_id: String,
+    },
+    /// Start the durable restore bound to one exact preview.
+    Start(OperationsPreviewConfirmationArguments),
+}
+
+/// Local-workspace operation.
+#[derive(Debug, Subcommand)]
+pub enum WorkspaceOperationsCommand {
+    /// List one bounded page of known workspaces and active-generation evidence.
+    List {
+        /// Continue strictly after this workspace identity.
+        #[arg(long)]
+        after_workspace_id: Option<Uuid>,
+        /// Maximum workspace descriptors returned.
+        #[arg(long, default_value_t = 64, value_parser = clap::value_parser!(u8).range(1..=64))]
+        limit: u8,
+    },
+    /// Preview and start a service-owned workspace switch.
+    Switch {
+        /// Workspace-switch operation.
+        #[command(subcommand)]
+        command: WorkspaceSwitchCommand,
+    },
+}
+
+/// Workspace-switch preview and start.
+#[derive(Debug, Subcommand)]
+pub enum WorkspaceSwitchCommand {
+    /// Preview fencing, blockers, reconciliation, and client resynchronization.
+    Preview {
+        /// Exact target workspace identity.
+        workspace_id: Uuid,
+    },
+    /// Start the durable switch bound to one exact preview.
+    Start(OperationsPreviewConfirmationArguments),
+}
+
+/// Immutable-program update and rollback operation.
+#[derive(Debug, Subcommand)]
+pub enum UpdateOperationsCommand {
+    /// Return trusted update, known-good generation, and recovery status.
+    Status,
+    /// Check trusted metadata and stage only an admitted candidate.
+    Check {
+        /// Explicitly authorize provider contact and candidate staging.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Preview activation of the currently staged trusted candidate.
+    Preview,
+    /// Start update activation bound to one exact preview.
+    Start(OperationsPreviewConfirmationArguments),
+    /// Preview or start rollback of program files without restoring data.
+    ProgramRollback {
+        /// Program-rollback operation.
+        #[command(subcommand)]
+        command: ProgramRollbackCommand,
+    },
+}
+
+/// Program-generation rollback preview and start.
+#[derive(Debug, Subcommand)]
+pub enum ProgramRollbackCommand {
+    /// Preview the known-good program generation and data compatibility.
+    Preview,
+    /// Start program rollback bound to one exact preview.
+    Start(OperationsPreviewConfirmationArguments),
+}
+
+/// Exact one-use Operations preview confirmation.
+#[derive(Debug, Args)]
+pub struct OperationsPreviewConfirmationArguments {
+    /// Exact preview UUID returned by the corresponding preview operation.
+    #[arg(long)]
+    pub preview_id: Uuid,
+    /// Lowercase SHA-256 returned with the exact preview.
+    #[arg(long)]
+    pub preview_digest: String,
+    /// Explicitly authorize this preview-bound mutation.
+    #[arg(long)]
+    pub confirm: bool,
+}
+
+/// Structured-log operation.
+#[derive(Debug, Subcommand)]
+pub enum LogOperationsCommand {
+    /// Query one bounded page of redacted structured logs.
+    Query(LogQueryArguments),
+    /// Publish a bounded redacted log export as a controlled artifact.
+    Export {
+        /// Exact bounded log selection.
+        #[command(flatten)]
+        query: LogQueryArguments,
+        /// Explicitly authorize controlled artifact publication.
+        #[arg(long)]
+        confirm: bool,
+    },
+}
+
+/// Typed filters shared by structured-log query and controlled export.
+#[derive(Debug, Args)]
+pub struct LogQueryArguments {
+    /// Inclusive RFC 3339 lower time bound.
+    #[arg(long)]
+    pub from: Option<String>,
+    /// Inclusive RFC 3339 upper time bound.
+    #[arg(long)]
+    pub through: Option<String>,
+    /// Minimum retained severity.
+    #[arg(long, value_enum)]
+    pub minimum_severity: Option<LogSeverityArgument>,
+    /// Exact product domain filter.
+    #[arg(long, value_enum)]
+    pub domain: Option<LogDomainArgument>,
+    /// Exact source identity filter, bounded by the application contract.
+    #[arg(long)]
+    pub source_id: Option<String>,
+    /// Exact durable-job identity filter, bounded by the application contract.
+    #[arg(long)]
+    pub job_id: Option<String>,
+    /// Exact correlation identity filter, bounded by the application contract.
+    #[arg(long)]
+    pub correlation_id: Option<String>,
+    /// Bounded redacted message search text.
+    #[arg(long)]
+    pub search: Option<String>,
+    /// Continue using the opaque cursor returned by the preceding log page.
+    #[arg(long)]
+    pub cursor: Option<String>,
+    /// Maximum records returned or exported.
+    #[arg(long, default_value_t = 250, value_parser = clap::value_parser!(u16).range(1..=1000))]
+    pub limit: u16,
+}
+
+/// Closed structured-log severity.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum LogSeverityArgument {
+    Trace,
+    Debug,
+    Info,
+    Warn,
+    Error,
+}
+
+/// Closed structured-log product domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum LogDomainArgument {
+    Application,
+    Source,
+    Market,
+    Research,
+    Portfolio,
+    Model,
+    Backtest,
+    Execution,
+    Risk,
+    FairValue,
+    Mcp,
+    Lifecycle,
+}
+
+/// Typed-settings operation.
+#[derive(Debug, Subcommand)]
+pub enum SettingsOperationsCommand {
+    /// Return all effective typed settings, origins, and restart impacts.
+    Get,
+    /// Preview or apply a typed settings change.
+    Change {
+        /// Settings-change operation.
+        #[command(subcommand)]
+        command: SettingsChangeCommand,
+    },
+    /// Preview or apply restoration of a retained settings revision.
+    Rollback {
+        /// Settings-rollback operation.
+        #[command(subcommand)]
+        command: SettingsRollbackCommand,
+    },
+}
+
+/// Typed settings-change preview and application.
+#[derive(Debug, Subcommand)]
+pub enum SettingsChangeCommand {
+    /// Preview one or more closed typed settings at an exact revision.
+    Preview(SettingsChangeArguments),
+    /// Apply one exact settings-change preview.
+    Apply(OperationsPreviewConfirmationArguments),
+}
+
+/// Settings-rollback preview and application.
+#[derive(Debug, Subcommand)]
+pub enum SettingsRollbackCommand {
+    /// Preview restoring a retained revision as a new monotonic revision.
+    Preview {
+        /// Exact currently observed settings revision.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        expected_revision: u64,
+        /// Exact retained settings revision to restore.
+        #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+        target_revision: u64,
+    },
+    /// Apply one exact settings-rollback preview.
+    Apply(OperationsPreviewConfirmationArguments),
+}
+
+/// Closed settings values accepted by `operations settings change preview`.
+#[derive(Debug, Args)]
+pub struct SettingsChangeArguments {
+    /// Exact currently observed settings revision.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    pub expected_revision: u64,
+    /// Structured-log retention in days.
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=365))]
+    pub log_retention_days: Option<u16>,
+    /// Minimum structured-log severity.
+    #[arg(long, value_enum)]
+    pub log_minimum_severity: Option<LogSeverityArgument>,
+    /// Product-owned update stream.
+    #[arg(long, value_enum)]
+    pub update_channel: Option<UpdateChannelArgument>,
+    /// Whether the service performs disclosed bounded automatic update checks.
+    #[arg(long)]
+    pub automatic_update_checks: Option<bool>,
+    /// Workspace soft storage limit in bytes.
+    #[arg(
+        long,
+        value_parser = clap::value_parser!(u64).range(1_073_741_824..=17_592_186_044_416)
+    )]
+    pub storage_soft_limit_bytes: Option<u64>,
+    /// Default bounded analytical-query row limit.
+    #[arg(long, value_parser = clap::value_parser!(u32).range(100..=1_000_000))]
+    pub default_query_row_limit: Option<u32>,
+    /// Maximum concurrently running durable jobs.
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=64))]
+    pub maximum_concurrent_jobs: Option<u16>,
+    /// Market-data freshness threshold in milliseconds.
+    #[arg(long, value_parser = clap::value_parser!(u64).range(250..=600_000))]
+    pub market_freshness_millis: Option<u64>,
+    /// Number of verified backups retained by default.
+    #[arg(long, value_parser = clap::value_parser!(u16).range(1..=64))]
+    pub backup_retention_count: Option<u16>,
+}
+
+/// Closed product-owned update stream.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum UpdateChannelArgument {
+    Stable,
+    Preview,
+}
+
+/// Guided first-run setup operation.
+#[derive(Debug, Subcommand)]
+pub enum SetupCommand {
+    /// Return the closed setup catalog and exact accepted plan, if any.
+    Status,
+    /// Preview a complete workspace-bound setup plan without completing any step.
+    Preview(SetupPreviewArguments),
+    /// Accept one exact one-use setup-plan preview without completing any step.
+    Apply(SetupApplyArguments),
+}
+
+/// Closed setup-plan selection.
+#[derive(Debug, Args)]
+pub struct SetupPreviewArguments {
+    /// Exact current setup-plan revision; zero selects an unconfigured workspace.
+    #[arg(long, default_value_t = 0)]
+    pub expected_revision: u64,
+    /// One or more closed goals; repeat the option or pass a comma-separated list.
+    #[arg(
+        long = "goal",
+        value_enum,
+        value_delimiter = ',',
+        default_value = "everything-recommended"
+    )]
+    pub goals: Vec<SetupGoalArgument>,
+    /// One code-owned starter plan compatible with the selected goals.
+    #[arg(long, value_enum, default_value = "everything-recommended")]
+    pub starter_plan: SetupStarterPlanArgument,
+}
+
+/// Exact one-use setup-plan confirmation.
+#[derive(Debug, Args)]
+pub struct SetupApplyArguments {
+    /// Exact non-nil preview UUID returned by `setup preview`.
+    #[arg(long)]
+    pub preview_id: Uuid,
+    /// Exact lowercase SHA-256 returned by `setup preview`.
+    #[arg(long)]
+    pub preview_sha256: String,
+    /// Explicitly authorize acceptance of this exact setup plan.
+    #[arg(long)]
+    pub confirm: bool,
+}
+
+/// Closed setup goal projected into the public application setup contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum SetupGoalArgument {
+    EverythingRecommended,
+    ExplorePublicMarkets,
+    ResearchInvestments,
+    ManagePortfolio,
+    BuildAndEvaluateModels,
+    PracticePaperExecution,
+    UseClaudeCode,
+    UseCodex,
+}
+
+/// Closed setup starter plan projected into the public application setup contract.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum SetupStarterPlanArgument {
+    EverythingRecommended,
+    PublicMarkets,
+    Research,
+    Portfolio,
+    Models,
+    PaperPractice,
+    AiClients,
 }
 
 /// Exact-head release operation.
@@ -734,24 +2111,18 @@ pub struct ReleaseProviderArguments {
     /// Require one authorized source to drive a verified risk-approved paper action.
     #[arg(long)]
     pub require_direct_verified_action: bool,
-    /// Require admitted FRED and ALFRED persistence and training rights.
+    /// Require exact FRED and ALFRED source authority for durable personal research.
     #[arg(long)]
-    pub require_fred_alfred_rights: bool,
+    pub require_fred_alfred_source_authority: bool,
     /// Exact zero-padded ten-digit CIK exercised through SEC filings and Company Facts.
     #[arg(long, value_name = "CIK")]
     pub sec_cik: Option<String>,
     /// Exact FRED or ALFRED provider dataset exercised through durable release acceptance.
     #[arg(long, value_name = "PROVIDER_DATASET")]
     pub fred_dataset: Option<String>,
-    /// Bounded typed PIT build request that consumes the exact published FRED generation.
-    #[arg(long, value_name = "REQUEST_FILE")]
-    pub fred_training_request: Option<PathBuf>,
     /// Exact BLS request-plan dataset exercised through durable release acceptance.
     #[arg(long, value_name = "PROVIDER_DATASET")]
     pub bls_dataset: Option<String>,
-    /// Bounded typed PIT build request that consumes the exact published BLS generation.
-    #[arg(long, value_name = "REQUEST_FILE")]
-    pub bls_training_request: Option<PathBuf>,
     /// New empty directory that will own provider evidence.
     #[arg(
         id = "provider_output_directory",
@@ -841,26 +2212,6 @@ pub struct MockArguments {
     pub paper_bot: bool,
 }
 
-/// Production paper-composition arguments.
-#[derive(Debug, Args)]
-pub struct PaperBotArguments {
-    /// Configured direct source.
-    #[arg(long, value_enum, default_value_t = ProductionSourceArgument::Coinbase)]
-    pub provider: ProductionSourceArgument,
-    /// Exact active provider-onboarding session; required only for Coinbase Direct.
-    #[arg(long, required_if_eq("provider", "coinbase-direct"))]
-    pub provider_session_id: Option<Uuid>,
-    /// Stop after this many seconds; omit to run until interrupted.
-    #[arg(long)]
-    pub seconds: Option<u64>,
-    /// Virtual starting cash in the configured common quote currency.
-    #[arg(long, default_value = "100000")]
-    pub initial_cash: Decimal,
-    /// Maker and taker fee assumption for local paper execution.
-    #[arg(long, default_value_t = 100)]
-    pub fee_basis_points: u32,
-}
-
 /// Diagnostic replay arguments.
 #[derive(Debug, Args)]
 pub struct ReplayArguments {
@@ -890,13 +2241,138 @@ impl From<JournalFormatArgument> for JournalFileFormat {
     }
 }
 
-/// Direct source selectable by controlled local paper operation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-pub enum ProductionSourceArgument {
-    /// Coinbase Exchange.
-    Coinbase,
-    /// Authenticated Coinbase Exchange Direct Market Data.
-    CoinbaseDirect,
-    /// Kraken book-v2.
-    Kraken,
+/// Closed operations over the installed native financial workflow.
+#[derive(Debug, Subcommand)]
+pub enum AnalysisCommand {
+    /// Analyze an admitted investment using the current investment settings.
+    Start {
+        /// Exact market selection returned by market lookup.
+        #[arg(long)]
+        selection_token: String,
+        /// Canonical comparison instrument from analysis profile options; omit for the current default.
+        #[arg(long)]
+        benchmark_instrument_id: Option<Uuid>,
+        /// Authorize the bounded financial analysis sequence; no order is submitted.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Find opportunities using the current investment settings and admitted population.
+    Find {
+        /// Canonical comparison instrument from analysis profile options; omit for the current default.
+        #[arg(long)]
+        benchmark_instrument_id: Option<Uuid>,
+        /// Authorize the bounded financial analysis sequence; no order is submitted.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Read saved workflow progress and current investment settings.
+    Status,
+    /// Resume one paused workflow with its original retained evidence and request identity.
+    Resume {
+        /// Exact workflow token returned by status.
+        #[arg(long)]
+        workflow_token: String,
+        /// Explicitly authorize continuation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Cancel one workflow and reconcile its exact child jobs.
+    Cancel {
+        /// Exact workflow token returned by status.
+        #[arg(long)]
+        workflow_token: String,
+        /// Explicitly authorize cancellation.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Read one bounded page of the original completed opportunity-search coverage.
+    Coverage {
+        /// Exact completed workflow token.
+        #[arg(long)]
+        workflow_token: String,
+        /// JSON file containing the exact nextAfter cursor from the prior page.
+        #[arg(long)]
+        after: Option<PathBuf>,
+    },
+    /// Use one closed Advanced investment-settings command, such as profileOptions or copyRecommended.
+    Profile {
+        /// JSON file containing the existing typed profile command and its current tokens.
+        #[arg(long)]
+        request: PathBuf,
+        /// Explicitly confirm commands that change or validate investment settings.
+        #[arg(long)]
+        confirm: bool,
+    },
+    /// Read, preview, or explicitly confirm recommendation account and allocation setup.
+    Setup {
+        /// Existing setup authority operation.
+        #[command(subcommand)]
+        command: AnalysisSetupCommand,
+    },
+    /// List persisted generated, no-action, and unavailable investment analyses.
+    Results {
+        /// Continue after the exact prior saved-analysis action token.
+        #[arg(long)]
+        after: Option<Uuid>,
+        /// Maximum saved results returned.
+        #[arg(long,default_value_t=100,value_parser=clap::value_parser!(u16).range(1..=1000))]
+        limit: u16,
+    },
+    /// Reopen one exact persisted investment analysis.
+    Show {
+        /// Original saved-analysis action token; also used by explicit paper drafting.
+        #[arg(long)]
+        action_token: Uuid,
+    },
+    /// Read a selected period and evidence layer from one saved investment analysis.
+    Chart {
+        /// Original saved-analysis action token returned by analysis results.
+        #[arg(long)]
+        action_token: Uuid,
+        /// Inclusive window start in exact Unix nanoseconds; omit for the saved beginning.
+        #[arg(long, allow_negative_numbers = true)]
+        start_unix_nanos: Option<i64>,
+        /// Inclusive window end in exact Unix nanoseconds; omit for the saved end.
+        #[arg(long, allow_negative_numbers = true)]
+        end_unix_nanos: Option<i64>,
+        /// Display points (8..4096; service default 1000); does not limit analytical inputs.
+        #[arg(long)]
+        point_limit: Option<u16>,
+        /// Saved layer: all, history, forecast, benchmark, price_pattern, or action_ranges.
+        #[arg(long)]
+        layer: Option<String>,
+    },
+}
+/// Explicit recommendation setup; every numeric choice comes from the operator.
+#[derive(Debug, Subcommand)]
+pub enum AnalysisSetupCommand {
+    /// Read one page of current financial settings and available model choices.
+    Catalog {
+        /// Continue using the cursor returned by the preceding model choices page.
+        #[arg(long)]
+        cursor: Option<String>,
+        /// Maximum model choices returned.
+        #[arg(long, default_value_t = 25, value_parser = clap::value_parser!(u16).range(1..=100))]
+        limit: u16,
+    },
+    /// Read the current setup and genuine available account choices.
+    Status,
+    /// Preview accountId, expectedRevision, and allocationProfile from a bounded JSON file.
+    Preview {
+        /// Exact setup request, with an explicitly selected account and numeric allocation profile.
+        #[arg(long)]
+        request: PathBuf,
+    },
+    /// Commit only the exact preview that the operator reviewed.
+    Commit {
+        /// Original preview identifier.
+        #[arg(long)]
+        preview_id: Uuid,
+        /// Original preview digest.
+        #[arg(long)]
+        preview_digest: String,
+        /// Explicitly confirm the reviewed setup.
+        #[arg(long)]
+        confirm: bool,
+    },
 }

@@ -105,6 +105,70 @@ impl PaperExecutionAdapter {
         control_response(response, deadline, cancellation).await
     }
 
+    /// Reconciles genuine source action economics against the worker's own original fills.
+    /// Callers provide no balances, holdings, fill timestamps or settlement amounts.
+    pub async fn reconcile_corporate_actions(
+        &self,
+        plan: market_squawk_data::CorporateActionPlan,
+        source_reference: Vec<u8>,
+        expected_sequence: u64,
+        control: PaperControlContext,
+    ) -> Result<PaperExecutionSnapshot, PaperControlError> {
+        self.reconcile_corporate_actions_with_virtual_marks(plan, source_reference, expected_sequence, Box::default(), control).await
+    }
+
+    /// Atomically joins authentic source coverage with an original revocable equity quote mark.
+    pub async fn reconcile_corporate_actions_with_virtual_marks(
+        &self,
+        plan: market_squawk_data::CorporateActionPlan,
+        source_reference: Vec<u8>,
+        expected_sequence: u64,
+        virtual_marks: Box<[market_squawk_execution::virtual_paper::VirtualPaperValuationMark]>,
+        control: PaperControlContext,
+    ) -> Result<PaperExecutionSnapshot, PaperControlError> {
+        let (reply, response) = oneshot::channel();
+        let deadline = control.deadline();
+        let cancellation = control.cancellation();
+        self.send_control(
+            WorkerCommand::CorporateActions {
+                plan: Box::new(plan),
+                source_reference,
+                expected_sequence,
+                virtual_marks,
+                control,
+                reply,
+            },
+            deadline,
+            &cancellation,
+        )
+        .await?;
+        control_response(response, deadline, cancellation).await
+    }
+
+    /// Revalidates the exact retained source action receipt after process recovery.
+    pub async fn reopen_corporate_actions(
+        &self,
+        plan: market_squawk_data::CorporateActionPlan,
+        source_reference: Vec<u8>,
+        control: PaperControlContext,
+    ) -> Result<(), PaperControlError> {
+        let (reply, response) = oneshot::channel();
+        let deadline = control.deadline();
+        let cancellation = control.cancellation();
+        self.send_control(
+            WorkerCommand::ReopenCorporateActions {
+                plan: Box::new(plan),
+                source_reference,
+                control,
+                reply,
+            },
+            deadline,
+            &cancellation,
+        )
+        .await?;
+        control_response(response, deadline, cancellation).await
+    }
+
     /// Exports a strict complete recovery checkpoint without performing filesystem I/O.
     pub async fn checkpoint(
         &self,
@@ -115,6 +179,24 @@ impl PaperExecutionAdapter {
         let cancellation = control.cancellation();
         self.send_control(
             WorkerCommand::Checkpoint { control, reply },
+            deadline,
+            &cancellation,
+        )
+        .await?;
+        control_response(response, deadline, cancellation).await
+    }
+
+    /// Reads one original checkpoint image without replacing persistence issuance authority.
+    /// This shares the existing worker mailbox and grants no persistence acknowledgement.
+    pub async fn portfolio_checkpoint(
+        &self,
+        control: PaperControlContext,
+    ) -> Result<PaperExecutionCheckpoint, PaperControlError> {
+        let (reply, response) = oneshot::channel();
+        let deadline = control.deadline();
+        let cancellation = control.cancellation();
+        self.send_control(
+            WorkerCommand::PortfolioCheckpoint { control, reply },
             deadline,
             &cancellation,
         )
@@ -227,6 +309,10 @@ impl PaperExecutionAdapter {
 }
 
 impl ExecutionAdapter for PaperExecutionAdapter {
+    fn accepts_virtual_paper(&self) -> bool {
+        true
+    }
+
     fn is_cooperative(&self) -> bool {
         true
     }
@@ -407,10 +493,16 @@ impl PaperExecutionRuntime {
         task_reaper: ExecutionTaskReaper,
         reconciliation_fence: Option<market_squawk_execution::AccountRiskReconciliationFence>,
     ) -> Result<Self, PaperStartError> {
+        if config.input().session_policy.calendar().is_none() {
+            return Err(PaperStartError::InvalidCheckpoint);
+        }
         if !checkpoint_repository.binds_config(&config) {
             return Err(PaperStartError::CheckpointRepositoryMismatch);
         }
-        let ledger = PaperLedger::try_new(config.ledger_config(), accounts)?;
+        let mut ledger = PaperLedger::try_new(config.ledger_config(), accounts)?;
+        ledger.retain_action_origin(
+            system_timestamp().map_err(|_| PaperStartError::InvalidCheckpoint)?,
+        )?;
         Self::start_with_state(
             config,
             ledger,
@@ -461,6 +553,9 @@ impl PaperExecutionRuntime {
         task_reaper: ExecutionTaskReaper,
         reconciliation_fence: Option<market_squawk_execution::AccountRiskReconciliationFence>,
     ) -> Result<Self, PaperStartError> {
+        if config.input().session_policy.calendar().is_none() {
+            return Err(PaperStartError::InvalidCheckpoint);
+        }
         if !checkpoint_repository.binds_config(&config) {
             return Err(PaperStartError::CheckpointRepositoryMismatch);
         }
@@ -926,6 +1021,10 @@ pub enum PaperStartError {
 /// Out-of-band lifecycle control failure.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum PaperControlError {
+    #[error("paper source action replay failed: {0}")]
+    CorporateAction(crate::PaperLedgerError),
+    #[error("paper financial state advanced before source action application")]
+    FinancialStateAdvanced,
     #[error("paper control deadline is invalid")]
     InvalidDeadline,
     #[error("paper control operation was cancelled")]

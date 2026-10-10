@@ -12,8 +12,8 @@ use market_squawk_domain::{
 };
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope,
-    DecodeOutcome, FreshnessPolicy, LiveSourceGeneration, MarketDecoder, ProviderBudgetPolicy,
-    RawMarketFrame, RawMarketSink, RegistryError, SessionId, SinkError, SourceError,
+    DecodeOutcome, FreshnessPolicy, LiveSourceGeneration, ProviderBudgetPolicy, RawMarketFrame,
+    RawMarketSink, RegistryError, SessionId, SinkError, SourceError,
 };
 use tokio::net::{TcpListener, TcpStream};
 use tokio_tungstenite::{
@@ -24,9 +24,14 @@ use tokio_util::sync::CancellationToken;
 
 use super::CoinbaseExchangeSource;
 use crate::{
-    CoinbaseChannel, CoinbaseExchangeConfig, CoinbaseExchangeDecoder, CoinbaseProductMapping,
-    CoinbaseTransportLimits,
+    CoinbaseChannel, CoinbaseExchangeConfig, CoinbaseExchangeDecoder, CoinbaseMarketDecodeOutcome,
+    CoinbaseProductMapping, CoinbaseTransportLimits,
 };
+
+#[path = "../../tests/common/catalog.rs"]
+mod catalog_fixture;
+
+use catalog_fixture::CatalogFixture;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
@@ -47,8 +52,9 @@ impl RawMarketSink for RecordingSink {
 #[tokio::test]
 async fn one_generation_subscribes_captures_controls_and_returns_typed_close() -> TestResult {
     let _budget_guard = SOURCE_BUDGET_TEST_LOCK.lock().await;
-    let config = config()?;
-    let (mut registry, session) = session(&config, "source-local-1")?;
+    let fixture = selected_fixture()?;
+    let config = fixture.config.clone();
+    let (mut registry, session) = session(&config, &fixture.catalog, "source-local-1")?;
     let generation = live_generation(&mut registry, &session)?;
     let mut source = CoinbaseExchangeSource::try_new(config.clone(), generation)?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -56,15 +62,18 @@ async fn one_generation_subscribes_captures_controls_and_returns_typed_close() -
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await?;
         let mut socket = accept_async(stream).await?;
-        let subscription = socket
-            .next()
-            .await
-            .ok_or("subscription was not sent")??
-            .into_text()?;
-        assert_eq!(
-            subscription,
-            r#"{"type":"subscribe","product_ids":["BTC-USD"],"channels":["level2_batch","matches","heartbeat"]}"#
-        );
+        for expected in [
+            r#"{"type":"subscribe","product_ids":["BTC-USD"],"channel":"level2"}"#,
+            r#"{"type":"subscribe","product_ids":["BTC-USD"],"channel":"market_trades"}"#,
+            r#"{"type":"subscribe","channel":"heartbeats"}"#,
+        ] {
+            let subscription = socket
+                .next()
+                .await
+                .ok_or("subscription was not sent")??
+                .into_text()?;
+            assert_eq!(subscription, expected);
+        }
         socket
             .send(Message::Text(
                 include_str!("../../fixtures/subscriptions.json")
@@ -114,12 +123,12 @@ async fn one_generation_subscribes_captures_controls_and_returns_typed_close() -
     );
     let mut decoder = CoinbaseExchangeDecoder::try_new(&config)?;
     assert!(matches!(
-        decoder.decode(&session.validate_live_frame(&sink.frames[0])?)?,
-        DecodeOutcome::Control(_)
+        decoder.decode_market_handoff(&session.validate_live_frame(&sink.frames[0])?)?,
+        CoinbaseMarketDecodeOutcome::Other(DecodeOutcome::Control(_))
     ));
     assert!(matches!(
-        decoder.decode(&session.validate_live_frame(&sink.frames[1])?)?,
-        DecodeOutcome::Data(_)
+        decoder.decode_market_handoff(&session.validate_live_frame(&sink.frames[1])?)?,
+        CoinbaseMarketDecodeOutcome::Market(_)
     ));
 
     let refusal = WebSocketError::Http(Box::new(
@@ -140,8 +149,15 @@ async fn one_generation_subscribes_captures_controls_and_returns_typed_close() -
         .remaining_wait(deadline)
         .map_err(|reason| format!("Coinbase budget wait failed: {reason:?}"))?;
     tokio::time::sleep(remaining).await;
-    let market_squawk_sources::BudgetDecision::Ready(permit) = source.budget.try_acquire() else {
+    let market_squawk_sources::BudgetReservationDecision::Ready(reservation) =
+        source.budget.try_reserve_request()
+    else {
         return Err("Coinbase budget remained unavailable after its exact deadline".into());
+    };
+    let market_squawk_sources::BudgetDispatchDecision::Ready(permit) =
+        reservation.commit_dispatch()
+    else {
+        return Err("Coinbase budget dispatch remained unavailable after reservation".into());
     };
     permit.release();
     source
@@ -153,29 +169,70 @@ async fn one_generation_subscribes_captures_controls_and_returns_typed_close() -
 
 #[tokio::test]
 async fn cancellation_preempts_read_and_source_refuses_same_generation_restart() -> TestResult {
+    struct DrainSink {
+        budget: market_squawk_sources::SharedProviderBudget,
+        drained: bool,
+    }
+    impl RawMarketSink for DrainSink {
+        fn try_publish(&mut self, _frame: RawMarketFrame) -> Result<(), SinkError> {
+            Ok(())
+        }
+
+        fn finish_stream_cancellation(
+            &mut self,
+        ) -> futures_util::future::BoxFuture<'_, Result<(), SinkError>> {
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                assert!(
+                    matches!(
+                        self.budget.try_reserve_request(),
+                        market_squawk_sources::BudgetReservationDecision::Unavailable(
+                            market_squawk_sources::BudgetUnavailableReason::ConcurrencyExhausted
+                        )
+                    ),
+                    "transport authority was released before publication drained"
+                );
+                self.drained = true;
+                Ok(())
+            })
+        }
+    }
     let _budget_guard = SOURCE_BUDGET_TEST_LOCK.lock().await;
-    let config = config()?;
-    let (mut registry, session) = session(&config, "source-local-2")?;
+    let fixture = selected_fixture()?;
+    let config = fixture.config.clone();
+    let (mut registry, session) = session(&config, &fixture.catalog, "source-local-2")?;
     let generation = live_generation(&mut registry, &session)?;
     let mut source = CoinbaseExchangeSource::try_new(config, generation)?;
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let address = listener.local_addr()?;
+    let cancellation = CancellationToken::new();
+    let stop = cancellation.clone();
     let server = tokio::spawn(async move {
         let (stream, _) = listener.accept().await?;
         let mut socket = accept_async(stream).await?;
-        let _subscription = socket.next().await;
+        for _ in 0..3 {
+            socket.next().await.ok_or("subscription was not sent")??;
+        }
+        stop.cancel();
         std::future::pending::<Result<(), Box<dyn Error + Send + Sync>>>().await
     });
     let stream = TcpStream::connect(address).await?;
     let (socket, _) = client_async(format!("ws://{address}"), stream).await?;
-    let cancellation = CancellationToken::new();
-    cancellation.cancel();
+    let mut sink = DrainSink {
+        budget: source.budget.clone(),
+        drained: false,
+    };
     let outcome = tokio::time::timeout(
         Duration::from_secs(1),
-        source.run_with_socket_for_test(socket, &mut RecordingSink::default(), cancellation),
+        source.run_with_socket_for_test(socket, &mut sink, cancellation),
     )
     .await?;
     assert_eq!(outcome, Err(SourceError::Cancelled));
+    assert!(sink.drained);
+    assert!(matches!(
+        source.budget.try_reserve_request(),
+        market_squawk_sources::BudgetReservationDecision::Ready(_)
+    ));
     assert_eq!(
         source.begin_generation_for_test(),
         Err(SourceError::InvalidProtocolState)
@@ -187,9 +244,9 @@ async fn cancellation_preempts_read_and_source_refuses_same_generation_restart()
 
 #[test]
 fn source_authority_rejects_rollover_factory_grafting_and_cross_registry_sessions() -> TestResult {
-    let config = config()?;
-    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
-    let registered = registry.register(config.metadata().clone(), Timestamp::from_unix_nanos(1))?;
+    let fixture = selected_fixture()?;
+    let config = fixture.config.clone();
+    let (mut registry, registered) = fixture.catalog.selected_registry(config.metadata())?;
     let first = registry.begin_session(
         &registered,
         SessionId::new(identifier("coinbase-session-first")?),
@@ -218,9 +275,8 @@ fn source_authority_rejects_rollover_factory_grafting_and_cross_registry_session
         Err(RegistryError::RawFrameFactoryAlreadyTaken)
     ));
 
-    let mut foreign_registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
-    let foreign_registered =
-        foreign_registry.register(config.metadata().clone(), Timestamp::from_unix_nanos(1))?;
+    let (mut foreign_registry, foreign_registered) =
+        fixture.catalog.selected_registry(config.metadata())?;
     let foreign = foreign_registry.begin_session(
         &foreign_registered,
         SessionId::new(identifier("coinbase-session-successor")?),
@@ -240,13 +296,13 @@ fn source_authority_rejects_rollover_factory_grafting_and_cross_registry_session
 
 fn session(
     config: &CoinbaseExchangeConfig,
+    catalog: &CatalogFixture,
     session_id: &str,
 ) -> TestResult<(
     AuthoritativeSourceRegistry,
     market_squawk_sources::CurrentSourceSession,
 )> {
-    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
-    let registered = registry.register(config.metadata().clone(), Timestamp::from_unix_nanos(1))?;
+    let (mut registry, registered) = catalog.selected_registry(config.metadata())?;
     let session = registry.begin_session(
         &registered,
         SessionId::new(identifier(session_id)?),
@@ -266,7 +322,35 @@ fn live_generation(
     Ok(registry.take_live_source_generation(session)?)
 }
 
+struct SelectedFixture {
+    config: CoinbaseExchangeConfig,
+    catalog: CatalogFixture,
+}
+
+fn selected_fixture() -> TestResult<SelectedFixture> {
+    let base = config()?;
+    let instrument = base
+        .mappings()
+        .first()
+        .ok_or("Coinbase product mapping missing")?
+        .instrument();
+    let catalog = CatalogFixture::new(instrument, SourceId::try_from("coinbase-advanced-trade")?)?;
+    let config = config_with_mapping(CoinbaseProductMapping::try_new_selected_public(
+        ProviderProduct::new(identifier("BTC-USD")?),
+        instrument,
+        catalog.selected.clone(),
+    )?)?;
+    Ok(SelectedFixture { config, catalog })
+}
+
 fn config() -> TestResult<CoinbaseExchangeConfig> {
+    config_with_mapping(CoinbaseProductMapping::try_new(
+        ProviderProduct::new(identifier("BTC-USD")?),
+        InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?,
+    )?)
+}
+
+fn config_with_mapping(mapping: CoinbaseProductMapping) -> TestResult<CoinbaseExchangeConfig> {
     let effective = EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?;
     let authorization = AuthorizationGrant::new(
         AuthorizationMode::PublicInterface,
@@ -288,20 +372,17 @@ fn config() -> TestResult<CoinbaseExchangeConfig> {
     CoinbaseExchangeConfig::try_new(
         SourceId::try_from("coinbase-exchange-public")?,
         RevisionBoundPayloadEvidence::new(
-            MetadataRevision::new(identifier("exchange-v1-2026-07-20")?),
+            MetadataRevision::new(identifier("advanced-trade-v1-2026-08-08")?),
             evidence(3),
         ),
         authorization,
         evidence(4),
         effective,
-        vec![CoinbaseProductMapping::try_new(
-            ProviderProduct::new(identifier("BTC-USD")?),
-            InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?,
-        )?],
+        vec![mapping],
         vec![
             CoinbaseChannel::Level2,
-            CoinbaseChannel::Matches,
-            CoinbaseChannel::Heartbeat,
+            CoinbaseChannel::MarketTrades,
+            CoinbaseChannel::Heartbeats,
         ],
         FreshnessPolicy::try_new(
             5_000_000_000,
@@ -312,7 +393,7 @@ fn config() -> TestResult<CoinbaseExchangeConfig> {
         )?,
         budget,
         CoinbaseTransportLimits::try_new(
-            256 * 1024,
+            market_squawk_sources::MAX_RAW_FRAME_BYTES,
             Duration::from_secs(5),
             Duration::from_secs(5),
         )?,

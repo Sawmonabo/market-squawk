@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-model-products"
+description = "Enables the model_products command without any pre-configured scope."
+commands.allow = ["model_products"]
+
+[[permission]]
+identifier = "deny-model-products"
+description = "Denies the model_products command without any pre-configured scope."
+commands.deny = ["model_products"]

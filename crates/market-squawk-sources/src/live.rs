@@ -437,8 +437,53 @@ impl<'de> Deserialize<'de> for RawMarketFrame {
     }
 }
 
-/// Nonblocking bounded sink used by a live source reader before decoding.
+/// Bounded sink used by a live source reader before decoding.
 pub trait RawMarketSink: Send {
+    /// Reserves admission before the next transport frame is read.
+    ///
+    /// Readers await this under the same cancellation and strictest deadline as receiving the
+    /// frame. A sink with an asynchronous publication queue retains its capacity reservation
+    /// until publication or drop; sinks without that queue can accept immediately.
+    ///
+    /// # Errors
+    ///
+    /// Returns a sink error if its publication owner has closed or the generation is terminal.
+    fn wait_for_capacity(&mut self) -> BoxFuture<'_, Result<(), SinkError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Finishes accepted publications before a cancelled stream releases its request authority.
+    ///
+    /// The adapter must retain its transport/request permit across this call. The sink decides
+    /// whether cancellation requests an orderly drain or immediate revocation; a forced stop
+    /// must not wait for new publication. Sinks without asynchronous publication have no drain.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if an orderly drain fails or exceeds its original shutdown deadline.
+    fn finish_stream_cancellation(&mut self) -> BoxFuture<'_, Result<(), SinkError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    /// Binds an exact provider request or established transport to this live stream's health.
+    ///
+    /// Sources call this once after the transport handshake and before publishing the first
+    /// frame. A successfully upgraded transport may release request concurrency through its
+    /// permit while retaining the same owner-bound lease. Sinks that do not qualify live
+    /// authority may ignore the opaque lease. Received-data qualification uses this owner lifetime,
+    /// independently of capacity or cooldown for another request.
+    ///
+    /// # Errors
+    ///
+    /// Returns a fail-closed sink error when the sink cannot accept the request authority.
+    fn bind_active_request_budget(
+        &mut self,
+        request: crate::BudgetPermitLease,
+    ) -> Result<(), SinkError> {
+        let _request = request;
+        Ok(())
+    }
+
     /// Attempts to publish one exact raw frame without waiting for capacity.
     ///
     /// # Errors
@@ -446,6 +491,28 @@ pub trait RawMarketSink: Send {
     /// Saturation, closure, and capture-integrity failure are explicit and must invalidate or
     /// degrade the affected stream according to supervision policy.
     fn try_publish(&mut self, frame: RawMarketFrame) -> Result<(), SinkError>;
+
+    /// Retains one complete raw response before any post-response currentness checks.
+    ///
+    /// Implementations keep the exact capture receipt privately until
+    /// [`Self::try_publish_captured`] consumes it. This grants no decoding or live authority.
+    /// Admission is nonblocking; the existing owned capture writer must drain at shutdown.
+    ///
+    /// # Errors
+    ///
+    /// Rejects unsupported sinks, saturation, closure, duplicate pending capture or lost custody.
+    fn try_capture_for_publication(&mut self, _frame: &RawMarketFrame) -> Result<(), SinkError> {
+        Err(SinkError::Closed)
+    }
+
+    /// Consumes the exact previously captured frame without enqueueing it a second time.
+    ///
+    /// # Errors
+    ///
+    /// Rejects missing/transplanted capture and performs all normal live-currentness checks.
+    fn try_publish_captured(&mut self, _frame: RawMarketFrame) -> Result<(), SinkError> {
+        Err(SinkError::Closed)
+    }
 
     /// Returns the earliest generation-local monotonic deadline that must interrupt transport
     /// receive waiting.
@@ -495,6 +562,73 @@ pub enum SinkError {
     /// Capture path is already known incomplete for this generation.
     #[error("raw capture integrity is incomplete")]
     CaptureIncomplete,
+}
+
+/// Closed payload-free metadata-schema failure retained only by internal diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceMetadataIntervalViolation {
+    /// The response-envelope start was not a valid civil date.
+    ResponseEnvelopeStart,
+    /// The response-envelope end was not a valid civil date.
+    ResponseEnvelopeEnd,
+    /// The response envelope was reversed.
+    ResponseEnvelopeOrder,
+    /// The response envelope did not equal the exact requested envelope.
+    ResponseEnvelopeBinding,
+    /// A metadata-record start was not a valid civil date.
+    RecordStart,
+    /// A metadata-record end was not a valid civil date.
+    RecordEnd,
+    /// A metadata-record interval was reversed.
+    RecordOrder,
+    /// The earliest metadata record did not cover the response-envelope start.
+    OuterStartCoverage,
+    /// The latest metadata record did not cover the response-envelope end.
+    OuterEndCoverage,
+    /// Two metadata records declared the same interval.
+    DuplicateInterval,
+    /// Adjacent ordered metadata records left an uncovered interval.
+    Gap,
+    /// Adjacent ordered metadata records overlapped.
+    Overlap,
+}
+
+/// Closed payload-free metadata-schema failure retained only by internal diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceMetadataSchemaViolation {
+    /// The bounded response was not the selected document shape.
+    DocumentShape,
+    /// The bounded response did not contain the exact selected record cardinality.
+    RecordCardinality,
+    /// Required bounded text was missing, empty, or outside its admitted limit.
+    RequiredText,
+    /// The selected update timestamp did not match its documented lexical contract.
+    UpdateTimestamp,
+    /// The returned record identity did not bind to the exact request.
+    RecordIdentity,
+    /// Page and record effective intervals were malformed or inconsistent.
+    PageRecordInterval(SourceMetadataIntervalViolation),
+    /// The provider-declared observation interval was malformed.
+    ObservationInterval,
+}
+
+/// Closed payload-free provider-response failure retained only by internal diagnostics.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SourceProtocolViolation {
+    /// A bounded metadata response declared an unsupported transport encoding.
+    MetadataEncoding,
+    /// A bounded metadata response violated its selected schema at the retained closed stage.
+    MetadataSchema(SourceMetadataSchemaViolation),
+    /// A bounded metadata response did not preserve the requested effective interval.
+    MetadataInterval,
+    /// A bounded observation response declared an unsupported transport encoding.
+    ObservationsEncoding,
+    /// A bounded observation response violated its selected schema.
+    ObservationsSchema,
+    /// A bounded observation response did not bind to its exact request.
+    ObservationsRequestBinding,
+    /// Exact response evidence could not bind to the bounded raw-capture contract.
+    CaptureBinding,
 }
 
 /// Live source lifecycle or bounded-input failure.

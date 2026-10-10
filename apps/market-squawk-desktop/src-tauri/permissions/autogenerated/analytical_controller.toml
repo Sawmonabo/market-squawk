@@ -1,0 +1,11 @@
+# Automatically generated - DO NOT EDIT!
+
+[[permission]]
+identifier = "allow-analytical-controller"
+description = "Enables the analytical_controller command without any pre-configured scope."
+commands.allow = ["analytical_controller"]
+
+[[permission]]
+identifier = "deny-analytical-controller"
+description = "Denies the analytical_controller command without any pre-configured scope."
+commands.deny = ["analytical_controller"]

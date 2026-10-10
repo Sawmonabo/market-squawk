@@ -10,6 +10,8 @@ use thiserror::Error;
 
 const MAX_SUBSCRIPTION_WARNINGS: usize = 16;
 const MAX_WARNING_JSON_BYTES: usize = 512;
+pub(crate) const MAX_SUBSCRIPTION_ERROR_BYTES: usize = 512;
+pub(crate) const PUBLIC_SUBSCRIPTION_REQUEST_ID: u64 = 1;
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -75,21 +77,49 @@ pub(crate) struct Heartbeat<'a> {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct StatusEnvelope<'a> {
-    pub(crate) channel: &'a str,
+struct StatusEnvelope<'a> {
+    channel: &'a str,
     #[serde(rename = "type")]
-    pub(crate) kind: &'a str,
+    kind: &'a str,
     #[serde(borrow)]
-    pub(crate) data: Vec<StatusData<'a>>,
+    data: Vec<StatusData<'a>>,
 }
 
 #[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub(crate) struct StatusData<'a> {
-    pub(crate) system: &'a str,
-    pub(crate) api_version: &'a str,
-    pub(crate) connection_id: u64,
-    pub(crate) version: &'a str,
+// Kraken adds optional maintenance/incident advisories to this row. Only the required fields
+// below govern connection status; serde skips unused advisories without retaining their bodies.
+// Financial message shapes and the surrounding status envelope remain strict.
+struct StatusData<'a> {
+    system: &'a str,
+    api_version: &'a str,
+    connection_id: u64,
+    version: &'a str,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum StatusValidationError {
+    Malformed,
+    InvalidState,
+}
+
+/// Shared public/authenticated connection-status contract; advisory text grants no authority.
+pub(crate) fn status_system(payload: &[u8]) -> Result<&str, StatusValidationError> {
+    let status: StatusEnvelope<'_> =
+        serde_json::from_slice(payload).map_err(|_| StatusValidationError::Malformed)?;
+    let value = status
+        .data
+        .first()
+        .ok_or(StatusValidationError::Malformed)?;
+    if status.channel != "status"
+        || status.kind != "update"
+        || status.data.len() != 1
+        || value.api_version.is_empty()
+        || value.version.is_empty()
+        || value.connection_id == 0
+    {
+        return Err(StatusValidationError::InvalidState);
+    }
+    Ok(value.system)
 }
 
 #[derive(Debug, Deserialize)]

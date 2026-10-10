@@ -2,7 +2,9 @@
 
 use std::num::{NonZeroU32, NonZeroUsize};
 
-use market_squawk_domain::RoundingPolicy;
+use market_squawk_domain::{
+    FeatureDatasetMacroComponentDescriptor, RoundingPolicy, feature_dataset_macro_components_v1,
+};
 
 use crate::{
     BatchRegistrationOutcome, FeatureDataType, FeatureInput, FeatureInputSchema, FeatureKey,
@@ -13,7 +15,20 @@ use crate::{
 };
 
 /// Number of code-owned batch feature definitions compiled into this release.
-pub const REQUIRED_BATCH_FEATURE_COUNT: usize = 43;
+pub const REQUIRED_BATCH_FEATURE_COUNT: usize =
+    BATCH_SPECS.len() + feature_dataset_macro_components_v1().len() + 1;
+
+pub(crate) const REPORTED_FINANCIAL_AMOUNT_FEATURE_NAME: &str =
+    "research.reported-financial-amount";
+// This is the actual data-owned identity projection, not a separate analytics calculation.
+// FinancialAmountSelection::mapping fixes the admitted concept/unit/role/share combinations;
+// FinancialFiscalTargetBinding validates the source-native period and its exact anchor chain.
+pub(crate) const REPORTED_FINANCIAL_AMOUNT_IMPLEMENTATION_IDENTITY: &str = concat!(
+    "market-squawk-data::dataset_builder::financial::FinancialSeriesSource::component",
+    "@native-fiscal-reported-financial-amount-v1;",
+    "FinancialAmountSelection::mapping@v1;",
+    "FinancialFiscalTargetBinding@sec-frame-native-contiguous-periods-v1",
+);
 
 /// Result-changing policies shared by canonical batch-feature definitions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -154,6 +169,16 @@ impl BatchFeatureCatalog {
         let entries = BATCH_SPECS
             .iter()
             .map(|spec| metadata(*spec, config, implementation_revision))
+            .chain(
+                feature_dataset_macro_components_v1()
+                    .iter()
+                    .map(|descriptor| {
+                        macro_component_metadata(*descriptor, config, implementation_revision)
+                    }),
+            )
+            .chain(std::iter::once(reported_financial_amount_metadata(
+                implementation_revision,
+            )))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Self {
             entries: entries.into_boxed_slice(),
@@ -221,6 +246,7 @@ enum InputFamily {
     RateCurve,
     RateCurvePair,
     MacroSurprise,
+    MacroComponent,
     Portfolio,
     PortfolioAndScenario,
 }
@@ -258,7 +284,7 @@ const fn spec(
     }
 }
 
-const BATCH_SPECS: [BatchSpec; REQUIRED_BATCH_FEATURE_COUNT] = [
+const BATCH_SPECS: &[BatchSpec] = &[
     spec(
         "research.price-return",
         KnownFeatureImplementation::BatchReturns,
@@ -672,6 +698,80 @@ fn metadata(
     )
 }
 
+fn macro_component_metadata(
+    descriptor: FeatureDatasetMacroComponentDescriptor,
+    config: BatchFeatureCatalogConfig,
+    revision: &str,
+) -> Result<FeatureMetadata, FeatureMetadataError> {
+    metadata(
+        spec(
+            descriptor.component_name(),
+            KnownFeatureImplementation::BatchMacro,
+            InputFamily::MacroComponent,
+            FeatureOutputType::Decimal,
+            FeatureUnit::Rate,
+            1,
+            ParameterFamily::None,
+        ),
+        config,
+        revision,
+    )
+}
+
+/// Describes the producer's exact selected amount without a price transform, rounding policy,
+/// generic share divisor, or trading-day cadence. The existing data publisher remains the sole
+/// authority for every input and rejects unsupported role/basis/share combinations.
+fn reported_financial_amount_metadata(
+    revision: &str,
+) -> Result<FeatureMetadata, FeatureMetadataError> {
+    FeatureMetadata::try_new_code_owned(
+        FeatureKey::try_new(REPORTED_FINANCIAL_AMOUNT_FEATURE_NAME, NonZeroU32::MIN)?,
+        FeatureInputSchema::try_new(vec![
+            field(
+                "reported_amount",
+                FeatureDataType::MonetaryValue,
+                FeatureUnit::CurrencyAmount,
+            )?,
+            field(
+                "role",
+                FeatureDataType::CanonicalIdentifier,
+                FeatureUnit::Unitless,
+            )?,
+            field(
+                "basis",
+                FeatureDataType::CanonicalIdentifier,
+                FeatureUnit::Unitless,
+            )?,
+            FeatureInput::try_new(
+                "share_convention",
+                FeatureDataType::CanonicalIdentifier,
+                FeatureUnit::Unitless,
+                true,
+            )?,
+            field(
+                "fiscal_period",
+                FeatureDataType::FinancialPeriodEvidence,
+                FeatureUnit::Unitless,
+            )?,
+            field(
+                "source_selection_as_of",
+                FeatureDataType::Timestamp,
+                FeatureUnit::Nanoseconds,
+            )?,
+        ])?,
+        FeatureParameters::try_new(Vec::new())?,
+        FeatureTimeSemantics::NativeFinancialPeriod,
+        FeatureWarmUp::Observations(NonZeroU32::MIN),
+        FeatureNullPolicy::Unavailable,
+        FeatureOutputType::Money,
+        FeatureUnit::CurrencyAmount,
+        false,
+        true,
+        revision,
+        KnownFeatureImplementation::BatchReportedFinancialAmount.implementation_digest()?,
+    )
+}
+
 fn schema(family: InputFamily) -> Result<FeatureInputSchema, FeatureMetadataError> {
     let fields = match family {
         InputFamily::Prices => vec![
@@ -847,6 +947,9 @@ fn schema(family: InputFamily) -> Result<FeatureInputSchema, FeatureMetadataErro
                 FeatureUnit::Unitless,
             )?,
         ],
+        InputFamily::MacroComponent => {
+            vec![field("value", FeatureDataType::Decimal, FeatureUnit::Rate)?]
+        }
         InputFamily::Portfolio => vec![
             field(
                 "allocation_dimensions",

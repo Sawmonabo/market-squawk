@@ -39,6 +39,71 @@ pub(super) fn operation_digest(
     Ok(hash.finalize().into())
 }
 
+pub(super) fn snapshot_logical_digest(
+    snapshot: &FairValueCatalogSnapshot,
+) -> Result<[u8; 32], CatalogError> {
+    let mut hash = Sha256::new();
+    hash.update(b"market-squawk/fair-value-catalog-snapshot/v1");
+    hash_count(&mut hash, snapshot.records.len())?;
+    for record in &snapshot.records {
+        hash.update(record.kind.tag().to_be_bytes());
+        hash.update(record.id);
+        hash_bytes(&mut hash, &record.payload)?;
+    }
+    hash_count(&mut hash, snapshot.audit.len())?;
+    for event in &snapshot.audit {
+        hash.update(event.sequence.to_be_bytes());
+        hash.update(event.id);
+        hash_optional_digest(&mut hash, event.previous_id);
+        hash.update(event.operation_id);
+        hash.update(event.kind.tag().to_be_bytes());
+        hash_bytes(&mut hash, event.actor.as_bytes())?;
+        hash.update(event.business_at.unix_nanos().to_be_bytes());
+        hash.update(event.appended_at.unix_nanos().to_be_bytes());
+        hash_count(&mut hash, event.records.len())?;
+        for (kind, id) in &event.records {
+            hash.update(kind.tag().to_be_bytes());
+            hash.update(id);
+        }
+        hash_count(&mut hash, event.links.len())?;
+        for link in &event.links {
+            hash.update(link.source_kind.tag().to_be_bytes());
+            hash.update(link.source_id);
+            hash.update(link.relation.tag().to_be_bytes());
+            hash.update(link.target_kind.tag().to_be_bytes());
+            hash.update(link.target_id);
+        }
+    }
+    hash_count(&mut hash, snapshot.membership_count)?;
+    hash_count(&mut hash, snapshot.link_count)?;
+    hash_count(&mut hash, snapshot.position.records)?;
+    hash_count(&mut hash, snapshot.position.operations)?;
+    hash_count(&mut hash, snapshot.position.memberships)?;
+    hash_count(&mut hash, snapshot.position.links)?;
+    hash.update(snapshot.position.last_audit_sequence.to_be_bytes());
+    hash_optional_digest(&mut hash, snapshot.position.last_audit_id);
+    Ok(hash.finalize().into())
+}
+
+fn hash_count(hash: &mut Sha256, value: usize) -> Result<(), CatalogError> {
+    hash.update(
+        u64::try_from(value)
+            .map_err(|_| CatalogError::InvalidRecord)?
+            .to_be_bytes(),
+    );
+    Ok(())
+}
+
+fn hash_optional_digest(hash: &mut Sha256, value: Option<[u8; 32]>) {
+    match value {
+        Some(value) => {
+            hash.update([1]);
+            hash.update(value);
+        }
+        None => hash.update([0]),
+    }
+}
+
 pub(super) fn audit_digest(
     sequence: u64,
     previous: Option<[u8; 32]>,

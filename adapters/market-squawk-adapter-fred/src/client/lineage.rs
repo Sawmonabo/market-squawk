@@ -18,9 +18,10 @@ pub(super) fn map_adapter_error(error: FredSourceError) -> ExtractionSourceError
         | FredSourceError::RevisionAuthority(_) => {
             ExtractionSourceError::Source(SourceError::InvalidProtocolState)
         }
-        FredSourceError::BodyTooLarge | FredSourceError::Network => {
-            ExtractionSourceError::Source(SourceError::Network)
+        FredSourceError::BodyTooLarge { max } => {
+            ExtractionSourceError::Source(SourceError::FrameTooLarge { max })
         }
+        FredSourceError::Network => ExtractionSourceError::Source(SourceError::Network),
     }
 }
 

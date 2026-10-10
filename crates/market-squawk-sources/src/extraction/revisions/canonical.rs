@@ -1,7 +1,7 @@
 //! Canonical natural-family encodings shared with point-in-time selection.
 
 use market_squawk_domain::{
-    DigestAlgorithm, EvidenceDigest, ResearchContext, ResearchObservation,
+    DigestAlgorithm, EvidenceDigest, FundamentalPeriod, ResearchContext, ResearchObservation,
     ResearchTemporalCoordinate, SourceId, SourceIdentifier,
 };
 
@@ -13,7 +13,7 @@ use super::{
 const PIT_FAMILY_DOMAIN: &str = "market-squawk/pit/family";
 const MAX_CANONICAL_OBSERVATION_FAMILY_BYTES: usize = 64 * 1024;
 
-/// Exact PIT-v1 natural-family bytes and their SHA-256 identity.
+/// Exact PIT-v2 natural-family bytes and their SHA-256 identity.
 ///
 /// Digest equality is never sufficient authority: [`Self::exact_bytes`] is retained so durable
 /// authorities can compare the complete canonical evidence on every digest hit.
@@ -27,7 +27,7 @@ pub struct CanonicalObservationFamily {
 impl CanonicalObservationFamily {
     /// Constructs the exact Macro family used by the point-in-time selector.
     ///
-    /// The encoding is `MSQPIT`, PIT identity schema `1`, the length-framed
+    /// The encoding is `MSQPIT`, PIT identity schema `2`, the length-framed
     /// `market-squawk/pit/family` domain, Macro tag `3`, source, series, and the exact effective
     /// coordinate. Value, revision, ingestion time, and whole-response evidence are excluded.
     ///
@@ -51,7 +51,7 @@ impl CanonicalObservationFamily {
     ///
     /// Payload, revision, publication, availability, ingestion, and manifest evidence are
     /// deliberately excluded. The resulting bytes are exactly compatible with PIT identity
-    /// schema version 1.
+    /// schema version 2.
     ///
     /// # Errors
     ///
@@ -73,22 +73,70 @@ impl CanonicalObservationFamily {
                 ResearchObservation::Filing(value) => {
                     encoder.u8(1)?;
                     encoder.str(provenance.source_id().as_str())?;
-                    encoder.bytes(required_instrument()?.as_uuid().as_bytes())?;
+                    encoder.serializable(value.subject())?;
                     encoder.str(value.accession().as_str())
                 }
                 ResearchObservation::Fundamental(value) => {
+                    if let Some(occurrence) = value.xbrl_evidence() {
+                        // Distinct locations in one filing are evidence occurrences, not
+                        // competing revisions of the same economic fact. Keep this identity
+                        // aligned with the PIT family encoder.
+                        encoder.u8(16)?;
+                        encoder.str(provenance.source_id().as_str())?;
+                        encoder.serializable(value.subject())?;
+                        encoder.str(occurrence.accession().as_str())?;
+                        return encoder.str(occurrence.occurrence_id().as_str());
+                    }
                     encoder.u8(2)?;
                     encoder.str(provenance.source_id().as_str())?;
-                    encoder.bytes(required_instrument()?.as_uuid().as_bytes())?;
-                    encoder.str(provenance.source_identifier().as_str())?;
+                    encoder.serializable(value.subject())?;
                     encoder.str(value.concept().as_str())?;
                     encoder.str(value.unit().as_str())?;
-                    encode_coordinate(encoder, context.time().effective())
+                    encode_fundamental_family_context(encoder, value.fact_context())
                 }
                 ResearchObservation::Macro(value) => {
                     encoder.u8(3)?;
                     encoder.str(provenance.source_id().as_str())?;
                     encoder.str(value.series().as_str())?;
+                    encode_coordinate(encoder, context.time().effective())
+                }
+                ResearchObservation::MarketBar(value) => {
+                    encoder.u8(10)?;
+                    encoder.str(provenance.source_id().as_str())?;
+                    encoder.bytes(required_instrument()?.as_uuid().as_bytes())?;
+                    encoder.str(
+                        provenance
+                            .venue_id()
+                            .ok_or(PitV1EncodingError::Encoding)?
+                            .as_str(),
+                    )?;
+                    encoder.str(value.provider_instrument_id().as_str())?;
+                    encoder.str(value.feed().as_str())?;
+                    encoder.str(value.interval().as_str())?;
+                    encoder.u8(market_bar_adjustment_tag(value.adjustment()))?;
+                    encode_market_bar_series_semantics(encoder, value.time_semantics())?;
+                    encode_coordinate(encoder, context.time().effective())
+                }
+                ResearchObservation::FundNav(value) => {
+                    encoder.u8(11)?;
+                    encoder.str(provenance.source_id().as_str())?;
+                    encoder.bytes(required_instrument()?.as_uuid().as_bytes())?;
+                    encoder.str(value.provider_product().as_source_identifier().as_str())?;
+                    encoder.str(value.provider_channel().as_source_identifier().as_str())?;
+                    encoder.str(value.provider_instrument_id().as_str())?;
+                    encode_calendar_date(encoder, value.nav_date())?;
+                    encoder.u8(fund_nav_valuation_basis_tag(value.valuation_basis()))?;
+                    encoder.str(value.currency().as_str())
+                }
+                ResearchObservation::MarketCalendar(value) => {
+                    encoder.u8(12)?;
+                    encoder.str(provenance.source_id().as_str())?;
+                    encoder.option_str(provenance.venue_id().map(|venue| venue.as_str()))?;
+                    encoder.serializable(value.scope())?;
+                    encoder.u8(u8::from(matches!(
+                        value.payload(),
+                        market_squawk_domain::MarketCalendarPayload::Coverage { .. }
+                    )))?;
                     encode_coordinate(encoder, context.time().effective())
                 }
                 ResearchObservation::PortfolioPosition(value) => {
@@ -101,8 +149,8 @@ impl CanonicalObservationFamily {
                 ResearchObservation::Transaction(value) => {
                     match provenance.instrument_id() {
                         Some(instrument) => {
-                            // Tag 9 extends PIT-v1 with instrument-scoped transactions while
-                            // preserving tag 5 byte-for-byte for legacy account-scoped records.
+                            // Tag 9 extends the current PIT schema with instrument-scoped
+                            // transactions while preserving tag 5 for account-scoped records.
                             encoder.u8(9)?;
                             encoder.str(provenance.source_id().as_str())?;
                             encoder.bytes(instrument.as_uuid().as_bytes())?;
@@ -114,6 +162,11 @@ impl CanonicalObservationFamily {
                     }
                     encoder.str(value.account_id().as_str())?;
                     encoder.str(value.source_record_id().as_str())
+                }
+                ResearchObservation::CorporateActionSource(_) => {
+                    encoder.u8(15)?;
+                    encoder.str(provenance.source_id().as_str())?;
+                    encoder.str(provenance.source_identifier().as_str())
                 }
                 ResearchObservation::CorporateAction(_) => {
                     encoder.u8(6)?;
@@ -197,11 +250,81 @@ fn observation_context(observation: &ResearchObservation) -> &ResearchContext {
         ResearchObservation::Filing(value) => value.context(),
         ResearchObservation::Fundamental(value) => value.context(),
         ResearchObservation::Macro(value) => value.context(),
+        ResearchObservation::MarketBar(value) => value.context(),
+        ResearchObservation::FundNav(value) => value.context(),
+        ResearchObservation::MarketCalendar(value) => value.context(),
         ResearchObservation::PortfolioPosition(value) => value.context(),
         ResearchObservation::Transaction(value) => value.context(),
         ResearchObservation::CorporateAction(value) => value.context(),
+        ResearchObservation::CorporateActionSource(value) => value.context(),
         ResearchObservation::UniverseMembership(value) => value.context(),
         ResearchObservation::AlternativeData(value) => value.context(),
+    }
+}
+
+fn encode_calendar_date(
+    encoder: &mut PitV1CanonicalEncoder<'_>,
+    date: market_squawk_domain::CalendarDate,
+) -> Result<(), PitV1EncodingError> {
+    encoder.u16(date.year())?;
+    encoder.u8(date.month())?;
+    encoder.u8(date.day())
+}
+
+const fn fund_nav_valuation_basis_tag(basis: market_squawk_domain::FundNavValuationBasis) -> u8 {
+    match basis {
+        market_squawk_domain::FundNavValuationBasis::PerShare => 1,
+    }
+}
+
+const fn market_bar_adjustment_tag(adjustment: market_squawk_domain::MarketBarAdjustment) -> u8 {
+    match adjustment {
+        market_squawk_domain::MarketBarAdjustment::Raw => 1,
+        market_squawk_domain::MarketBarAdjustment::Split => 2,
+        market_squawk_domain::MarketBarAdjustment::Dividend => 3,
+        market_squawk_domain::MarketBarAdjustment::SpinOff => 4,
+        market_squawk_domain::MarketBarAdjustment::All => 5,
+    }
+}
+
+fn encode_market_bar_series_semantics(
+    encoder: &mut PitV1CanonicalEncoder<'_>,
+    semantics: &market_squawk_domain::BarTimeSemantics,
+) -> Result<(), PitV1EncodingError> {
+    match semantics {
+        market_squawk_domain::BarTimeSemantics::TimestampedPeriod(period) => {
+            encoder.u8(1)?;
+            encoder.u8(bar_timestamp_basis_tag(period.timestamp_basis()))?;
+            encode_market_bar_session(encoder, period.session())
+        }
+        market_squawk_domain::BarTimeSemantics::NominalDailyDate(date) => {
+            encoder.u8(2)?;
+            encoder.str(date.ruleset().as_str())
+        }
+    }
+}
+
+fn encode_market_bar_session(
+    encoder: &mut PitV1CanonicalEncoder<'_>,
+    session: &market_squawk_domain::MarketBarSessionEvidence,
+) -> Result<(), PitV1EncodingError> {
+    encoder.u8(market_bar_session_kind_tag(session.kind()))?;
+    encoder.str(session.ruleset().as_str())
+}
+
+const fn bar_timestamp_basis_tag(basis: market_squawk_domain::BarTimestampBasis) -> u8 {
+    match basis {
+        market_squawk_domain::BarTimestampBasis::PeriodStart => 1,
+        market_squawk_domain::BarTimestampBasis::PeriodEnd => 2,
+    }
+}
+
+const fn market_bar_session_kind_tag(kind: market_squawk_domain::MarketBarSessionKind) -> u8 {
+    match kind {
+        market_squawk_domain::MarketBarSessionKind::Regular => 1,
+        market_squawk_domain::MarketBarSessionKind::Extended => 2,
+        market_squawk_domain::MarketBarSessionKind::Continuous => 3,
+        market_squawk_domain::MarketBarSessionKind::ProviderDefined => 4,
     }
 }
 
@@ -226,6 +349,38 @@ fn encode_coordinate(
     } else {
         Err(PitV1EncodingError::Encoding)
     }
+}
+
+fn encode_fundamental_period(
+    encoder: &mut PitV1CanonicalEncoder<'_>,
+    period: FundamentalPeriod,
+) -> Result<(), PitV1EncodingError> {
+    match period {
+        FundamentalPeriod::Instant { instant } => {
+            encoder.u8(1)?;
+            encoder.u16(instant.year())?;
+            encoder.u8(instant.month())?;
+            encoder.u8(instant.day())
+        }
+        FundamentalPeriod::Duration { start, end } => {
+            encoder.u8(2)?;
+            encoder.u16(start.year())?;
+            encoder.u8(start.month())?;
+            encoder.u8(start.day())?;
+            encoder.u16(end.year())?;
+            encoder.u8(end.month())?;
+            encoder.u8(end.day())
+        }
+    }
+}
+
+fn encode_fundamental_family_context(
+    encoder: &mut PitV1CanonicalEncoder<'_>,
+    context: &market_squawk_domain::FundamentalFactContext,
+) -> Result<(), PitV1EncodingError> {
+    encode_fundamental_period(encoder, context.period())?;
+    encoder.serializable(context.dimensions())?;
+    encoder.serializable(&context.consolidation())
 }
 
 struct NoopEncodingControl;

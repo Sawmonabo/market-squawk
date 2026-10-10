@@ -65,17 +65,7 @@ fn legitimate_post_mint_generation_change_returns_precise_nonterminal_reason() -
         .map_err(|reason| format!("clock setup failed: {reason:?}"))?;
     let checkpoint = checkpoint_from_runtime(
         declaration.policy(),
-        &BudgetState {
-            window_started_at: observation.monotonic,
-            restored_window_ends_at: None,
-            requests_used: 0,
-            primary_sliding_releases: VecDeque::new(),
-            additional_windows: Vec::new(),
-            in_flight: 0,
-            unavailable_until: None,
-            disabled: false,
-            consecutive_refusals: 0,
-        },
+        &BudgetState::new(declaration.policy(), observation.monotonic),
         observation,
         1,
         false,
@@ -92,7 +82,7 @@ fn legitimate_post_mint_generation_change_returns_precise_nonterminal_reason() -
         clock,
         BudgetDurabilityBinding {
             session: session.clone(),
-            slot,
+            slot: Some(slot),
         },
     );
     store.arm(&budget.allocation)?;

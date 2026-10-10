@@ -2,17 +2,38 @@
 
 mod authority;
 mod backup;
+mod chart_projection;
+mod company_identity;
+mod company_security;
 mod diagnostics;
 mod evidence;
 mod fair_value;
+mod forecast_inventory;
+mod listing_reference;
+mod market_data_instruments;
+pub(crate) mod market_event_store;
+mod market_recovery;
 mod migration_preflight;
+mod model_inventory;
 mod observed_revisions;
+mod official_options_reference;
+mod official_options_reference_stage;
 mod onboarding;
+mod portfolio_planning;
+mod provider_capture;
+pub(crate) mod provider_event;
+mod provider_logical;
+mod provider_macro_plan;
+mod provider_option;
 mod publication;
 mod query_artifacts;
+mod read_snapshot;
 mod records;
 mod restore_logical;
 mod runs;
+mod search;
+mod sec_fund_job;
+pub(crate) mod sec_prepared;
 mod storage;
 mod types;
 
@@ -20,10 +41,45 @@ use market_squawk_platform::{CatalogFileGuard, CatalogWriterGuard, PathError};
 use rusqlite::limits::Limit;
 use rusqlite::{Connection, OpenFlags};
 
+pub use self::chart_projection::{
+    ChartProjectionCatalogCapability, ChartProjectionError, ChartProjectionReference,
+    ChartProjectionRow, ChartProjectionValue,
+};
+pub use self::model_inventory::{
+    ModelInventoryCatalogCapability, ModelInventoryEntry, ModelInventoryError, ModelInventoryHead,
+    ModelInventoryRecord,
+};
+
+pub use self::portfolio_planning::{
+    PortfolioPlanningCatalogCapability, PortfolioPlanningChainHead, PortfolioPlanningCompletion,
+    PortfolioPlanningCompletionEntry, PortfolioPlanningError, PortfolioPlanningHead,
+    PortfolioPlanningKind, PortfolioPlanningSavedEntry,
+};
+
 pub(crate) use self::authority::exact_catalog_file_binding;
 pub use self::backup::BackupReceipt;
 pub(crate) use self::backup::{
     InstalledBackupCatalog, InstalledCatalogState, VerifiedBackupCatalog,
+};
+pub use self::company_identity::{
+    CompanyIdentityExactRecord, CompanyIdentityMatchKind, CompanyIdentityMatchReason,
+    CompanyIdentitySearchMatch, CompanyIdentitySearchPage,
+};
+pub use self::company_security::{
+    CompanySecurityIdentityCatalogError, CompanySecurityIdentityDisposition,
+    CompanySecurityIdentityExclusion, CompanySecurityIdentityExclusionReason,
+    CompanySecurityIdentityQuery, CompanySecurityIdentityReadCapability,
+    CompanySecurityIdentityRecord, CompanySecurityIdentitySelection,
+    CompanySecurityIdentitySelectionReceipt, CompanySecurityLinkPublicationCapability,
+    CompanySecurityLinkPublicationDisposition, CompanySecurityLinkPublicationReceipt,
+    CompanySecuritySelectionReceiptEntry, IndustryClassificationCode,
+    IndustryClassificationDisposition, IndustryClassificationExclusionReason,
+    IndustryClassificationReceiptEntry, IndustryClassificationRecord, IndustryClassificationScheme,
+    IndustryClassificationSelection, IndustryClassificationSelectionReceipt,
+    IndustryClassificationVersion, IndustryCohortCompleteness, IndustryCohortExclusion,
+    IndustryCohortSelection, IndustryCohortSelectionReceipt, MAX_COMPANY_SECURITY_SELECTION_ROWS,
+    SecFundamentalIdentityAvailability, SecFundamentalIdentityQuery,
+    SecFundamentalIdentitySelection, sec_listing_exchange_matches_venue,
 };
 pub use self::diagnostics::{CatalogDiagnosticSnapshot, ProviderOnboardingDiagnostic};
 pub use self::fair_value::{
@@ -32,13 +88,93 @@ pub use self::fair_value::{
     FairValueCatalogSnapshot, FairValueCatalogSnapshotLimits, FairValueCommitDisposition,
     FairValueLinkRelation, FairValueOperationKind, FairValueRecordKind,
 };
+pub use self::listing_reference::{
+    ListingReferenceDirectoryPresence, ListingReferenceError, ListingReferenceExchangeCode,
+    ListingReferenceFileEvidence, ListingReferenceFileKind, ListingReferenceFinancialStatus,
+    ListingReferenceGenerationInput, ListingReferenceGenerationReceipt,
+    ListingReferenceGenerationSelection, ListingReferenceMarketCategory, ListingReferenceMatchKind,
+    ListingReferenceMembershipCursor, ListingReferenceMembershipPage,
+    ListingReferenceMembershipPageState, ListingReferenceMembershipSelectionReceipt,
+    ListingReferencePublicationCapability, ListingReferencePublicationDisposition,
+    ListingReferencePublicationReceipt, ListingReferenceReadCapability, ListingReferenceRecord,
+    ListingReferenceRecordInput, ListingReferenceRightsState, ListingReferenceSearchMatch,
+    ListingReferenceSearchPage, ListingReferenceSourceFileInput,
+    MAX_LISTING_REFERENCE_MEMBERSHIP_PAGE_ROWS, MAX_LISTING_REFERENCE_RECORDS,
+    MAX_LISTING_REFERENCE_SEARCH_ROWS,
+};
+pub(crate) use self::market_data_instruments::verify_provider_identity_evidence;
+pub use self::market_data_instruments::{
+    AcceptedNativeReferenceCapture, AlpacaAssetReferenceAdmission, AlpacaOptionReferenceAdmission,
+    AlpacaOptionReferencePublication, CurrentListedPopulation, CurrentListedPopulationAdmission,
+    CurrentListedPopulationMember, CurrentListedPopulationPartition, CurrentListedPopulationScope,
+    CurrentListedPopulationSourceScope, CurrentPopulationError, CurrentPopulationExclusion,
+    CurrentPopulationExclusionReason, DatasetPopulationPartition, DatasetPopulationSourceUse,
+    MAX_CURRENT_LISTED_POPULATION_MEMBERS, MAX_MARKET_DATA_INSTRUMENT_POPULATION_ROWS,
+    MAX_MARKET_DATA_INSTRUMENT_SEARCH_ROWS, MAX_MARKET_DATA_INSTRUMENT_SYNC_ROWS,
+    MarketDataInstrumentCatalogError, MarketDataInstrumentCurrentExpectation,
+    MarketDataInstrumentEnumerationCursor, MarketDataInstrumentEnumerationPage,
+    MarketDataInstrumentMatchKind, MarketDataInstrumentPopulationDisposition,
+    MarketDataInstrumentPopulationExclusion, MarketDataInstrumentPopulationExclusionReason,
+    MarketDataInstrumentPopulationQuery, MarketDataInstrumentPopulationSelection,
+    MarketDataInstrumentReadCapability, MarketDataInstrumentRecord,
+    MarketDataInstrumentSearchMatch, MarketDataInstrumentSearchPage,
+    MarketDataInstrumentSourceReferenceInput, MarketDataInstrumentSynchronization,
+    MarketDataInstrumentSynchronizationCapability, MarketDataInstrumentSynchronizationReceipt,
+    MarketDataProviderIdentityExactReceipt, MarketDataProviderIdentityQuery,
+    MarketDataProviderIdentityResolution, MarketDataProviderIdentityResolutionOutcome,
+    MarketDataProviderIdentitySelection, NativeReferenceSourceCoordinate,
+    OfficialIssuerInstrumentReference, RetainedNativeReferenceCapture,
+};
+pub use self::market_recovery::ProviderMarketEventDurableRoute;
+pub use self::official_options_reference::{
+    MAX_OFFICIAL_OPTIONS_REFERENCE_ALIAS_ASSERTIONS,
+    MAX_OFFICIAL_OPTIONS_REFERENCE_ALIAS_RESOLUTIONS,
+    MAX_OFFICIAL_OPTIONS_REFERENCE_CANONICAL_CANDIDATES, MAX_OFFICIAL_OPTIONS_REFERENCE_CONFLICTS,
+    MAX_OFFICIAL_OPTIONS_REFERENCE_EXACT_ROWS, MAX_OFFICIAL_OPTIONS_REFERENCE_OBJECTS,
+    MAX_OFFICIAL_OPTIONS_REFERENCE_RECORDS, MAX_OFFICIAL_OPTIONS_REFERENCE_SEARCH_ROWS,
+    MAX_OFFICIAL_OPTIONS_REFERENCE_STRICT_ROWS, OfficialOptionsReferenceAliasAssertionSetBuilder,
+    OfficialOptionsReferenceAliasAssertionSetEvidence, OfficialOptionsReferenceAliasKey,
+    OfficialOptionsReferenceAliasResolutionInput, OfficialOptionsReferenceAliasResolutionState,
+    OfficialOptionsReferenceAmbiguity, OfficialOptionsReferenceCanonicalCandidate,
+    OfficialOptionsReferenceCanonicalMatchKind, OfficialOptionsReferenceCanonicalResolution,
+    OfficialOptionsReferenceCatalogReadCapability, OfficialOptionsReferenceCatalogResolution,
+    OfficialOptionsReferenceCboeSeries, OfficialOptionsReferenceConflict,
+    OfficialOptionsReferenceConflictInput, OfficialOptionsReferenceConflictKind,
+    OfficialOptionsReferenceConflictSetDigestBuilder, OfficialOptionsReferenceConflictSetEvidence,
+    OfficialOptionsReferenceError, OfficialOptionsReferenceExactIdentity,
+    OfficialOptionsReferenceGenerationHeader, OfficialOptionsReferenceGenerationReceipt,
+    OfficialOptionsReferenceGenerationSelection, OfficialOptionsReferenceIdentityQuery,
+    OfficialOptionsReferenceIdentityResolution, OfficialOptionsReferenceObjectBindingFields,
+    OfficialOptionsReferenceObjectEvidence, OfficialOptionsReferenceObjectInput,
+    OfficialOptionsReferenceObjectInputFields, OfficialOptionsReferenceOccExchangeListingEvidence,
+    OfficialOptionsReferenceOccPositionLimit, OfficialOptionsReferenceOccProduct,
+    OfficialOptionsReferenceOccProductType, OfficialOptionsReferenceProvider,
+    OfficialOptionsReferencePublicationCapability, OfficialOptionsReferencePublicationDisposition,
+    OfficialOptionsReferencePublicationReceipt, OfficialOptionsReferenceReadCapability,
+    OfficialOptionsReferenceRecord, OfficialOptionsReferenceRecordInput,
+    OfficialOptionsReferenceRecordSetDigestBuilder, OfficialOptionsReferenceRecordSetEvidence,
+    OfficialOptionsReferenceRecordValue, OfficialOptionsReferenceRequestBinding,
+    OfficialOptionsReferenceResolutionSetDigestBuilder,
+    OfficialOptionsReferenceResolutionSetEvidence, OfficialOptionsReferenceSearchPage,
+    OfficialOptionsReferenceSourceAuthority, OfficialOptionsReferenceSourceEvidence,
+    OfficialOptionsReferenceSurface, official_options_reference_object_binding_digest,
+};
+pub use self::official_options_reference_stage::{
+    MAX_OFFICIAL_OPTIONS_REFERENCE_STAGE_BATCH_BYTES,
+    MAX_OFFICIAL_OPTIONS_REFERENCE_STAGE_BATCH_ROWS,
+    MAX_OFFICIAL_OPTIONS_REFERENCE_STAGE_TOTAL_BYTES, MAX_OFFICIAL_OPTIONS_REFERENCE_STAGES,
+    OfficialOptionsReferenceSealedStage, OfficialOptionsReferenceStageCapability,
+    OfficialOptionsReferenceStageProgress, OfficialOptionsReferenceStageRestartDisposition,
+};
 pub use self::onboarding::{
     OnboardingAppendOutcome, OnboardingReservation, OnboardingReservationRequest,
     ResumedProviderOnboarding,
 };
+pub(crate) use self::read_snapshot::CatalogReadSnapshot;
 use self::storage::{
     apply_migrations, initialize_catalog_identity, pragma_bool, prepare_local_path,
 };
+pub(crate) use self::storage::{now_timestamp, trusted_catalog_now};
 pub(crate) use self::storage::{verify_integrity, verify_migration_identities};
 use self::types::WriterPermit;
 pub use self::types::{
@@ -48,7 +184,51 @@ pub use self::types::{
 };
 pub(crate) use observed_revisions::CatalogObservedRevisionAuthority;
 pub use observed_revisions::StoredObservedRevision;
+pub use provider_capture::{
+    PersistedProviderCaptureBindingEvidence, PersistedProviderCaptureBindingRow,
+    PersistedProviderCapturePhysicalClaim, PersistedProviderNativeLineageSchema,
+    ProviderCaptureOriginalReceipt,
+};
+pub(crate) use provider_capture::{
+    PreparedProviderCaptureBinding, ProviderArtifactInputCoordinate,
+    ProviderMacroPlanCompletionCapture, ProviderMetadataCaptureEvidence,
+    load_provider_capture_for_run, retain_prepared_provider_capture_binding,
+};
+pub(crate) use provider_event::PreparedProviderPublicationBinding;
+pub use provider_event::{
+    PersistedProviderEventBindingEvidence, PersistedProviderEventBindingRow,
+    PersistedProviderEventNativeLineage, PersistedProviderPublicationEvidence,
+    PersistedProviderResponseMarketEventBindingEvidence,
+    PersistedProviderResponseMarketEventBindingRow,
+};
+pub(crate) use provider_logical::{
+    MAX_PROVIDER_LOGICAL_ORIGINAL_CHECKPOINT_BYTES, load_provider_logical_publication_binding,
+    retain_sealed_provider_logical_publication_binding,
+};
+pub use provider_logical::{
+    PersistedProviderLogicalGenerationBinding, PersistedProviderLogicalObjectClaim,
+    PersistedProviderLogicalPartitionClaim, PersistedProviderLogicalPublicationBinding,
+    ProviderLogicalOriginalReceipt, ProviderLogicalPublicationOrigin,
+};
+pub(crate) use provider_macro_plan::{
+    CompletedProviderMacroPlanSession, MAX_PROVIDER_MACRO_PLAN_CHECKPOINT_BYTES,
+    ProviderMacroPlanPageObjectEvidence, ProviderMacroPlanPublicationCommit,
+    ProviderMacroPlanPublishedHead, ProviderMacroPlanRestartProjection,
+    ProviderMacroPlanSemanticsEvidence, ProviderMacroPlanSessionKey,
+    ProviderMacroPlanSessionRecovery, ProviderMacroPlanStageCoordinate,
+    ProviderMacroPlanStagedPageInput, ProviderMacroPlanTerminalInput,
+    load_provider_macro_plan_head, publish_provider_macro_plan_record,
+    reconstruct_provider_macro_plan_projection,
+};
+pub use provider_option::{
+    PersistedOptionContractReferenceDependency, PersistedProviderOptionMarketBindingEvidence,
+    PersistedProviderOptionMarketBindingRow, PersistedProviderOptionMarketNativeLineage,
+};
+pub(crate) use provider_option::{
+    PreparedProviderOptionMarketBinding, retain_prepared_provider_option_market_binding,
+};
 pub use publication::PublishedIngest;
+pub(crate) use publication::{PublicationSourceEvidence, publish_artifact_manifest_in_transaction};
 #[cfg(test)]
 pub(crate) use query_artifacts::QueryArtifactBindCheckpoint;
 pub(crate) use query_artifacts::QueryArtifactPublisher;
@@ -56,10 +236,19 @@ pub use query_artifacts::{
     QueryArtifactReservation, QueryArtifactReservationInput, QueryArtifactResult,
 };
 pub(crate) use restore_logical::RestoreCatalogBaseline;
+pub(crate) use runs::complete_ingest_in_transaction;
 pub use runs::{CatalogAuthority, ResumedIngest};
+pub use search::{InstrumentSearchMatch, InstrumentSearchPage};
+pub use sec_fund_job::{
+    MAX_SEC_FUND_POINT_IN_TIME_CANDIDATES, MAX_SEC_FUND_POINT_IN_TIME_RETAINED_BYTES,
+    SecFundJobCatalogCapability, SecFundJobCatalogError, SecFundJobCommit, SecFundJobCoordinate,
+    SecFundJobDurablePublication, SecFundJobFamily, SecFundJobPointInTimeSelection,
+    SecFundJobRecovery, SecFundPointInTimeReadOutcome, SecFundPointInTimeReadRequest,
+};
 
 impl Catalog {
-    /// Opens, hardens, migrates, and verifies a local SQLite catalog.
+    /// Opens and hardens a local SQLite catalog with exact identity and migration admission.
+    /// Whole-catalog integrity auditing remains explicit; selected reads validate their evidence.
     pub(super) fn open(config: CatalogConfig) -> Result<Self, CatalogError> {
         let cross_process_writer = config
             .location
@@ -126,6 +315,7 @@ impl Catalog {
             initialize_catalog_identity(&connection)?;
         } else {
             verify_migration_identities(&connection)?;
+            // Restored catalogs receive a full audit before any authority is admitted.
             verify_integrity(&connection)?;
         }
         config
@@ -148,9 +338,10 @@ impl Catalog {
         } else {
             verify_migration_identities(&connection)?;
         }
-        verify_integrity(&connection)?;
-        Ok(Self {
+        let catalog = Self {
             connection,
+            publication_observer: crate::ingest::DataPublicationObserverSlot::default(),
+            location: config.location.clone(),
             _catalog_file: catalog_file,
             _cross_process_writer: cross_process_writer,
             _writer_permit: writer_permit,
@@ -159,7 +350,36 @@ impl Catalog {
             result_bytes: config.result_bytes,
             catalog_id: uuid::Uuid::new_v4(),
             artifact_root_binding,
-        })
+            planner_maintenance_at: std::cell::Cell::new(None),
+        };
+        // A restored catalog remains untouched until its first new publication.
+        if initialize {
+            catalog.refresh_query_planner_if_due();
+        }
+        Ok(catalog)
+    }
+
+    fn refresh_query_planner_if_due(&self) {
+        // SQLite bounds this statistics work itself. Revisit it on active publication,
+        // at most daily, without adding a timer or work to ordinary screen reads.
+        if self
+            .planner_maintenance_at
+            .get()
+            .is_some_and(|at| at.elapsed() < std::time::Duration::from_secs(24 * 60 * 60))
+        {
+            return;
+        }
+        self.planner_maintenance_at
+            .set(Some(std::time::Instant::now()));
+        if self
+            .connection
+            .execute_batch("PRAGMA optimize=0x10002")
+            .is_err()
+        {
+            // Statistics are optional: a maintenance failure must not turn a durable
+            // publication into a reported failure or prevent the workspace opening.
+            tracing::warn!("catalog query planner statistics could not be refreshed");
+        }
     }
 
     /// Returns defensive connection state and migration count.
@@ -286,3 +506,8 @@ pub(super) fn map_catalog_location_error(error: PathError) -> CatalogError {
         CatalogError::UnsafePath
     }
 }
+
+pub use self::forecast_inventory::{
+    ForecastInventoryCatalogCapability, ForecastInventoryError, ForecastInventoryHead,
+    ForecastInventoryLookup, ForecastInventoryOutcome, ForecastInventoryVintage,
+};

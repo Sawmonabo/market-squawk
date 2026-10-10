@@ -21,7 +21,9 @@ pub struct BlsRequestLimits {
     series_per_query: usize,
     documented_years_per_query: u16,
     enforced_years_per_query: u16,
-    daily_queries: u16,
+    documented_daily_queries: u16,
+    enforced_daily_queries: u16,
+    enforced_requests_per_second: u16,
 }
 
 impl BlsRequestLimits {
@@ -40,9 +42,27 @@ impl BlsRequestLimits {
         self.enforced_years_per_query
     }
 
-    /// Returns the documented daily request limit.
+    /// Returns the provider-published daily request limit.
+    pub const fn documented_daily_queries(self) -> u16 {
+        self.documented_daily_queries
+    }
+
+    /// Returns the conservative daily attempt ceiling actually enforced by Market Squawk.
+    ///
+    /// Every attempted provider request consumes this budget, regardless of HTTP or semantic
+    /// success. The owning provider-rate authority persists the window across restart.
     pub const fn daily_queries(self) -> u16 {
-        self.daily_queries
+        self.enforced_daily_queries
+    }
+
+    /// Returns the conservative per-second attempt ceiling enforced for both BLS tiers.
+    pub const fn enforced_requests_per_second(self) -> u16 {
+        self.enforced_requests_per_second
+    }
+
+    /// Returns the exact daily discovery allowance after reserving one request for doctor.
+    pub const fn discovery_queries_after_doctor(self) -> u16 {
+        self.enforced_daily_queries - 1
     }
 }
 
@@ -120,7 +140,7 @@ impl BlsRequestPlan {
         let total_chunks = series_chunk_count
             .checked_mul(year_windows.len())
             .ok_or(BlsChunkError::PlanTooLarge)?;
-        if total_chunks > 10_000 {
+        if total_chunks > usize::from(limits.discovery_queries_after_doctor()) {
             return Err(BlsChunkError::PlanTooLarge);
         }
         let mut chunks = Vec::with_capacity(total_chunks);
@@ -168,7 +188,7 @@ pub enum BlsChunkError {
     /// The inclusive year range is invalid.
     #[error("BLS year range is invalid")]
     InvalidYearRange,
-    /// The expanded plan exceeds its deterministic chunk budget.
+    /// The expanded plan plus its mandatory doctor exceeds the tier's daily attempt budget.
     #[error("BLS request plan exceeds its chunk budget")]
     PlanTooLarge,
 }
@@ -179,13 +199,20 @@ pub(crate) const fn limits_for(tier: BlsAccessTier) -> BlsRequestLimits {
             series_per_query: 25,
             documented_years_per_query: 10,
             enforced_years_per_query: 10,
-            daily_queries: 25,
+            documented_daily_queries: 25,
+            enforced_daily_queries: 25,
+            enforced_requests_per_second: 1,
         },
         BlsAccessTier::RegisteredV2 => BlsRequestLimits {
             series_per_query: 50,
             documented_years_per_query: 20,
-            enforced_years_per_query: 20,
-            daily_queries: 500,
+            // The BLS FAQ currently conflicts between 20 and 10 years. The maintained provider
+            // contract therefore preserves the published table value while failing closed to ten
+            // inclusive years until the provider resolves that conflict.
+            enforced_years_per_query: 10,
+            documented_daily_queries: 500,
+            enforced_daily_queries: 400,
+            enforced_requests_per_second: 1,
         },
     }
 }

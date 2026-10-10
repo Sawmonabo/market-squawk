@@ -1,6 +1,5 @@
 //! Conversion of bounded parser drafts into exact occurrence families.
 
-use std::collections::BTreeMap;
 use std::str::FromStr as _;
 
 use market_squawk_domain::{
@@ -11,6 +10,7 @@ use rust_decimal::Decimal;
 
 use super::*;
 
+#[derive(serde::Serialize, serde::Deserialize)]
 pub(super) enum NormalizedDraft {
     Numeric {
         concept: SourceIdentifier,
@@ -24,28 +24,38 @@ pub(super) enum NormalizedDraft {
 impl NormalizedDraft {
     pub(super) fn try_new(
         fact: FactDraft,
-        contexts: &BTreeMap<String, ContextDraft>,
-        units: &BTreeMap<String, XbrlUnitExpression>,
-        occurrence_graph: &BTreeMap<String, XbrlOccurrenceRelationships>,
+        context: &ContextDraft,
+        unit_expression: Option<XbrlUnitExpression>,
+        relationships: XbrlOccurrenceRelationships,
         document: &XbrlDocumentContext,
     ) -> Result<Self, SecXbrlError> {
-        let context = contexts
-            .get(&fact.context_id)
-            .ok_or(SecXbrlError::UnknownContext)?;
+        if let Some(expected_cik) = &document.expected_cik
+            && (context.entity_scheme.as_deref() != Some("http://www.sec.gov/CIK")
+                || context.entity_value.as_deref() != Some(expected_cik.as_str()))
+        {
+            return Err(SecXbrlError::EntityMismatch);
+        }
         let occurrence_id = SourceIdentifier::try_from(fact.occurrence_id.clone())?;
         let source_concept = fact.concept.source_qname().clone();
         let context_id = SourceIdentifier::try_from(fact.context_id)?;
-        let exact_text = XbrlText::try_from(fact.text.trim().to_owned())?;
-        let relationships = occurrence_graph
-            .get(&fact.occurrence_id)
-            .cloned()
-            .ok_or(SecXbrlError::ParserInvariant)?;
-        if fact.nil || fact.explicitly_nonnumeric || fact.unit_id.is_none() {
+        let nonnumeric = fact.nil || fact.explicitly_nonnumeric || fact.unit_id.is_none();
+        // Numeric transforms validate their own lexical whitespace. Trimming first can turn
+        // an invalid SEC word-number into an admitted value and would lose source evidence.
+        let exact_text = XbrlText::try_from(if nonnumeric {
+            fact.text.trim().to_owned()
+        } else {
+            fact.text
+        })?;
+        if nonnumeric {
+            // The source context lives once in the disk index. Only this occurrence's
+            // view is owned while normalizing; complete materialization interns these views.
+            let shared_context = context.occurrence_context()?;
             return Ok(Self::Nonnumeric(Box::new(XbrlNonnumericOccurrence {
                 occurrence_id,
                 accession: document.accession.clone(),
                 concept: fact.concept,
                 context_id,
+                context: shared_context,
                 lexical_value: exact_text,
                 nil: fact.nil,
                 source_payload: document.source_payload.clone(),
@@ -53,10 +63,7 @@ impl NormalizedDraft {
             })));
         }
         let unit_id_text = fact.unit_id.ok_or(SecXbrlError::UnknownUnit)?;
-        let unit_expression = units
-            .get(&unit_id_text)
-            .cloned()
-            .ok_or(SecXbrlError::UnknownUnit)?;
+        let unit_expression = unit_expression.ok_or(SecXbrlError::UnknownUnit)?;
         let unit = unit_expression.source_identifier()?;
         let transformed = transform_numeric(exact_text.as_str(), fact.format.as_ref())?;
         let mut value =

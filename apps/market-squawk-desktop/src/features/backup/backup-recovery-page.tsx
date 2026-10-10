@@ -1,0 +1,651 @@
+import { RefreshButton } from "@/components/ui/refresh-button"
+import * as React from "react"
+import { Link } from "react-router-dom"
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import {
+  Archive,
+  CircleAlert,
+  HardDrive,
+  LoaderCircle,
+  RefreshCw,
+  RotateCcw,
+  ShieldCheck,
+  Trash2,
+} from "lucide-react"
+
+import { messageFrom, useSystem } from "@/app/product-context"
+import { productKeys } from "@/app/query-client"
+import { Alert, AlertDescription, AlertTitle } from "@/components/ui/alert"
+import { Button } from "@/components/ui/button"
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog"
+import { Input } from "@/components/ui/input"
+import { Progress } from "@/components/ui/progress"
+import type { DesktopSystemBootstrap } from "@/lib/schemas"
+import type { OperationsControlRequest, SystemTransport } from "@/lib/transport"
+
+import {
+  encryptionLabel,
+  formatBytes,
+  formatSnapshotTime,
+  parseBackupInventory,
+  parseBackupJobReceipt,
+  parseBackupJobs,
+  parseProgramRollbackPreview,
+  parseRestorePreview,
+  parseRetentionPreview,
+  shortBackupId,
+  type BackupJob,
+  type BackupJobReceipt,
+  type BackupManifest,
+  type ProgramRollbackPreview,
+  type RestorePreview,
+  type RetentionPreview,
+} from "./contracts"
+
+import { CursorNavigation, useCursorNavigation } from "../shared/cursor-navigation"
+import { jobFailureLabel, jobKindLabel, jobPhaseLabel, jobStateLabel } from "../operations/job-presentation"
+
+const INVENTORY_LIMIT = 64
+const JOB_LIMIT = 50
+
+type PendingConfirmation =
+  | { kind: "create" }
+  | { kind: "verify"; backup: BackupManifest }
+  | { kind: "retention"; preview: RetentionPreview }
+  | { kind: "restore"; preview: RestorePreview }
+  | { kind: "programRollback"; preview: ProgramRollbackPreview }
+
+export function BackupRecoveryPage() {
+  const system = useSystem()
+
+  if (system.status === "loading") return <BackupLoading />
+  if (system.status !== "ready") {
+    return (
+      <BackupFrame>
+        <Unavailable
+          detail={system.status === "unavailable" ? system.error : "Finish secure storage setup in Settings before using backup and recovery."}
+          onRetry={system.refresh}
+        />
+      </BackupFrame>
+    )
+  }
+
+  return (
+    <ReadyBackupRecovery
+      bootstrap={system.bootstrap}
+      transport={system.transport}
+    />
+  )
+}
+
+function ReadyBackupRecovery({
+  bootstrap,
+  transport,
+}: {
+  bootstrap: DesktopSystemBootstrap
+  transport: SystemTransport
+}) {
+  const queryClient = useQueryClient()
+  const scope = bootstrap.productSessionToken
+  const [keepLatestInput, setKeepLatestInput] = React.useState("3")
+  const [retentionPreview, setRetentionPreview] = React.useState<RetentionPreview | null>(null)
+  const [restorePreview, setRestorePreview] = React.useState<RestorePreview | null>(null)
+  const [rollbackPreview, setRollbackPreview] = React.useState<ProgramRollbackPreview | null>(null)
+  const [pendingConfirmation, setPendingConfirmation] =
+    React.useState<PendingConfirmation | null>(null)
+  const [receipt, setReceipt] = React.useState<BackupJobReceipt | null>(null)
+  const [announcement, setAnnouncement] = React.useState("")
+
+  const navigation = useCursorNavigation()
+  const inventory = useQuery({
+    queryKey: productKeys.operation(scope, "operations", "Operations.ListBackups", {
+      limit: INVENTORY_LIMIT,
+      afterBackupId: navigation.after,
+    }),
+    gcTime: 0,
+    queryFn: ({ signal }) =>
+      transport
+        .systemQuery({
+          query: "operationBackups",
+          afterBackupId: navigation.after,
+          limit: INVENTORY_LIMIT,
+        }, { signal })
+        .then(parseBackupInventory),
+  })
+
+  const backups = inventory.data?.manifests ?? []
+  const inventoryRevision = inventory.data?.revision ?? null
+  const pendingDeletions = inventory.data?.pendingDeletions ?? 0
+  const retentionStale =
+    retentionPreview !== null &&
+    (inventoryRevision === null || retentionPreview.evidence.revision !== inventoryRevision)
+
+  const retainedJob = useQuery({
+    queryKey: productKeys.operation(scope, "job", "Job.List", { limit: JOB_LIMIT }),
+    queryFn: ({ signal }) => transport.systemQuery({ query: "jobs", limit: JOB_LIMIT }, { signal }),
+    select: parseBackupJobs,
+    gcTime: 0,
+    enabled: receipt !== null,
+    refetchInterval: (query) => {
+      if (!receipt) return false
+      try {
+        const job = query.state.data ? parseBackupJobs(query.state.data).find((item) => item.jobId === receipt.jobId && item.generation === receipt.generation) : undefined
+        return !job || ["queued", "preparing", "running", "recovering", "awaiting_confirmation", "cancelling"].includes(job.state) ? 5_000 : false
+      } catch { return false }
+    },
+    refetchIntervalInBackground: false,
+  })
+  const trackedJob = receipt
+    ? retainedJob.data?.find(
+        (job) => job.jobId === receipt.jobId && job.generation === receipt.generation,
+      )
+    : undefined
+
+  const previewRetention = useMutation({
+    mutationFn: (keepLatest: number) =>
+      transport
+        .systemQuery({ query: "operationBackupRetentionPreview", keepLatest })
+        .then(parseRetentionPreview),
+    onSuccess: (preview) => {
+      setRetentionPreview(preview)
+      setAnnouncement("Retention preview is ready for review.")
+    },
+  })
+  const previewRestore = useMutation({
+    mutationFn: (backupId: string) =>
+      transport
+        .systemQuery({ query: "operationRestorePreview", backupId })
+        .then(parseRestorePreview),
+    onSuccess: (preview) => {
+      setRestorePreview(preview)
+      setAnnouncement("Restore preview is ready for review.")
+    },
+  })
+  const previewRollback = useMutation({
+    mutationFn: () =>
+      transport
+        .systemQuery({ query: "operationProgramRollbackPreview" })
+        .then(parseProgramRollbackPreview),
+    onSuccess: (preview) => {
+      setRollbackPreview(preview)
+      setAnnouncement("Program rollback preview is ready for review.")
+    },
+  })
+  const control = useMutation({
+    mutationFn: (request: OperationsControlRequest) =>
+      transport.operationsControl(request, true).then(parseBackupJobReceipt),
+    onSuccess: async (newReceipt) => {
+      setReceipt(newReceipt)
+      setPendingConfirmation(null)
+      setRetentionPreview(null)
+      setRestorePreview(null)
+      setRollbackPreview(null)
+      setAnnouncement(
+        "The operation is queued. Follow progress to confirm completion.",
+      )
+      await Promise.all([
+        queryClient.invalidateQueries({ queryKey: productKeys.domain(scope, "operations") }),
+        queryClient.invalidateQueries({ queryKey: productKeys.domain(scope, "job") }),
+      ])
+    },
+  })
+
+  const refresh = () => {
+    void Promise.all([inventory.refetch(), retainedJob.refetch()])
+  }
+  const beginRetentionPreview = () => {
+    const keepLatest = Number(keepLatestInput)
+    if (!Number.isInteger(keepLatest) || keepLatest < 1 || keepLatest > 128) {
+      setAnnouncement("Enter a whole-number retention count from 1 through 128.")
+      return
+    }
+    previewRetention.reset()
+    setRetentionPreview(null)
+    previewRetention.mutate(keepLatest)
+  }
+  const confirm = () => {
+    if (!pendingConfirmation) return
+    control.reset()
+    control.mutate(controlRequest(pendingConfirmation))
+  }
+
+  return (
+    <BackupFrame
+      action={
+        <RefreshButton label="Refresh backups" refreshing={inventory.isFetching} onClick={refresh} disabled={inventory.isFetching} />
+      }
+    >
+      <p className="sr-only" aria-live="polite">{announcement}</p>
+
+      <Alert>
+        <ShieldCheck aria-hidden="true" />
+        <AlertTitle>Restore from a checked backup</AlertTitle>
+        <AlertDescription>
+          A restore checks the backup in a separate workspace before making it active. It does not merge backup data with your current workspace.
+        </AlertDescription>
+      </Alert>
+
+      <JobReceiptStatus receipt={receipt} job={trackedJob} loading={retainedJob.isFetching} error={retainedJob.error} />
+
+      {control.isError ? (
+        <Alert variant="destructive" className="mt-4">
+          <CircleAlert aria-hidden="true" />
+          <AlertTitle>The service did not queue this operation</AlertTitle>
+          <AlertDescription>{messageFrom(control.error)}</AlertDescription>
+        </Alert>
+      ) : null}
+
+      <section className="mt-6" aria-labelledby="backup-inventory-heading">
+        <div className="flex flex-wrap items-end justify-between gap-3">
+          <div>
+            <p className="font-mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">Saved backups</p>
+            <h2 id="backup-inventory-heading" className="mt-1 text-xl font-semibold">Verified backups</h2>
+            <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
+              Review saved backups, their contents, and encryption.
+            </p>
+          </div>
+          <Button onClick={() => setPendingConfirmation({ kind: "create" })} disabled={control.isPending}>
+            <Archive aria-hidden="true" />
+            Create backup
+          </Button>
+        </div>
+
+        {inventory.isPending ? <InventoryLoading /> : null}
+        {inventory.isError ? <Unavailable detail={messageFrom(inventory.error)} onRetry={() => void inventory.refetch()} /> : null}
+        {inventory.isSuccess && backups.length === 0 ? <InventoryEmpty /> : null}
+        {backups.length > 0 ? (
+          <div className="mt-4 grid gap-3">
+            {backups.map((backup) => (
+              <BackupCard
+                key={backup.backupId}
+                backup={backup}
+                busy={control.isPending || previewRestore.isPending}
+                onVerify={() => setPendingConfirmation({ kind: "verify", backup })}
+                onRestore={() => {
+                  previewRestore.reset()
+                  setRestorePreview(null)
+                  previewRestore.mutate(backup.backupId)
+                }}
+              />
+            ))}
+          </div>
+        ) : null}
+        <CursorNavigation navigation={navigation} next={inventory.data?.nextAfterBackupId} busy={inventory.isFetching} error={inventory.isError}
+          onRestart={() => { if (navigation.after === undefined) void inventory.refetch() }} />
+      </section>
+
+      <section className="mt-6 grid gap-4 xl:grid-cols-2" aria-label="Retention and restore controls">
+        <RetentionPanel
+          keepLatestInput={keepLatestInput}
+          setKeepLatestInput={setKeepLatestInput}
+          preview={retentionPreview}
+          stale={retentionStale}
+          pendingDeletions={pendingDeletions}
+          previewBusy={previewRetention.isPending}
+          previewError={previewRetention.error}
+          controlBusy={control.isPending}
+          onPreview={beginRetentionPreview}
+          onConfirm={() => retentionPreview && setPendingConfirmation({ kind: "retention", preview: retentionPreview })}
+        />
+        <RestorePanel
+          preview={restorePreview}
+          previewBusy={previewRestore.isPending}
+          previewError={previewRestore.error}
+          controlBusy={control.isPending}
+          onConfirm={() => restorePreview && setPendingConfirmation({ kind: "restore", preview: restorePreview })}
+        />
+      </section>
+
+      <ProgramRollbackPanel
+        preview={rollbackPreview}
+        previewBusy={previewRollback.isPending}
+        previewError={previewRollback.error}
+        controlBusy={control.isPending}
+        onPreview={() => {
+          previewRollback.reset()
+          setRollbackPreview(null)
+          previewRollback.mutate()
+        }}
+        onConfirm={() => rollbackPreview && setPendingConfirmation({ kind: "programRollback", preview: rollbackPreview })}
+      />
+
+      <ConfirmationDialog
+        pending={pendingConfirmation}
+        submitting={control.isPending}
+        error={control.isError ? messageFrom(control.error) : null}
+        onClose={() => !control.isPending && setPendingConfirmation(null)}
+        onConfirm={confirm}
+      />
+    </BackupFrame>
+  )
+}
+
+function BackupCard({
+  backup,
+  busy,
+  onVerify,
+  onRestore,
+}: {
+  backup: BackupManifest
+  busy: boolean
+  onVerify: () => void
+  onRestore: () => void
+}) {
+  const totalBytes = backup.components
+    .reduce((total, component) => total + BigInt(component.byteLength), 0n)
+    .toString()
+  return (
+    <article className="rounded-xl border border-border bg-card/45 p-4 shadow-sm">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="min-w-0">
+          <p className="font-mono text-[10px] uppercase tracking-wider text-muted-foreground">Saved backup</p>
+          <h3 className="mt-1 font-mono text-sm font-semibold" title={backup.backupId}>{shortBackupId(backup.backupId)}</h3>
+          <p className="mt-1 text-xs text-muted-foreground">Backup as of {formatSnapshotTime(backup.snapshot.cutoff)}</p>
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <Button size="sm" variant="outline" disabled={busy} onClick={onVerify}>
+            <ShieldCheck aria-hidden="true" /> Verify
+          </Button>
+          <Button size="sm" disabled={busy} onClick={onRestore}>
+            <HardDrive aria-hidden="true" /> Review restore
+          </Button>
+        </div>
+      </div>
+      <dl className="mt-4 grid gap-3 border-t border-border/70 pt-4 text-xs sm:grid-cols-2 xl:grid-cols-4">
+        <Fact label="Source workspace" value={shortId(backup.ownership.workspaceId)} />
+        <Fact label="Installation" value={shortId(backup.ownership.installationId)} />
+        <Fact label="Encryption" value={encryptionLabel(backup.encryption)} />
+        <Fact label="Components" value={`${backup.components.length} · ${formatBytes(totalBytes)}`} />
+      </dl>
+      <div className="mt-4 grid gap-2 sm:grid-cols-2 xl:grid-cols-3">
+        {backup.components.map((component) => (
+          <div key={component.kind} className="rounded-lg border border-border/70 bg-background/35 p-3 text-xs">
+            <p className="font-medium">{humanize(component.kind)}</p>
+            <p className="mt-1 text-muted-foreground">{component.producer} · schema {String(component.schema.version)}</p>
+            <p className="mt-1 text-muted-foreground">{formatBytes(component.byteLength)} · {humanize(component.sensitivity)}</p>
+          </div>
+        ))}
+      </div>
+    </article>
+  )
+}
+
+function RetentionPanel({
+  keepLatestInput,
+  setKeepLatestInput,
+  preview,
+  stale,
+  pendingDeletions,
+  previewBusy,
+  previewError,
+  controlBusy,
+  onPreview,
+  onConfirm,
+}: {
+  keepLatestInput: string
+  setKeepLatestInput: (value: string) => void
+  preview: RetentionPreview | null
+  stale: boolean
+  pendingDeletions: number
+  previewBusy: boolean
+  previewError: unknown
+  controlBusy: boolean
+  onPreview: () => void
+  onConfirm: () => void
+}) {
+  return (
+    <section className="rounded-xl border border-border bg-card/45 p-5" aria-labelledby="retention-heading">
+      <div className="flex items-start gap-3">
+        <Trash2 className="mt-0.5 text-amber-300" aria-hidden="true" />
+        <div>
+          <h2 id="retention-heading" className="text-lg font-semibold">Retention preview</h2>
+          <p className="mt-1 text-sm text-muted-foreground">Review which older backups will be deleted. Reviewing does not delete anything.</p>
+        </div>
+      </div>
+      <div className="mt-4 flex flex-wrap items-end gap-3">
+        <label className="grid gap-1 text-xs font-medium" htmlFor="backup-retention-count">
+          Keep latest backups (1–128)
+          <Input
+            id="backup-retention-count"
+            inputMode="numeric"
+            className="w-44"
+            value={keepLatestInput}
+            onChange={(event) => setKeepLatestInput(event.target.value)}
+          />
+        </label>
+        <Button variant="outline" onClick={onPreview} disabled={previewBusy || controlBusy}>
+          {previewBusy ? <LoaderCircle className="animate-spin" aria-hidden="true" /> : <RefreshCw aria-hidden="true" />}
+          Review older backups
+        </Button>
+      </div>
+      {pendingDeletions > 0 ? <p className="mt-3 text-xs text-amber-300">{pendingDeletions.toLocaleString()} deletion{pendingDeletions === 1 ? " is" : "s are"} already being processed.</p> : null}
+      {previewError ? <InlineFailure detail={messageFrom(previewError)} /> : null}
+      {preview ? (
+        <div className="mt-4 rounded-lg border border-border bg-background/35 p-4">
+          {stale ? (
+            <Alert variant="destructive">
+              <CircleAlert aria-hidden="true" />
+              <AlertTitle>Retention preview is stale</AlertTitle>
+              <AlertDescription>The backup list changed. Review older backups again before confirming.</AlertDescription>
+            </Alert>
+          ) : preview.evidence.deleteBackupIds.length === 0 ? (
+            <p className="text-sm text-muted-foreground">There are no older backups to delete with this setting.</p>
+          ) : (
+            <>
+              <p className="text-sm font-medium">Delete {preview.evidence.deleteBackupIds.length.toLocaleString()} older backup{preview.evidence.deleteBackupIds.length === 1 ? "" : "s"} after confirmation.</p>
+              <ul className="mt-3 grid gap-1 font-mono text-[11px] text-muted-foreground">
+                {preview.evidence.deleteBackupIds.map((id) => <li key={id}>{shortBackupId(id)}</li>)}
+              </ul>
+              <Button className="mt-4" variant="destructive" disabled={controlBusy} onClick={onConfirm}>
+                <Trash2 aria-hidden="true" /> Review deletion
+              </Button>
+            </>
+          )}
+        </div>
+      ) : null}
+    </section>
+  )
+}
+
+function RestorePanel({
+  preview,
+  previewBusy,
+  previewError,
+  controlBusy,
+  onConfirm,
+}: {
+  preview: RestorePreview | null
+  previewBusy: boolean
+  previewError: unknown
+  controlBusy: boolean
+  onConfirm: () => void
+}) {
+  return (
+    <section className="rounded-xl border border-border bg-card/45 p-5" aria-labelledby="restore-heading">
+      <div className="flex items-start gap-3">
+        <HardDrive className="mt-0.5 text-primary" aria-hidden="true" />
+        <div>
+          <h2 id="restore-heading" className="text-lg font-semibold">Data restore</h2>
+          <p className="mt-1 text-sm text-muted-foreground">Choose a backup above to check compatibility, current jobs, and disk space before restoring.</p>
+        </div>
+      </div>
+      {previewBusy ? <p className="mt-4 flex items-center gap-2 text-sm text-muted-foreground"><LoaderCircle className="animate-spin" aria-hidden="true" /> Preparing restore preview…</p> : null}
+      {previewError ? <InlineFailure detail={messageFrom(previewError)} /> : null}
+      {preview ? <RestoreEvidence preview={preview} controlBusy={controlBusy} onConfirm={onConfirm} /> : <p className="mt-4 text-xs text-muted-foreground">Choose a backup to review before restoring.</p>}
+    </section>
+  )
+}
+
+function RestoreEvidence({ preview, controlBusy, onConfirm }: { preview: RestorePreview; controlBusy: boolean; onConfirm: () => void }) {
+  const evidence = preview.evidence
+  const diskSufficient =
+    BigInt(evidence.availableDiskBytes) >= BigInt(evidence.requiredDiskBytes)
+  const permitted = evidence.blockers.length === 0 && evidence.schemaCompatible && diskSufficient
+  return (
+    <div className="mt-4 rounded-lg border border-border bg-background/35 p-4">
+      <p className="text-xs font-medium">Selected backup {shortBackupId(evidence.backup.backupId)}</p>
+      <dl className="mt-3 grid gap-3 text-xs sm:grid-cols-2">
+        <Fact label="Active workspace" value={`${shortId(evidence.active.workspaceId)} · generation ${evidence.active.generation}`} />
+        <Fact label="Schema compatibility" value={evidence.schemaCompatible ? "Compatible" : "Not compatible"} />
+        <Fact label="Available disk" value={formatBytes(evidence.availableDiskBytes)} />
+        <Fact label="Required disk" value={formatBytes(evidence.requiredDiskBytes)} />
+      </dl>
+      {!permitted ? (
+        <Alert variant="destructive" className="mt-4">
+          <CircleAlert aria-hidden="true" />
+          <AlertTitle>Restore is blocked</AlertTitle>
+          <AlertDescription>
+            <ul className="list-disc pl-4">
+              {!evidence.schemaCompatible ? <li>The backup data format is not compatible.</li> : null}
+              {!diskSufficient ? <li>Available disk is below the service-required amount.</li> : null}
+              {evidence.blockers.map((blocker) => <li key={blocker}>{humanize(blocker)}</li>)}
+            </ul>
+          </AlertDescription>
+        </Alert>
+      ) : (
+        <>
+          <p className="mt-4 text-xs text-muted-foreground">The backup is checked before its workspace becomes active. Follow progress to confirm completion.</p>
+          <Button className="mt-4" disabled={controlBusy} onClick={onConfirm}>
+            <HardDrive aria-hidden="true" /> Review restore
+          </Button>
+        </>
+      )}
+    </div>
+  )
+}
+
+function ProgramRollbackPanel({
+  preview,
+  previewBusy,
+  previewError,
+  controlBusy,
+  onPreview,
+  onConfirm,
+}: {
+  preview: ProgramRollbackPreview | null
+  previewBusy: boolean
+  previewError: unknown
+  controlBusy: boolean
+  onPreview: () => void
+  onConfirm: () => void
+}) {
+  const allowed = preview && !preview.evidence.activeWorkBlocked && preview.evidence.knownGoodVerified
+  return (
+    <section className="mt-6 rounded-xl border border-border bg-card/45 p-5" aria-labelledby="program-rollback-heading">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div className="flex items-start gap-3">
+          <RotateCcw className="mt-0.5 text-amber-300" aria-hidden="true" />
+          <div>
+            <h2 id="program-rollback-heading" className="text-lg font-semibold">Program rollback</h2>
+            <p className="mt-1 max-w-3xl text-sm text-muted-foreground">Restore the previous program version. This changes program files only; use Data restore for saved-data recovery.</p>
+          </div>
+        </div>
+        <Button variant="outline" disabled={previewBusy || controlBusy} onClick={onPreview}>
+          {previewBusy ? <LoaderCircle className="animate-spin" aria-hidden="true" /> : <RotateCcw aria-hidden="true" />}
+          Preview program rollback
+        </Button>
+      </div>
+      {previewError ? <InlineFailure detail={messageFrom(previewError)} /> : null}
+      {preview ? (
+        <div className="mt-4 rounded-lg border border-border bg-background/35 p-4">
+          <dl className="grid gap-3 text-xs sm:grid-cols-4">
+            <Fact label="Current program generation" value={preview.evidence.currentGeneration} />
+            <Fact label="Known-good target" value={preview.evidence.targetVersion} />
+            <Fact label="Known-good verification" value={preview.evidence.knownGoodVerified ? "Verified" : "Not verified"} />
+            <Fact label="Active jobs" value={preview.evidence.activeWorkBlocked ? "Blocked" : "Clear"} />
+          </dl>
+          {allowed ? <Button className="mt-4" variant="outline" disabled={controlBusy} onClick={onConfirm}><RotateCcw aria-hidden="true" /> Review program rollback</Button> : <p className="mt-4 text-xs text-amber-300">Rollback is unavailable until current work finishes and the previous program version passes verification.</p>}
+        </div>
+      ) : null}
+    </section>
+  )
+}
+
+function JobReceiptStatus({ receipt, job, loading, error }: { receipt: BackupJobReceipt | null; job: BackupJob | undefined; loading: boolean; error: unknown }) {
+  if (!receipt) return null
+  const progress = job?.totalUnits && job.completedUnits !== null
+    ? Number((BigInt(job.completedUnits) * 10_000n) / BigInt(job.totalUnits)) / 100
+    : null
+  return (
+    <section className="mt-4 rounded-xl border border-primary/30 bg-primary/5 p-4" aria-labelledby="backup-job-heading">
+      <div className="flex flex-wrap items-start justify-between gap-3">
+        <div>
+          <p className="font-mono text-[10px] uppercase tracking-wider text-primary">Operation progress</p>
+          <h2 id="backup-job-heading" className="mt-1 text-sm font-semibold">{job ? jobKindLabel(job.kind) : "Queued operation"}</h2>
+          <p className="mt-1 text-xs text-muted-foreground">Job {shortId(receipt.jobId)} · generation {receipt.generation} · initial state {jobStateLabel(receipt.state)}.</p>
+        </div>
+        <Button asChild size="sm" variant="outline"><Link to="/system/logs-diagnostics">Open job logs</Link></Button>
+      </div>
+      {error ? <InlineFailure detail={`The job could not be refreshed: ${messageFrom(error)}`} /> : null}
+      {!job && !error ? <p className="mt-3 text-xs text-muted-foreground">{loading ? "Loading job status…" : "The queued job is not shown yet. Open job logs for details; completion is not yet confirmed."}</p> : null}
+      {job ? (
+        <div className="mt-3">
+          <div className="flex flex-wrap items-center justify-between gap-2 text-xs"><span className="font-medium">{jobStateLabel(job.state)}{job.phase ? ` · ${jobPhaseLabel(job.phase)}` : ""}</span><span className="font-mono text-muted-foreground">{job.completedUnits !== null && job.totalUnits !== null ? `${job.completedUnits.toLocaleString()} / ${job.totalUnits.toLocaleString()} units` : "No measurable progress yet"}</span></div>
+          {progress !== null ? <Progress className="mt-2" value={progress} aria-label="Backup job progress" /> : null}
+          {job.state === "completed" ? <p className="mt-3 text-xs text-emerald-300">The job completed. After a restore, reconnect and check the restored workspace before continuing.</p> : null}
+          {job.state === "failed" || job.state === "interrupted" ? <p className="mt-3 text-xs text-destructive">{job.failure ? `${jobFailureLabel(job.failure.class)}.` : "The job did not complete."} The workspace changes only after a successful restore.</p> : null}
+        </div>
+      ) : null}
+    </section>
+  )
+}
+
+function ConfirmationDialog({ pending, submitting, error, onClose, onConfirm }: { pending: PendingConfirmation | null; submitting: boolean; error: string | null; onClose: () => void; onConfirm: () => void }) {
+  if (!pending) return null
+  const content = confirmationContent(pending)
+  return (
+    <Dialog open onOpenChange={(open) => !open && onClose()}>
+      <DialogContent>
+        <DialogHeader><DialogTitle>{content.title}</DialogTitle><DialogDescription>{content.description}</DialogDescription></DialogHeader>
+        {content.details ? <div className="rounded-lg border border-border bg-card/45 p-3 text-xs text-muted-foreground">{content.details}</div> : null}
+        {error ? <Alert variant="destructive"><CircleAlert aria-hidden="true" /><AlertTitle>The service did not queue this operation</AlertTitle><AlertDescription>{error}</AlertDescription></Alert> : null}
+        <DialogFooter>
+          <Button variant="outline" disabled={submitting} onClick={onClose}>Keep current state</Button>
+          <Button variant={pending.kind === "retention" ? "destructive" : "default"} disabled={submitting} onClick={onConfirm}>
+            {submitting ? <LoaderCircle className="animate-spin" aria-hidden="true" /> : null}{submitting ? "Submitting" : content.confirm}
+          </Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
+function confirmationContent(pending: PendingConfirmation): { title: string; description: string; details: string | null; confirm: string } {
+  switch (pending.kind) {
+    case "create": return { title: "Create a backup?", description: "Create a backup of the current workspace. Follow progress to confirm completion.", details: null, confirm: "Create backup" }
+    case "verify": return { title: "Verify this backup?", description: "Check that the selected backup is intact and can be used for recovery.", details: `Backup ${shortBackupId(pending.backup.backupId)}.`, confirm: "Verify backup" }
+    case "retention": return { title: "Delete the previewed backups?", description: "Permanently delete the backups listed in this review. They will no longer be available for recovery. Review again if the backup list changes.", details: `${pending.preview.evidence.deleteBackupIds.length.toLocaleString()} backups will be scheduled for deletion.`, confirm: "Delete backups" }
+    case "restore": return { title: "Restore this backup?", description: "The backup is checked in a separate workspace before becoming active. Changes made since this backup will not appear in the restored workspace; current data is not merged into it. Follow progress to confirm completion.", details: `Backup ${shortBackupId(pending.preview.evidence.backup.backupId)}. Active workspace ${shortId(pending.preview.evidence.active.workspaceId)} at generation ${pending.preview.evidence.active.generation}.`, confirm: "Restore backup" }
+    case "programRollback": return { title: "Roll back the installed program?", description: "This changes program files only. It does not restore backup data, switch a workspace, or reverse a data migration.", details: `Known-good program target ${pending.preview.evidence.targetVersion}.`, confirm: "Roll back program" }
+  }
+}
+
+function controlRequest(pending: PendingConfirmation): OperationsControlRequest {
+  switch (pending.kind) {
+    case "create": return { action: "startBackup" }
+    case "verify": return { action: "startBackupVerification", backupId: pending.backup.backupId }
+    case "retention": return { action: "startBackupRetention", previewId: pending.preview.previewId, previewDigest: pending.preview.previewDigest }
+    case "restore": return { action: "startRestore", previewId: pending.preview.previewId, previewDigest: pending.preview.previewDigest }
+    case "programRollback": return { action: "startProgramRollback", previewId: pending.preview.previewId, previewDigest: pending.preview.previewDigest }
+  }
+}
+
+function BackupFrame({ children, action }: { children: React.ReactNode; action?: React.ReactNode }) {
+  return <div className="mx-auto w-full max-w-[1180px] p-5 lg:p-7"><div className="flex flex-wrap items-start justify-between gap-3"><div><p className="font-mono text-[10px] uppercase tracking-[0.18em] text-muted-foreground">Market Squawk · Operations</p><h1 className="mt-2 text-3xl font-semibold tracking-tight">Backup &amp; Recovery</h1><p className="mt-2 max-w-3xl text-sm leading-6 text-muted-foreground">Create and verify backups, review older backups before deletion, and restore saved data.</p></div>{action}</div><div className="mt-6">{children}</div></div>
+}
+
+function InventoryLoading() { return <div className="mt-4 grid gap-3">{Array.from({ length: 3 }, (_, index) => <div key={index} className="h-44 animate-pulse rounded-xl border border-border bg-muted/35" />)}</div> }
+function BackupLoading() { return <BackupFrame><InventoryLoading /></BackupFrame> }
+function InventoryEmpty() { return <div className="mt-4 rounded-xl border border-dashed border-border bg-card/30 p-6 text-sm text-muted-foreground"><p className="font-medium text-foreground">No verified backups are retained</p><p className="mt-1">Create a backup before using recovery or retention controls.</p></div> }
+function Unavailable({ detail, onRetry }: { detail: string; onRetry: () => void }) { return <Alert variant="destructive" className="mt-4"><CircleAlert aria-hidden="true" /><AlertTitle>Backup &amp; Recovery is unavailable</AlertTitle><AlertDescription>{detail}<Button className="mt-2" variant="outline" size="sm" onClick={onRetry}>Reconnect</Button></AlertDescription></Alert> }
+function InlineFailure({ detail }: { detail: string }) { return <p className="mt-3 text-xs text-destructive" role="alert">{detail}</p> }
+function Fact({ label, value }: { label: string; value: React.ReactNode }) { return <div><dt className="text-muted-foreground">{label}</dt><dd className="mt-1 break-words font-medium text-foreground">{value}</dd></div> }
+function shortId(value: string): string { return `${value.slice(0, 8)}…${value.slice(-4)}` }
+function humanize(value: string): string { const words = value.replace(/([a-z0-9])([A-Z])/g, "$1 $2").replace(/[_-]+/g, " ").trim(); return words ? words.charAt(0).toUpperCase() + words.slice(1) : "Value" }

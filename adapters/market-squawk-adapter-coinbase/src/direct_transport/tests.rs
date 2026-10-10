@@ -1,24 +1,31 @@
 use std::collections::VecDeque;
 use std::error::Error;
+use std::io::Read as _;
 use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+use std::path::{Path, PathBuf};
 use std::str::FromStr as _;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use futures_util::{SinkExt as _, StreamExt as _, future::BoxFuture};
 use market_squawk_domain::{
-    AuthorizationBasis, ConnectionGeneration, Currency, Denomination, DigestAlgorithm,
+    AuthorizationBasis, ConnectionGeneration, Currency, DataQuality, Denomination, DigestAlgorithm,
     EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, InstrumentDefinitionRevision,
-    InstrumentExecutionTerms, InstrumentId, LiveEventClass, LotSize, MetadataRevision,
-    ProviderProduct, RevisionBoundPayloadEvidence, SourceId, SourceIdentifier, TickSize, Timestamp,
+    InstrumentExecutionTerms, InstrumentId, LiveEventClass, LotSize, MarketDepth, MetadataRevision,
+    ProviderInstrumentId, ProviderProduct, RevisionBoundPayloadEvidence, SourceId,
+    SourceIdentifier, TickSize, Timestamp, TradingStatus, VenueSymbol,
 };
+use market_squawk_platform::{LocalPaths, RawCaptureRecord};
 use market_squawk_sources::{
     AuthoritativeSourceRegistry, AuthorizationGrant, AuthorizationMode,
-    AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy,
-    BudgetDecision, BudgetScope, BudgetUnavailableReason, DecodedControlFrame, DecoderEvidence,
-    DirectBookLimits, DirectSyncPhase, FreshnessPolicy, LiveSourceGeneration, ProviderBookSide,
-    ProviderBudgetPolicy, ProviderDecimalLexeme, ProviderObservationPayload, RawMarketFrame,
+    AuthorizationSubjectResolutionError, AuthorizationSubjectResolver, BackoffPolicy, BudgetScope,
+    BudgetUnavailableReason, DecodedControlFrame, DecoderEvidence, DirectBookLimits,
+    DirectSyncPhase, FreshnessPolicy, LiveSourceGeneration, ProviderBookSide, ProviderBudgetPolicy,
+    ProviderCaptureMaterial, ProviderCapturePageReceipt, ProviderCaptureSetReceipt,
+    ProviderCaptureTerminalDisposition, ProviderDecimalLexeme, ProviderNativeIdentityRequest,
+    ProviderObservationPayload, ProviderOrderEvent, ProviderOrderEventKind, RawMarketFrame,
     RawMarketSink, SessionId, SinkError, SourceError,
 };
 use sha2::{Digest as _, Sha256};
@@ -28,29 +35,38 @@ use tokio_tungstenite::{accept_async, client_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 
 use super::{
-    CoinbaseDirectBookUpdate, CoinbaseDirectHttpRequest, CoinbaseDirectHttpResponse,
-    CoinbaseDirectHttpTransport, CoinbaseDirectHttpTransportError, CoinbaseDirectOutput,
-    CoinbaseDirectSession, CoinbaseDirectSessionError,
+    CoinbaseDirectHttpRequest, CoinbaseDirectHttpResponse, CoinbaseDirectHttpTransport,
+    CoinbaseDirectHttpTransportError, CoinbaseDirectOrderLevelPayload,
+    CoinbaseDirectOrderLevelUpdate, CoinbaseDirectOutput, CoinbaseDirectOutputAdmission,
+    CoinbaseDirectProductPreflightFreshness, CoinbaseDirectSession, CoinbaseDirectSessionError,
 };
 use crate::{
     CoinbaseDirectAuthentication, CoinbaseDirectConfig, CoinbaseDirectLimits,
-    CoinbaseDirectNonBookEvent, CoinbaseDirectProductEvidence, CoinbaseDirectSigningCapability,
-    CoinbaseDirectSigningError, CoinbaseDirectSigningRequest, CoinbaseProductMapping,
-    CoinbaseTransportLimits,
+    CoinbaseDirectNonBookEvent, CoinbaseDirectProductEvidence,
+    CoinbaseDirectProductReferenceEvidence, CoinbaseDirectSigningCapability,
+    CoinbaseDirectSigningError, CoinbaseDirectSigningRequest, CoinbaseMarketChannel,
+    CoinbaseMarketContinuity, CoinbaseMarketFeed, CoinbaseProductMapping, CoinbaseTransportLimits,
 };
+
+#[path = "../../tests/common/catalog.rs"]
+mod catalog_fixture;
+
+use catalog_fixture::CatalogFixture;
 
 type TestResult<T = ()> = Result<T, Box<dyn Error>>;
 
-const PRODUCT_BODY: &[u8] = br#"{"id":"BTC-USD","status":"online","base_increment":"0.00000001","quote_increment":"0.01","trading_disabled":false,"cancel_only":false,"post_only":false,"limit_only":false,"auction_mode":false}"#;
+const PRODUCT_BODY: &[u8] = br#"{"id":"BTC-USD","base_currency":"BTC","quote_currency":"USD","status":"online","base_increment":"0.00000001","quote_increment":"0.01","trading_disabled":false,"cancel_only":false,"post_only":false,"limit_only":false,"auction_mode":false}"#;
 const SNAPSHOT_BODY: &[u8] = br#"{"sequence":104,"time":"2026-07-24T21:34:10.604Z","bids":[["100.00","1.00000000","bid-1"]],"asks":[["101.00","2.00000000","ask-1"]]}"#;
 const SEQUENCE_101: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.601Z","product_id":"BTC-USD","sequence":101,"order_id":"order-101","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy"}"#;
 const SEQUENCE_102: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.602Z","product_id":"BTC-USD","sequence":102,"order_id":"order-102","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy"}"#;
 const SEQUENCE_103: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.603Z","product_id":"BTC-USD","sequence":103,"order_id":"order-103","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy"}"#;
 const SEQUENCE_104: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.604Z","product_id":"BTC-USD","sequence":104,"order_id":"order-104","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy"}"#;
-const SEQUENCE_105: &str = r#"{"type":"open","time":"2026-07-24T21:34:10.605Z","product_id":"BTC-USD","sequence":105,"order_id":"order-105","price":"99.00","remaining_size":"0.50000000","side":"buy"}"#;
-const SEQUENCE_106: &str = r#"{"type":"done","time":"2026-07-24T21:34:10.606Z","product_id":"BTC-USD","sequence":106,"order_id":"order-105","reason":"canceled","price":"99.00","remaining_size":"0.50000000","side":"buy"}"#;
-const SEQUENCE_107: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.607Z","product_id":"BTC-USD","sequence":107,"order_id":"order-107","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy"}"#;
-const PRIVATE_RECEIVED: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.605Z","product_id":"BTC-USD","order_id":"private-order","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy","user_id":"fixture-user"}"#;
+const SEQUENCE_105: &str = r#"{"type":"match","time":"2026-07-24T21:34:10.605Z","product_id":"BTC-USD","sequence":105,"trade_id":7005,"maker_order_id":"bid-1","taker_order_id":"taker-105","size":"0.25000000","price":"100.00","side":"buy"}"#;
+const SEQUENCE_106: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.606Z","product_id":"BTC-USD","sequence":106,"order_id":"order-106","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy"}"#;
+const SEQUENCE_107: &str = r#"{"type":"open","time":"2026-07-24T21:34:10.607Z","product_id":"BTC-USD","sequence":107,"order_id":"bid-2","remaining_size":"1.00000000","price":"99.00","side":"buy"}"#;
+const SEQUENCE_108: &str = r#"{"type":"done","time":"2026-07-24T21:34:10.608Z","product_id":"BTC-USD","sequence":108,"order_id":"bid-1","reason":"canceled","remaining_size":"0.75000000","price":"100.00","side":"buy"}"#;
+const SEQUENCE_109: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.609Z","product_id":"BTC-USD","sequence":109,"order_id":"order-109","order_type":"limit","size":"1.00000000","price":"99.00","side":"buy"}"#;
+const PRIVATE_RECEIVED: &str = r#"{"type":"received","time":"2026-07-24T21:34:10.607Z","product_id":"BTC-USD","order_id":"private-order","order_type":"limit","size":"1.00000000","price":"100.00","side":"buy","user_id":"fixture-user"}"#;
 const SUBSCRIPTION_ACK: &str =
     r#"{"type":"subscriptions","channels":[{"name":"full","product_ids":["BTC-USD"]}]}"#;
 
@@ -143,8 +159,6 @@ impl CoinbaseDirectHttpTransport for ScriptedHttpTransport {
 }
 
 struct HttpControls {
-    product_started: oneshot::Receiver<()>,
-    release_product: oneshot::Sender<()>,
     snapshot_started: oneshot::Receiver<()>,
     release_snapshot: oneshot::Sender<()>,
 }
@@ -152,31 +166,19 @@ struct HttpControls {
 fn scripted_http(
     config: &CoinbaseDirectConfig,
 ) -> (Arc<dyn CoinbaseDirectHttpTransport>, HttpControls) {
-    let (product_started_tx, product_started) = oneshot::channel();
-    let (release_product, product_release_rx) = oneshot::channel();
     let (snapshot_started_tx, snapshot_started) = oneshot::channel();
     let (release_snapshot, snapshot_release_rx) = oneshot::channel();
-    let scripts = VecDeque::from([
-        ScriptedHttpResponse {
-            expected_url: config.product_url().to_owned().into_boxed_str(),
-            started: product_started_tx,
-            release: product_release_rx,
-            response: successful_http_response(config.product_url(), PRODUCT_BODY),
-        },
-        ScriptedHttpResponse {
-            expected_url: config.snapshot_url().to_owned().into_boxed_str(),
-            started: snapshot_started_tx,
-            release: snapshot_release_rx,
-            response: successful_http_response(config.snapshot_url(), SNAPSHOT_BODY),
-        },
-    ]);
+    let scripts = VecDeque::from([ScriptedHttpResponse {
+        expected_url: config.snapshot_url().to_owned().into_boxed_str(),
+        started: snapshot_started_tx,
+        release: snapshot_release_rx,
+        response: successful_http_response(config.snapshot_url(), SNAPSHOT_BODY),
+    }]);
     (
         Arc::new(ScriptedHttpTransport {
             scripts: Mutex::new(scripts),
         }),
         HttpControls {
-            product_started,
-            release_product,
             snapshot_started,
             release_snapshot,
         },
@@ -193,6 +195,104 @@ fn successful_http_response(url: &str, body: &'static [u8]) -> CoinbaseDirectHtt
         content_encoding: Some(Box::from(&b"identity"[..])),
         segments: vec![Bytes::from_static(body)],
     }
+}
+
+static CAPTURE_DIRECTORY_ORDINAL: AtomicU64 = AtomicU64::new(0);
+
+struct FixtureCaptureDirectory(PathBuf);
+
+impl FixtureCaptureDirectory {
+    fn new() -> Self {
+        let ordinal = CAPTURE_DIRECTORY_ORDINAL.fetch_add(1, Ordering::Relaxed);
+        Self(std::env::temp_dir().join(format!(
+            "market-squawk-direct-transport-{}-{ordinal}",
+            std::process::id()
+        )))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for FixtureCaptureDirectory {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// The original fixture body crosses the real physical-seal boundary before a test session.
+fn sealed_product_reference(
+    config: &CoinbaseDirectConfig,
+) -> TestResult<(
+    FixtureCaptureDirectory,
+    CoinbaseDirectProductReferenceEvidence,
+    ProviderNativeIdentityRequest,
+    CoinbaseDirectProductPreflightFreshness,
+)> {
+    let directory = FixtureCaptureDirectory::new();
+    let received_at = Timestamp::from_unix_nanos(1_000_000_000);
+    let source_id = config
+        .product_reference_profile()
+        .metadata()
+        .source_id()
+        .clone();
+    let body_digest =
+        EvidenceDigest::new(DigestAlgorithm::Sha256, Sha256::digest(PRODUCT_BODY).into());
+    let request_identity = super::direct_product_get_request_identity(config.product_url());
+    let page = ProviderCapturePageReceipt::try_new(
+        0,
+        request_identity,
+        None,
+        None,
+        200,
+        u64::try_from(PRODUCT_BODY.len())?,
+        body_digest,
+        received_at,
+    )?;
+    let capture = ProviderCaptureSetReceipt::try_new(
+        source_id.clone(),
+        config
+            .product_reference_profile()
+            .metadata()
+            .revision()
+            .clone(),
+        SourceIdentifier::try_from(config.product_url())?,
+        request_identity,
+        ProviderCaptureTerminalDisposition::StandaloneResponse,
+        vec![page],
+    )?;
+    let record: RawCaptureRecord = serde_json::from_value(serde_json::json!({
+        "event_id": "00000000-0000-0000-0000-000000000001",
+        "source": source_id.as_str(),
+        "connection_id": "00000000-0000-0000-0000-000000000064",
+        "source_sequence": 0,
+        "exchange_at": null,
+        "received_at": "1970-01-01T00:00:01Z",
+        "payload": PRODUCT_BODY,
+    }))?;
+    let material = ProviderCaptureMaterial::try_new(capture, vec![record])?;
+    let paths = LocalPaths::prepare(directory.path())?;
+    let store = paths.sealed_research_journal_store()?;
+    let (expectation, seal_request) = material.into_whole_seal_parts();
+    let token = expectation
+        .try_rejoin(seal_request.seal(&store)?)?
+        .try_into_whole()?;
+    let evidence = config.decode_product_reference_evidence(PRODUCT_BODY, token)?;
+    let product = evidence.product().as_source_identifier().as_str();
+    let selected = ProviderNativeIdentityRequest {
+        namespace: SourceId::try_from("coinbase-exchange-direct")?,
+        provider_instrument_id: ProviderInstrumentId::try_from(product)?,
+        instrument: config.instrument(),
+        venue: config.venue().clone(),
+        venue_symbol: VenueSymbol::try_from(product)?,
+        knowledge_at: received_at,
+        effective_at: received_at,
+    };
+    let freshness = CoinbaseDirectProductPreflightFreshness {
+        completed_at: Instant::now(),
+    };
+    Ok((directory, evidence, selected, freshness))
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -216,9 +316,52 @@ struct RecordedBook {
     snapshot_url: String,
     source_identifier: String,
     event_class: LiveEventClass,
+    input_depth: Option<MarketDepth>,
+    output_depth: Option<MarketDepth>,
     publication: RecordedPublication,
-    bids: Vec<(i64, i64)>,
-    asks: Vec<(i64, i64)>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct RecordedNativeTrade {
+    trade_id: u64,
+    maker_order_id: String,
+    taker_order_id: String,
+    maker_side: ProviderBookSide,
+    price: i64,
+    quantity: i64,
+    sequence: u64,
+    provider_timestamp: i64,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct RecordedReplayFrame {
+    sequence: u64,
+    payload: Vec<u8>,
+    native_trade: Option<RecordedNativeTrade>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct RecordedPendingHandoff {
+    snapshot_sequence: u64,
+    terminal_sequence: u64,
+    snapshot_body: Vec<u8>,
+    replay: Vec<RecordedReplayFrame>,
+    request_set_digest: [u8; 32],
+    subscription_digest: [u8; 32],
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum RecordedOrderLevel {
+    Snapshot {
+        generation: u64,
+        snapshot_sequence: u64,
+        orders: Vec<(String, ProviderBookSide, i64, i64)>,
+        replay_sequences: Vec<u64>,
+    },
+    Event {
+        sequence: u64,
+        order_identity: Option<String>,
+    },
 }
 
 #[derive(Debug, Default)]
@@ -227,10 +370,18 @@ struct RecordingOutput {
     product_statuses: Vec<String>,
     private_events: usize,
     books: Vec<RecordedBook>,
+    order_level: Vec<RecordedOrderLevel>,
+    handoffs: Vec<RecordedPendingHandoff>,
+    pending_handoff: Option<crate::CoinbaseMarketHandoff>,
+    output_admission: Option<CoinbaseDirectOutputAdmission>,
+    discarded_sequences: Vec<u64>,
     reject_raw_at: Option<usize>,
     sequence_101_captured: Arc<Notify>,
     sequence_102_captured: Arc<Notify>,
+    sequence_106_captured: Arc<Notify>,
     first_book: Arc<Notify>,
+    continuation_complete: Arc<Notify>,
+    snapshot_http: Option<market_squawk_sources::NormalizedHttpResponseBatch>,
 }
 
 impl RawMarketSink for RecordingOutput {
@@ -245,12 +396,25 @@ impl RawMarketSink for RecordingOutput {
         if frame.payload() == SEQUENCE_102.as_bytes() {
             self.sequence_102_captured.notify_one();
         }
+        if frame.payload() == SEQUENCE_106.as_bytes() {
+            self.sequence_106_captured.notify_one();
+        }
         self.frames.push(frame);
         Ok(())
     }
 }
 
 impl CoinbaseDirectOutput for RecordingOutput {
+    fn try_admit_replay(
+        &mut self,
+        admission: CoinbaseDirectOutputAdmission,
+    ) -> Result<(), SinkError> {
+        if self.output_admission.replace(admission).is_some() {
+            return Err(SinkError::CaptureIncomplete);
+        }
+        Ok(())
+    }
+
     fn try_publish_subscription_acknowledgement(
         &mut self,
         acknowledgement: DecodedControlFrame,
@@ -274,6 +438,24 @@ impl CoinbaseDirectOutput for RecordingOutput {
         Ok(())
     }
 
+    fn try_publish_preflight_product(
+        &mut self,
+        evidence: &CoinbaseDirectProductReferenceEvidence,
+    ) -> Result<(), SinkError> {
+        if evidence.product().as_source_identifier().as_str() != "BTC-USD"
+            || evidence.trading_status() != TradingStatus::Active
+            || evidence.trading_disabled()
+            || evidence.cancel_only()
+            || evidence.post_only()
+            || evidence.limit_only()
+            || evidence.auction_mode()
+        {
+            return Err(SinkError::CaptureIncomplete);
+        }
+        self.product_statuses.push("online".to_owned());
+        Ok(())
+    }
+
     fn try_publish_non_book(
         &mut self,
         _event: CoinbaseDirectNonBookEvent,
@@ -293,14 +475,191 @@ impl CoinbaseDirectOutput for RecordingOutput {
         Ok(())
     }
 
-    fn try_publish_book(&mut self, update: CoinbaseDirectBookUpdate<'_>) -> Result<(), SinkError> {
-        let batch = update
-            .try_publication_batch()
+    fn try_discard_sequenced_frame(&mut self, evidence: &DecoderEvidence) -> Result<(), SinkError> {
+        let frame = self
+            .frames
+            .iter()
+            .find(|frame| frame.frame_id() == evidence.frame_id())
+            .ok_or(SinkError::CaptureIncomplete)?;
+        let sequence = serde_json::from_slice::<serde_json::Value>(frame.payload())
+            .ok()
+            .and_then(|value| value.get("sequence").and_then(serde_json::Value::as_u64))
+            .ok_or(SinkError::CaptureIncomplete)?;
+        self.discarded_sequences.push(sequence);
+        Ok(())
+    }
+
+    fn try_publish_snapshot_http(
+        &mut self,
+        batch: market_squawk_sources::NormalizedHttpResponseBatch,
+    ) -> Result<(), SinkError> {
+        if self.snapshot_http.is_some() {
+            return Err(SinkError::CaptureIncomplete);
+        }
+        self.snapshot_http = Some(batch);
+        Ok(())
+    }
+
+    fn try_publish_order_level(
+        &mut self,
+        update: CoinbaseDirectOrderLevelUpdate<'_>,
+    ) -> Result<(), SinkError> {
+        update
+            .validate_current()
             .map_err(|_error| SinkError::CaptureIncomplete)?;
-        let observation = batch
+        if update.market_depth() != MarketDepth::OrderLevel {
+            return Err(SinkError::CaptureIncomplete);
+        }
+        let recorded = match update.payload() {
+            CoinbaseDirectOrderLevelPayload::Snapshot {
+                snapshot_sequence,
+                orders,
+                replay,
+                ..
+            } => RecordedOrderLevel::Snapshot {
+                generation: update.connection_generation().get(),
+                snapshot_sequence: snapshot_sequence.get(),
+                orders: orders
+                    .iter()
+                    .map(|order| {
+                        (
+                            order.order_id().as_str().to_owned(),
+                            order.side(),
+                            order.price().get(),
+                            order.quantity().get(),
+                        )
+                    })
+                    .collect(),
+                replay_sequences: replay.iter().map(|event| event.sequence().get()).collect(),
+            },
+            CoinbaseDirectOrderLevelPayload::Event(event) => RecordedOrderLevel::Event {
+                sequence: event.sequence().get(),
+                order_identity: order_identity(event),
+            },
+        };
+        self.order_level.push(recorded);
+        Ok(())
+    }
+
+    fn try_publish_book(&mut self, handoff: crate::CoinbaseMarketHandoff) -> Result<(), SinkError> {
+        let evidence = handoff.evidence();
+        let (snapshot_sequence, terminal_sequence) = match evidence.continuity() {
+            CoinbaseMarketContinuity::SnapshotContiguous { snapshot, terminal } => {
+                (snapshot.get(), terminal.get())
+            }
+            CoinbaseMarketContinuity::CapturedContiguous {
+                snapshot,
+                predecessor,
+                terminal,
+            } => {
+                if self.books.last().map(|book| book.sequence) != Some(predecessor.get()) {
+                    return Err(SinkError::CaptureIncomplete);
+                }
+                (snapshot.get(), terminal.get())
+            }
+            CoinbaseMarketContinuity::ProviderCursorUnverified { .. } => {
+                return Err(SinkError::CaptureIncomplete);
+            }
+        };
+        if evidence.feed() != CoinbaseMarketFeed::ExchangeDirectFull
+            || evidence.channel() != CoinbaseMarketChannel::Full
+            || evidence.product().as_source_identifier().as_str() != "BTC-USD"
+            || evidence.venue().as_str() != "coinbase-exchange"
+            || !matches!(
+                evidence.event_class(),
+                LiveEventClass::BookSnapshot | LiveEventClass::BookDelta | LiveEventClass::Quote
+            )
+            || evidence.native_input_depth() != Some(MarketDepth::OrderLevel)
+            || (evidence.event_class() != LiveEventClass::Quote
+                && evidence.output_depth() != Some(MarketDepth::PriceLevel))
+            || evidence.subscription_acknowledgement().is_none()
+            || evidence.request_set_digest().bytes()
+                != [
+                    0xe1, 0x65, 0x33, 0x9d, 0x1c, 0xfb, 0x77, 0xb9, 0x21, 0xa2, 0x51, 0x30, 0xf3,
+                    0x6a, 0x0d, 0xc4, 0xfa, 0x68, 0x56, 0x2e, 0xc1, 0xcb, 0xc7, 0x2b, 0xfa, 0xd6,
+                    0xdb, 0x16, 0x4e, 0x15, 0x99, 0xb6,
+                ]
+            || evidence.subscription_digest().bytes()
+                != [
+                    0x1f, 0xc6, 0x84, 0x81, 0x41, 0x1f, 0xb9, 0x07, 0x5f, 0xa8, 0xe7, 0x84, 0x69,
+                    0x94, 0x68, 0x2e, 0x21, 0x32, 0x70, 0x6d, 0xf2, 0x94, 0x1b, 0x5f, 0xd2, 0xfb,
+                    0x06, 0xb6, 0xe6, 0x7a, 0xa9, 0x8f,
+                ]
+            || handoff.raw_payload_digest() != handoff.typed_batch().evidence().payload_digest()
+        {
+            return Err(SinkError::CaptureIncomplete);
+        }
+        let mut snapshot_body = Vec::new();
+        let (snapshot_receipt, frames) = match handoff.raw_lineage() {
+            crate::CoinbaseMarketRawLineage::DirectInitial(lineage) => {
+                lineage
+                    .snapshot()
+                    .reader()
+                    .read_to_end(&mut snapshot_body)
+                    .map_err(|_| SinkError::CaptureIncomplete)?;
+                (lineage.snapshot().receipt(), lineage.replay())
+            }
+            crate::CoinbaseMarketRawLineage::DirectSuccessor(lineage) => {
+                let previous = self
+                    .pending_handoff
+                    .as_ref()
+                    .ok_or(SinkError::CaptureIncomplete)?;
+                assert_eq!(
+                    lineage.predecessor().frame_id(),
+                    previous.typed_batch().evidence().frame_id()
+                );
+                assert_eq!(
+                    lineage.predecessor().payload_digest(),
+                    previous.raw_payload_digest()
+                );
+                assert!(
+                    lineage
+                        .predecessor()
+                        .binding()
+                        .shares_allocation_with(previous.typed_batch().evidence().binding())
+                );
+                (lineage.snapshot(), lineage.frames())
+            }
+            _ => return Err(SinkError::CaptureIncomplete),
+        };
+        let replay = frames
+            .iter()
+            .map(|frame| {
+                let native_trade = frame.native_trade().map(|trade| RecordedNativeTrade {
+                    trade_id: trade.trade_id(),
+                    maker_order_id: trade.maker_order_id().as_str().to_owned(),
+                    taker_order_id: trade.taker_order_id().as_str().to_owned(),
+                    maker_side: trade.maker_side(),
+                    price: trade.price().get(),
+                    quantity: trade.quantity().get(),
+                    sequence: trade.sequence().get(),
+                    provider_timestamp: trade.provider_timestamp().unix_nanos(),
+                });
+                RecordedReplayFrame {
+                    sequence: frame.sequence().get(),
+                    payload: frame.raw_payload().as_bytes().to_vec(),
+                    native_trade,
+                }
+            })
+            .collect::<Vec<_>>();
+        let observation = handoff
+            .typed_batch()
             .observations()
             .first()
             .ok_or(SinkError::CaptureIncomplete)?;
+        if observation.event_class() != evidence.event_class()
+            || observation.depth() != evidence.output_depth()
+            || snapshot_receipt.status() != 200
+            || snapshot_receipt.body_length() != SNAPSHOT_BODY.len() as u64
+            || snapshot_receipt.body_digest().bytes()
+                != <[u8; 32]>::from(Sha256::digest(SNAPSHOT_BODY))
+            || (terminal_sequence == 106 && snapshot_body != SNAPSHOT_BODY)
+            || replay
+                .last()
+                .is_none_or(|frame| frame.sequence != terminal_sequence)
+        {
+            return Err(SinkError::CaptureIncomplete);
+        }
         let publication = match observation.payload() {
             ProviderObservationPayload::BookSnapshot(snapshot) => RecordedPublication::Snapshot {
                 bids: snapshot.bids().iter().map(record_level).collect::<Vec<_>>(),
@@ -322,24 +681,47 @@ impl CoinbaseDirectOutput for RecordingOutput {
             },
             _ => return Err(SinkError::CaptureIncomplete),
         };
-        let book = update.book();
+        self.handoffs.push(RecordedPendingHandoff {
+            snapshot_sequence,
+            terminal_sequence,
+            snapshot_body,
+            replay,
+            request_set_digest: evidence.request_set_digest().bytes(),
+            subscription_digest: evidence.subscription_digest().bytes(),
+        });
         self.books.push(RecordedBook {
-            sequence: update.sequence().get(),
-            snapshot_url: update.snapshot_receipt().final_url().to_owned(),
+            sequence: terminal_sequence,
+            snapshot_url: snapshot_receipt.final_url().to_owned(),
             source_identifier: observation.source_identifier().as_str().to_owned(),
             event_class: observation.event_class(),
+            input_depth: evidence.native_input_depth(),
+            output_depth: observation.depth(),
             publication,
-            bids: book
-                .bids()
-                .map(|level| (level.price().get(), level.quantity().get()))
-                .collect(),
-            asks: book
-                .asks()
-                .map(|level| (level.price().get(), level.quantity().get()))
-                .collect(),
         });
-        self.first_book.notify_one();
+        if terminal_sequence == 106 {
+            self.first_book.notify_one();
+        }
+        if terminal_sequence == 109 {
+            self.continuation_complete.notify_one();
+        }
+        self.pending_handoff = Some(handoff);
         Ok(())
+    }
+}
+
+fn order_identity(event: &ProviderOrderEvent) -> Option<String> {
+    match event.kind() {
+        ProviderOrderEventKind::Open(order) => Some(order.order_id().as_str().to_owned()),
+        ProviderOrderEventKind::Match { maker_order_id, .. }
+        | ProviderOrderEventKind::Done {
+            order_id: maker_order_id,
+            ..
+        }
+        | ProviderOrderEventKind::Change {
+            order_id: maker_order_id,
+            ..
+        } => Some(maker_order_id.as_str().to_owned()),
+        ProviderOrderEventKind::CursorOnly(_) => None,
     }
 }
 
@@ -354,21 +736,60 @@ fn record_level(level: &market_squawk_sources::ProviderBookLevel) -> (String, St
 async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_live() -> TestResult
 {
     let config = config()?;
-    let (mut registry, session, generation) = live_generation(&config, "direct-transport-happy")?;
+    assert_eq!(config.publication_depth(), MarketDepth::OrderLevel);
+    assert_eq!(
+        config.metadata().quality_ceiling(),
+        DataQuality::DirectUnverified
+    );
+    let complete_session_bytes = config.limits().checked_maximum_retained_bytes()?;
+    assert_eq!(
+        config.checked_maximum_retained_bytes()?,
+        complete_session_bytes
+    );
+    let live_coverage = config
+        .metadata()
+        .coverage()
+        .live()
+        .ok_or("missing Coinbase order-level coverage")?;
+    assert!(
+        live_coverage
+            .rule_for(LiveEventClass::BookSnapshot, Some(MarketDepth::OrderLevel))
+            .is_some()
+    );
+    assert!(
+        live_coverage
+            .rule_for(LiveEventClass::BookDelta, Some(MarketDepth::OrderLevel))
+            .is_some()
+    );
+    let (_catalog, mut registry, session, generation) =
+        live_generation(&config, "direct-transport-happy")?;
     let budget = session
         .budget()
         .ok_or("fixture session lacks its shared provider budget")?
         .clone();
+    let (_product_capture, product, selected, freshness) = sealed_product_reference(&config)?;
     let (http, controls) = scripted_http(&config);
-    let mut direct =
-        CoinbaseDirectSession::try_new_with_transport(config.clone(), generation, http)?;
+    let mut direct = CoinbaseDirectSession::try_new_with_transport(
+        config.clone(),
+        generation,
+        http,
+        selected,
+        product,
+        freshness,
+    )?;
     let first_book = Arc::new(Notify::new());
+    let continuation_complete = Arc::new(Notify::new());
+    let cancellation = CancellationToken::new();
+    let server_cancellation = cancellation.clone();
     let sequence_101_captured = Arc::new(Notify::new());
     let sequence_102_captured = Arc::new(Notify::new());
+    let sequence_106_captured = Arc::new(Notify::new());
     let mut output = RecordingOutput {
         first_book: Arc::clone(&first_book),
+        continuation_complete: Arc::clone(&continuation_complete),
         sequence_101_captured: Arc::clone(&sequence_101_captured),
         sequence_102_captured: Arc::clone(&sequence_102_captured),
+        sequence_106_captured: Arc::clone(&sequence_106_captured),
         ..RecordingOutput::default()
     };
     let listener = TcpListener::bind("127.0.0.1:0").await?;
@@ -388,29 +809,16 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
         assert_eq!(subscription["key"], "fixture-key");
         assert_eq!(subscription["passphrase"], "fixture-passphrase");
         assert_eq!(subscription["signature"], "fixture-signature");
-        assert!(matches!(
-            budget.try_acquire(),
-            BudgetDecision::Unavailable(BudgetUnavailableReason::ConcurrencyExhausted)
-        ));
         socket.send(Message::Text(SUBSCRIPTION_ACK.into())).await?;
-
-        controls.product_started.await?;
+        controls.snapshot_started.await?;
         assert!(matches!(
-            budget.try_acquire(),
-            BudgetDecision::Unavailable(BudgetUnavailableReason::ConcurrencyExhausted)
+            budget.try_reserve_request(),
+            market_squawk_sources::BudgetReservationDecision::Unavailable(
+                BudgetUnavailableReason::ConcurrencyExhausted
+            )
         ));
         socket.send(Message::Text(SEQUENCE_101.into())).await?;
         sequence_101_captured.notified().await;
-        controls
-            .release_product
-            .send(())
-            .map_err(|_| "product request was dropped")?;
-
-        controls.snapshot_started.await?;
-        assert!(matches!(
-            budget.try_acquire(),
-            BudgetDecision::Unavailable(BudgetUnavailableReason::ConcurrencyExhausted)
-        ));
         socket.send(Message::Text(SEQUENCE_102.into())).await?;
         sequence_102_captured.notified().await;
         controls
@@ -426,25 +834,35 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
             return Err("snapshot handoff frontier was not a Ping".into());
         };
         assert_eq!(frontier.len(), 56);
+        assert_eq!(&frontier[..8], b"MSQCBF01");
         socket.send(Message::Pong(frontier)).await?;
+
         socket.send(Message::Text(PRIVATE_RECEIVED.into())).await?;
         socket.send(Message::Text(SEQUENCE_103.into())).await?;
         socket.send(Message::Text(SEQUENCE_104.into())).await?;
+        socket.send(Message::Text(SEQUENCE_105.into())).await?;
+        let publication_frontier = socket
+            .next()
+            .await
+            .ok_or("snapshot publication frontier Ping was not sent")??;
+        let Message::Ping(publication_frontier) = publication_frontier else {
+            return Err("snapshot publication frontier was not a Ping".into());
+        };
+        assert_eq!(publication_frontier.len(), 56);
+        assert_eq!(&publication_frontier[..8], b"MSQCBF02");
+        socket.send(Message::Text(SEQUENCE_106.into())).await?;
+        sequence_106_captured.notified().await;
+        socket.send(Message::Pong(publication_frontier)).await?;
 
         first_book.notified().await;
-        socket.send(Message::Text(SEQUENCE_105.into())).await?;
-        socket.send(Message::Text(SEQUENCE_106.into())).await?;
-        socket.send(Message::Text(SEQUENCE_107.into())).await?;
-        socket
-            .send(Message::Ping(Bytes::from_static(b"direct-probe")))
-            .await?;
-        assert!(matches!(
-            socket.next().await,
-            Some(Ok(Message::Pong(payload)))
-                if payload == Bytes::from_static(b"direct-probe")
-        ));
-        socket.send(Message::Close(None)).await?;
-        assert!(matches!(socket.next().await, Some(Ok(Message::Close(_)))));
+        for payload in [SEQUENCE_107, SEQUENCE_108, SEQUENCE_109] {
+            socket.send(Message::Text(payload.into())).await?;
+        }
+        continuation_complete.notified().await;
+        server_cancellation.cancel();
+        let close = socket.next().await.ok_or("missing cancellation close")??;
+        assert!(matches!(close, Message::Close(_)));
+        socket.flush().await?;
         Ok::<(), Box<dyn Error + Send + Sync>>(())
     });
     let stream = TcpStream::connect(address).await?;
@@ -456,7 +874,7 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
             socket,
             &FixtureSigner,
             &mut output,
-            CancellationToken::new(),
+            cancellation,
             1_721_847_600,
         ),
     )
@@ -464,91 +882,208 @@ async fn direct_session_queues_during_http_replays_then_hands_the_same_owner_to_
     assert!(
         matches!(
             outcome,
-            Err(CoinbaseDirectSessionError::Source(
-                SourceError::ProviderUnavailable
-            ))
+            Err(CoinbaseDirectSessionError::Source(SourceError::Cancelled))
         ),
-        "unexpected terminal outcome: {outcome:?}"
+        "unexpected terminal outcome: {outcome:?}; output: {output:?}"
     );
     server
         .await?
         .map_err(|error| std::io::Error::other(error.to_string()))?;
 
-    assert_eq!(output.frames.len(), 9);
+    assert_eq!(output.frames.len(), 11);
+    let snapshot_http = output
+        .snapshot_http
+        .as_ref()
+        .ok_or("original HTTP row missing")?;
+    assert_eq!(
+        snapshot_http.receipt().body_digest().bytes(),
+        <[u8; 32]>::from(Sha256::digest(SNAPSHOT_BODY))
+    );
+    assert_eq!(snapshot_http.observations().len(), 1);
+    assert_eq!(
+        snapshot_http.observations()[0].source_identifier().as_str(),
+        snapshot_identity(104)
+    );
     assert_eq!(output.frames[0].payload(), SUBSCRIPTION_ACK.as_bytes());
     assert_eq!(output.product_statuses, ["online"]);
     assert_eq!(output.private_events, 1);
+    let output_admission = CoinbaseDirectOutputAdmission::try_from_config(&config)?;
+    assert_eq!(output.output_admission, Some(output_admission));
     assert_eq!(
-        output.books,
+        output_admission.complete_retained_bytes(),
+        complete_session_bytes
+    );
+    assert_eq!(output.discarded_sequences, [101, 102, 103, 104]);
+    assert_eq!(
+        &output.order_level[..1],
+        &[RecordedOrderLevel::Snapshot {
+            generation: 1,
+            snapshot_sequence: 104,
+            orders: vec![
+                (
+                    "bid-1".to_owned(),
+                    ProviderBookSide::Bid,
+                    10_000,
+                    100_000_000,
+                ),
+                (
+                    "ask-1".to_owned(),
+                    ProviderBookSide::Ask,
+                    10_100,
+                    200_000_000,
+                ),
+            ],
+            replay_sequences: vec![105, 106],
+        }]
+    );
+    assert_eq!(
+        &output.handoffs[..1],
+        &[RecordedPendingHandoff {
+            snapshot_sequence: 104,
+            terminal_sequence: 106,
+            snapshot_body: SNAPSHOT_BODY.to_vec(),
+            replay: vec![
+                RecordedReplayFrame {
+                    sequence: 105,
+                    payload: SEQUENCE_105.as_bytes().to_vec(),
+                    native_trade: Some(RecordedNativeTrade {
+                        trade_id: 7005,
+                        maker_order_id: "bid-1".to_owned(),
+                        taker_order_id: "taker-105".to_owned(),
+                        maker_side: ProviderBookSide::Bid,
+                        price: 10_000,
+                        quantity: 25_000_000,
+                        sequence: 105,
+                        provider_timestamp: 1_784_928_850_605_000_000,
+                    }),
+                },
+                RecordedReplayFrame {
+                    sequence: 106,
+                    payload: SEQUENCE_106.as_bytes().to_vec(),
+                    native_trade: None,
+                },
+            ],
+            request_set_digest: [
+                0xe1, 0x65, 0x33, 0x9d, 0x1c, 0xfb, 0x77, 0xb9, 0x21, 0xa2, 0x51, 0x30, 0xf3, 0x6a,
+                0x0d, 0xc4, 0xfa, 0x68, 0x56, 0x2e, 0xc1, 0xcb, 0xc7, 0x2b, 0xfa, 0xd6, 0xdb, 0x16,
+                0x4e, 0x15, 0x99, 0xb6,
+            ],
+            subscription_digest: [
+                0x1f, 0xc6, 0x84, 0x81, 0x41, 0x1f, 0xb9, 0x07, 0x5f, 0xa8, 0xe7, 0x84, 0x69, 0x94,
+                0x68, 0x2e, 0x21, 0x32, 0x70, 0x6d, 0xf2, 0x94, 0x1b, 0x5f, 0xd2, 0xfb, 0x06, 0xb6,
+                0xe6, 0x7a, 0xa9, 0x8f,
+            ],
+        }]
+    );
+    assert_eq!(
+        &output.books[..1],
+        &[RecordedBook {
+            sequence: 106,
+            snapshot_url: config.snapshot_url().to_owned(),
+            source_identifier: snapshot_identity(106),
+            event_class: LiveEventClass::BookSnapshot,
+            input_depth: Some(MarketDepth::OrderLevel),
+            output_depth: Some(MarketDepth::PriceLevel),
+            publication: RecordedPublication::Snapshot {
+                bids: vec![("100.00".to_owned(), "0.75000000".to_owned())],
+                asks: vec![("101.00".to_owned(), "2.00000000".to_owned())],
+            },
+        }]
+    );
+    assert_eq!(output.books.len(), 4);
+    assert_eq!(
+        output.order_level[1..],
         [
-            RecordedBook {
-                sequence: 104,
-                snapshot_url: config.snapshot_url().to_owned(),
-                source_identifier: snapshot_identity(104),
-                event_class: LiveEventClass::BookSnapshot,
-                publication: RecordedPublication::Snapshot {
-                    bids: vec![("100.00".to_owned(), "1.00000000".to_owned())],
-                    asks: vec![("101.00".to_owned(), "2.00000000".to_owned())],
-                },
-                bids: vec![(10_000, 100_000_000)],
-                asks: vec![(10_100, 200_000_000)],
-            },
-            RecordedBook {
-                sequence: 105,
-                snapshot_url: config.snapshot_url().to_owned(),
-                source_identifier: snapshot_identity(105),
-                event_class: LiveEventClass::BookDelta,
-                publication: RecordedPublication::Delta {
-                    changes: vec![(
-                        ProviderBookSide::Bid,
-                        "99.00".to_owned(),
-                        "0.50000000".to_owned(),
-                    )],
-                },
-                bids: vec![(10_000, 100_000_000), (9_900, 50_000_000)],
-                asks: vec![(10_100, 200_000_000)],
-            },
-            RecordedBook {
-                sequence: 106,
-                snapshot_url: config.snapshot_url().to_owned(),
-                source_identifier: snapshot_identity(106),
-                event_class: LiveEventClass::BookDelta,
-                publication: RecordedPublication::Delta {
-                    changes: vec![(
-                        ProviderBookSide::Bid,
-                        "99.00".to_owned(),
-                        "0.00000000".to_owned(),
-                    )],
-                },
-                bids: vec![(10_000, 100_000_000)],
-                asks: vec![(10_100, 200_000_000)],
-            },
-            RecordedBook {
+            RecordedOrderLevel::Event {
                 sequence: 107,
-                snapshot_url: config.snapshot_url().to_owned(),
-                source_identifier: snapshot_identity(107),
-                event_class: LiveEventClass::Quote,
-                publication: RecordedPublication::Quote {
-                    bid: Some(("100.00".to_owned(), "1.00000000".to_owned())),
-                    ask: Some(("101.00".to_owned(), "2.00000000".to_owned())),
-                },
-                bids: vec![(10_000, 100_000_000)],
-                asks: vec![(10_100, 200_000_000)],
+                order_identity: Some("bid-2".to_owned())
+            },
+            RecordedOrderLevel::Event {
+                sequence: 108,
+                order_identity: Some("bid-1".to_owned())
+            },
+            RecordedOrderLevel::Event {
+                sequence: 109,
+                order_identity: None
             },
         ]
     );
+    assert_eq!(
+        output.books[1].publication,
+        RecordedPublication::Delta {
+            changes: vec![(
+                ProviderBookSide::Bid,
+                "99.00".to_owned(),
+                "1.00000000".to_owned()
+            )],
+        }
+    );
+    assert_eq!(
+        output.books[2].publication,
+        RecordedPublication::Delta {
+            changes: vec![(
+                ProviderBookSide::Bid,
+                "100.00".to_owned(),
+                "0.00000000".to_owned()
+            )],
+        }
+    );
+    assert_eq!(
+        output.books[3].publication,
+        RecordedPublication::Quote {
+            bid: Some(("99.00".to_owned(), "1.00000000".to_owned())),
+            ask: Some(("101.00".to_owned(), "2.00000000".to_owned())),
+        }
+    );
+    for (index, payload) in [SEQUENCE_107, SEQUENCE_108, SEQUENCE_109]
+        .into_iter()
+        .enumerate()
+    {
+        let handoff = &output.handoffs[index + 1];
+        assert!(handoff.snapshot_body.is_empty());
+        assert_eq!(handoff.replay.len(), 1);
+        assert_eq!(handoff.replay[0].payload, payload.as_bytes());
+        assert_eq!(handoff.terminal_sequence, 107 + index as u64);
+    }
     assert_eq!(direct.book.phase(), DirectSyncPhase::Quarantined);
     registry.end_session(&session, Timestamp::from_unix_nanos(2))?;
+    // A retained capture witness cannot outlive its original registry generation.
+    let (evidence, raw, batch) = output
+        .pending_handoff
+        .take()
+        .ok_or("missing successor")?
+        .into_parts();
+    let input = crate::market_handoff::CoinbaseMarketHandoffInput {
+        feed: evidence.feed(),
+        channel: evidence.channel(),
+        native_input_depth: evidence.native_input_depth(),
+        product: evidence.product().clone(),
+        configured_instrument: evidence.configured_instrument(),
+        venue: evidence.venue().clone(),
+        request_set_digest: evidence.request_set_digest(),
+        subscription_digest: evidence.subscription_digest(),
+        subscription_acknowledgement: evidence.subscription_acknowledgement().cloned(),
+        continuity: evidence.continuity(),
+        provider_published_at: evidence.provider_published_at(),
+        snapshot_provider_at: evidence.snapshot_provider_at(),
+    };
+    assert!(matches!(
+        crate::CoinbaseMarketHandoff::try_new(input, raw, batch),
+        Err(crate::CoinbaseMarketHandoffError::StaleAuthority)
+    ));
     Ok(())
 }
 
 #[tokio::test]
 async fn raw_sink_rejection_precedes_every_decoded_state_mutation() -> TestResult {
     let config = config()?;
-    let (_registry, _session, generation) =
+    let (_catalog, _registry, _session, generation) =
         live_generation(&config, "direct-transport-raw-rejection")?;
+    let (_product_capture, product, selected, freshness) = sealed_product_reference(&config)?;
     let (http, controls) = scripted_http(&config);
-    let mut direct = CoinbaseDirectSession::try_new_with_transport(config, generation, http)?;
+    let mut direct = CoinbaseDirectSession::try_new_with_transport(
+        config, generation, http, selected, product, freshness,
+    )?;
     let mut output = RecordingOutput {
         reject_raw_at: Some(2),
         ..RecordingOutput::default()
@@ -561,9 +1096,8 @@ async fn raw_sink_rejection_precedes_every_decoded_state_mutation() -> TestResul
         let mut socket = accept_async(stream).await?;
         let _subscription = socket.next().await;
         socket.send(Message::Text(SUBSCRIPTION_ACK.into())).await?;
-        controls.product_started.await?;
+        controls.snapshot_started.await?;
         socket.send(Message::Text(SEQUENCE_101.into())).await?;
-        let _keep_product_pending = controls.release_product;
         let _keep_snapshot_pending = controls.release_snapshot;
         let _finish = finish_rx.await;
         Ok::<(), Box<dyn Error + Send + Sync>>(())
@@ -589,7 +1123,7 @@ async fn raw_sink_rejection_precedes_every_decoded_state_mutation() -> TestResul
         )))
     ));
     assert_eq!(output.frames.len(), 1);
-    assert!(output.product_statuses.is_empty());
+    assert_eq!(output.product_statuses, ["online"]);
     assert_eq!(output.private_events, 0);
     assert!(output.books.is_empty());
     assert_eq!(direct.book.phase(), DirectSyncPhase::Quarantined);
@@ -604,6 +1138,7 @@ fn live_generation(
     config: &CoinbaseDirectConfig,
     session_id: &str,
 ) -> TestResult<(
+    CatalogFixture,
     AuthoritativeSourceRegistry,
     market_squawk_sources::CurrentSourceSession,
     LiveSourceGeneration,
@@ -611,11 +1146,15 @@ fn live_generation(
     let resolver = FixtureAuthorizationSubjectResolver {
         subject: identifier(&format!("{session_id}-credential"))?,
     };
-    let mut registry =
+    let registry =
         AuthoritativeSourceRegistry::try_new_ephemeral_with_authorization_subject_resolver_for_diagnostics(
             Arc::new(resolver),
         )?;
-    let registered = registry.register(config.metadata().clone(), Timestamp::from_unix_nanos(1))?;
+    let catalog = CatalogFixture::new(
+        config.instrument(),
+        SourceId::try_from("coinbase-exchange-direct")?,
+    )?;
+    let (mut registry, registered) = catalog.register_selected(registry, config.metadata())?;
     let session = registry.begin_session(
         &registered,
         SessionId::new(identifier(session_id)?),
@@ -626,7 +1165,7 @@ fn live_generation(
     let (mut initialization, _admission, _degradation) = capture.into_parts();
     initialization.mark_healthy()?;
     let generation = registry.take_live_source_generation(&session)?;
-    Ok((registry, session, generation))
+    Ok((catalog, registry, session, generation))
 }
 
 fn config() -> TestResult<CoinbaseDirectConfig> {
@@ -658,7 +1197,7 @@ fn config() -> TestResult<CoinbaseDirectConfig> {
             1_000,
         )?,
     )?;
-    CoinbaseDirectConfig::try_new(
+    CoinbaseDirectConfig::try_new_order_level(
         SourceId::try_from("coinbase-exchange-direct")?,
         RevisionBoundPayloadEvidence::new(
             MetadataRevision::new(identifier("coinbase-direct-transport-2026-07-24")?),

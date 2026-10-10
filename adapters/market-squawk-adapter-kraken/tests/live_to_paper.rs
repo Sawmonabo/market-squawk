@@ -1,7 +1,8 @@
 use market_squawk_adapter_kraken::{
     KRAKEN_BOOK_SEQUENCE_RULE, KRAKEN_QUALIFICATION_POLICY_DIGEST,
-    KRAKEN_QUALIFICATION_POLICY_VERSION, KrakenConfig, KrakenDecodeOutcome, KrakenDecoder,
-    KrakenDecoderState, KrakenDepth, KrakenMetadataInput, KrakenQualificationPolicy,
+    KRAKEN_QUALIFICATION_POLICY_VERSION, KrakenConfig, KrakenConfigError, KrakenDecodeOutcome,
+    KrakenDecoder, KrakenDepth, KrakenMetadataInput, KrakenQualificationPolicy,
+    KrakenReferenceSelectionEvidence,
 };
 use market_squawk_adapter_paper::{
     FeeSchedule, PaperAccountBootstrap, PaperExposureValuation, PaperLedger, PaperLedgerConfig,
@@ -9,10 +10,13 @@ use market_squawk_adapter_paper::{
 use market_squawk_domain::{
     AccountId, AuthorizationBasis, BasisPoints, ClientOrderId, Currency, DataQuality, Denomination,
     DigestAlgorithm, EffectiveInterval, EvidenceDigest, ExactPayloadEvidence, ExecutionEligibility,
-    InstrumentDefinitionRevision, InstrumentExecutionTerms, InstrumentId, LotSize,
-    MetadataRevision, Money, OrderId, OrderReasonCode, OrderSide, OrderType, PriceTicks,
-    QuantityLots, RevisionBoundPayloadEvidence, RuleVersion, SourceId, SourceIdentifier,
-    StrategyId, TickSize, TimeInForce, Timestamp,
+    InstrumentDefinition, InstrumentDefinitionInput, InstrumentDefinitionRevision,
+    InstrumentExecutionTerms, InstrumentId, LotSize, MetadataRevision, Money, OrderId,
+    OrderReasonCode, OrderSide, OrderType, PriceTicks, ProviderIdentityEvidence,
+    ProviderIdentityRecord, ProviderIdentityRecordInput, ProviderIdentitySupersession,
+    ProviderInstrumentId, QuantityLots, RevisionBoundPayloadEvidence, RuleVersion, SourceId,
+    SourceIdentifier, StrategyId, TickSize, TimeInForce, Timestamp, TradingStatus, VenueId,
+    VenueMapping, VenueSymbol,
 };
 use market_squawk_execution::{
     AccountBootstrap, AccountCoordinatorConfig, AccountIdempotencyBootstrap,
@@ -23,7 +27,7 @@ use market_squawk_execution::{
 };
 use market_squawk_sources::{
     AuthorizationGrant, AuthorizationMode, BackoffPolicy, BudgetScope, ChecksumValidationProfile,
-    FreshnessPolicy, ProviderBudgetPolicy, ProviderChecksumEvidence, SourceProtocolProfile,
+    DecodeError, FreshnessPolicy, ProviderBudgetPolicy, SourceProtocolProfile,
 };
 use rust_decimal::Decimal;
 use std::collections::BTreeSet;
@@ -77,30 +81,269 @@ fn metadata_binds_the_reviewed_ceiling_and_contains_no_fabricated_sequence()
     assert!(json.contains(KRAKEN_QUALIFICATION_POLICY_DIGEST));
 
     let instrument = InstrumentId::from_str("4c74ab95-53b9-42ad-9b66-0ed403b88fed")?;
-    let _book_config = KrakenConfig::try_new(
-        metadata,
-        "BTC/USD",
+    let provider_identity = kraken_provider_identity(
         instrument,
+        "kraken-instrument-identity-v1",
+        EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?,
+        4,
+        None,
+    )?;
+    let provider_identity_key = provider_identity.key();
+    let definition = kraken_definition(
+        instrument,
+        vec![provider_identity.clone()],
+        "kraken",
+        "BTC/USD",
+    )?;
+    let selected_at = Timestamp::from_unix_nanos(1);
+    let reference_selection =
+        kraken_reference_selection(EffectiveInterval::new(Timestamp::from_unix_nanos(0), None)?)?;
+    let book_config = KrakenConfig::try_new(
+        metadata,
+        &definition,
+        &provider_identity_key,
+        &reference_selection,
+        selected_at,
         KrakenDepth::Ten,
         NonZeroUsize::new(1 << 20).ok_or("zero frame bound")?,
     )?;
-    let _trade_config = KrakenConfig::try_trades(
+    let trade_config = KrakenConfig::try_trades(
         trade_metadata,
-        "BTC/USD",
-        instrument,
+        &definition,
+        &provider_identity_key,
+        &reference_selection,
+        selected_at,
         NonZeroUsize::new(1 << 20).ok_or("zero frame bound")?,
     )?;
 
-    let mut decoder = KrakenDecoder::try_trades("BTC/USD", instrument)?;
-    let trade = br#"{"channel":"trade","type":"update","data":[{"symbol":"BTC/USD","side":"buy","price":"45283.50000","qty":"0.01000000","ord_type":"market","trade_id":123,"timestamp":"2023-10-04T07:48:26Z"}]}"#;
-    let KrakenDecodeOutcome::Market(observations) = decoder.decode_payload(trade)? else {
-        return Err("trade decoded as control traffic".into());
-    };
+    let book_coordinates = book_config.native_coordinates().clone();
+    let trade_coordinates = trade_config.native_coordinates().clone();
+    assert_eq!(
+        book_coordinates
+            .provider_identity_key()
+            .provider_instrument_id()
+            .as_str(),
+        "XBTUSD"
+    );
+    assert_eq!(book_coordinates.venue_symbol().as_str(), "BTC/USD");
+    assert_eq!(book_coordinates.selected_at(), selected_at);
+    assert_eq!(book_coordinates.valid_from(), Timestamp::from_unix_nanos(0));
+    assert_eq!(book_coordinates.valid_until(), None);
+    assert_eq!(
+        book_coordinates.provider_identity_revision(),
+        provider_identity.metadata_revision()
+    );
+    assert_eq!(
+        book_coordinates.provider_identity_digest(),
+        provider_identity.evidence().content_digest()
+    );
+    assert_eq!(
+        book_coordinates
+            .provider_product()
+            .as_source_identifier()
+            .as_str(),
+        "kraken-spot"
+    );
+    assert_eq!(
+        book_coordinates
+            .provider_channel()
+            .as_source_identifier()
+            .as_str(),
+        "book-v2"
+    );
+    assert_eq!(
+        trade_coordinates
+            .provider_channel()
+            .as_source_identifier()
+            .as_str(),
+        "trade-v2"
+    );
     assert!(matches!(
-        observations[0].checksum(),
-        ProviderChecksumEvidence::Unsupported { .. }
+        KrakenDecoder::try_trades(book_coordinates.clone()),
+        Err(DecodeError::InvalidProviderEvidence)
     ));
-    assert_eq!(decoder.state(), KrakenDecoderState::Healthy);
+
+    let mut decoder = KrakenDecoder::try_new(book_coordinates.clone(), KrakenDepth::Ten)?;
+    let KrakenDecodeOutcome::Market(observations) =
+        decoder.decode_payload(include_bytes!("../fixtures/official_book_checksum.json"))?
+    else {
+        return Err("official Kraken book snapshot decoded as control traffic".into());
+    };
+    assert_eq!(decoder.native_coordinates(), &book_coordinates);
+    assert_eq!(observations.len(), 1);
+    assert_eq!(observations[0].instrument(), instrument);
+    assert_eq!(observations[0].venue(), book_coordinates.venue());
+    let _trade_decoder = KrakenDecoder::try_trades(trade_coordinates)?;
+
+    let bounded_reference_selection =
+        kraken_reference_selection(EffectiveInterval::new(Timestamp::from_unix_nanos(1), None)?)?;
+    let bounded_trade_config = KrakenConfig::try_trades(
+        metadata_input(true)?.try_build()?,
+        &definition,
+        &provider_identity_key,
+        &bounded_reference_selection,
+        selected_at,
+        NonZeroUsize::new(1 << 20).ok_or("zero frame bound")?,
+    )?;
+    let mut bounded_trade_decoder =
+        KrakenDecoder::try_trades(bounded_trade_config.native_coordinates().clone())?;
+    let trade_ack = br#"{"method":"subscribe","result":{"channel":"trade","snapshot":false,"symbol":"BTC/USD"},"success":true,"time_in":"1970-01-01T00:00:01Z","time_out":"1970-01-01T00:00:01.001Z","req_id":1}"#;
+    assert!(matches!(
+        bounded_trade_decoder.decode_payload(trade_ack)?,
+        KrakenDecodeOutcome::Control(
+            market_squawk_adapter_kraken::KrakenPublicControl::Subscribed { .. }
+        )
+    ));
+    let current_trade = br#"{"channel":"trade","type":"update","data":[{"symbol":"BTC/USD","side":"buy","price":1.0,"qty":1.0,"ord_type":"market","trade_id":1,"timestamp":"1970-01-01T00:00:01Z"}]}"#;
+    let KrakenDecodeOutcome::Market(current_trades) =
+        bounded_trade_decoder.decode_payload(current_trade)?
+    else {
+        return Err("first current trade update did not produce market observations".into());
+    };
+    assert_eq!(current_trades.len(), 1);
+    assert_eq!(
+        bounded_trade_decoder.state(),
+        market_squawk_adapter_kraken::KrakenDecoderState::Healthy
+    );
+    let mut authorized_snapshot_decoder =
+        KrakenDecoder::try_trades(bounded_trade_config.native_coordinates().clone())?;
+    let mut authorized_snapshot: serde_json::Value = serde_json::from_slice(current_trade)?;
+    authorized_snapshot["type"] = serde_json::Value::String("snapshot".to_owned());
+    assert!(matches!(
+        authorized_snapshot_decoder.decode_payload(&serde_json::to_vec(&authorized_snapshot)?)?,
+        KrakenDecodeOutcome::Market(rows) if rows.len() == 1
+    ));
+
+    let mut unexpected_snapshot_decoder =
+        KrakenDecoder::try_trades(bounded_trade_config.native_coordinates().clone())?;
+    let mut unexpected_snapshot_ack: serde_json::Value = serde_json::from_slice(trade_ack)?;
+    unexpected_snapshot_ack["result"]["snapshot"] = serde_json::Value::Bool(true);
+    assert!(matches!(
+        unexpected_snapshot_decoder
+            .decode_payload(&serde_json::to_vec(&unexpected_snapshot_ack)?),
+        Err(DecodeError::ResynchronizationRequired)
+    ));
+
+    assert!(matches!(
+        bounded_trade_decoder.decode_payload(
+            br#"{"channel":"trade","type":"snapshot","data":[{"symbol":"BTC/USD","side":"buy","price":"1.0","qty":"1.0","ord_type":"market","trade_id":1,"timestamp":"1970-01-01T00:00:00Z"}]}"#,
+        ),
+        Err(DecodeError::InvalidProviderEvidence)
+    ));
+
+    let expired = kraken_definition(
+        instrument,
+        vec![kraken_provider_identity(
+            instrument,
+            "kraken-expired-v1",
+            EffectiveInterval::new(
+                Timestamp::from_unix_nanos(0),
+                Some(Timestamp::from_unix_nanos(1)),
+            )?,
+            5,
+            None,
+        )?],
+        "kraken",
+        "BTC/USD",
+    )?;
+    assert!(matches!(
+        KrakenConfig::try_new(
+            metadata_input(false)?.try_build()?,
+            &expired,
+            &provider_identity_key,
+            &reference_selection,
+            selected_at,
+            KrakenDepth::Ten,
+            NonZeroUsize::new(1 << 20).ok_or("zero frame bound")?,
+        ),
+        Err(KrakenConfigError::NativeIdentity)
+    ));
+    let future = kraken_definition(
+        instrument,
+        vec![kraken_provider_identity(
+            instrument,
+            "kraken-future-v1",
+            EffectiveInterval::new(Timestamp::from_unix_nanos(2), None)?,
+            6,
+            None,
+        )?],
+        "kraken",
+        "BTC/USD",
+    )?;
+    assert!(matches!(
+        KrakenConfig::try_new(
+            metadata_input(false)?.try_build()?,
+            &future,
+            &provider_identity_key,
+            &reference_selection,
+            selected_at,
+            KrakenDepth::Ten,
+            NonZeroUsize::new(1 << 20).ok_or("zero frame bound")?,
+        ),
+        Err(KrakenConfigError::NativeIdentity)
+    ));
+    let mismatched_venue = kraken_definition(
+        instrument,
+        vec![provider_identity.clone()],
+        "coinbase",
+        "BTC-USD",
+    )?;
+    assert!(matches!(
+        KrakenConfig::try_new(
+            metadata_input(false)?.try_build()?,
+            &mismatched_venue,
+            &provider_identity_key,
+            &reference_selection,
+            selected_at,
+            KrakenDepth::Ten,
+            NonZeroUsize::new(1 << 20).ok_or("zero frame bound")?,
+        ),
+        Err(KrakenConfigError::VenueMapping)
+    ));
+
+    let superseded_at = Timestamp::from_unix_nanos(10);
+    let predecessor = kraken_provider_identity(
+        instrument,
+        "kraken-superseded-v1",
+        EffectiveInterval::new(Timestamp::from_unix_nanos(0), Some(superseded_at))?,
+        7,
+        None,
+    )?;
+    let successor = kraken_provider_identity(
+        instrument,
+        "kraken-current-v2",
+        EffectiveInterval::new(superseded_at, None)?,
+        8,
+        Some(ProviderIdentitySupersession::new(
+            predecessor.metadata_revision().clone(),
+            ProviderIdentityEvidence::from_content_digest(EvidenceDigest::new(
+                DigestAlgorithm::Sha256,
+                [9; 32],
+            )),
+        )),
+    )?;
+    let revised = kraken_definition(
+        instrument,
+        vec![predecessor, successor.clone()],
+        "kraken",
+        "BTC/USD",
+    )?;
+    let revised_config = KrakenConfig::try_new(
+        metadata_input(false)?.try_build()?,
+        &revised,
+        &provider_identity_key,
+        &reference_selection,
+        superseded_at,
+        KrakenDepth::Ten,
+        NonZeroUsize::new(1 << 20).ok_or("zero frame bound")?,
+    )?;
+    assert_eq!(
+        revised_config
+            .native_coordinates()
+            .provider_identity_revision(),
+        successor.metadata_revision()
+    );
+
     Ok(())
 }
 
@@ -274,6 +517,69 @@ fn current_timestamp() -> Result<Timestamp, Box<dyn Error>> {
         .and_then(|value| value.checked_add(i128::from(elapsed.subsec_nanos())))
         .ok_or("system timestamp overflow")?;
     Ok(Timestamp::from_unix_nanos(i64::try_from(nanos)?))
+}
+
+fn kraken_provider_identity(
+    instrument: InstrumentId,
+    revision: &str,
+    validity: EffectiveInterval,
+    digest_byte: u8,
+    supersedes: Option<ProviderIdentitySupersession>,
+) -> Result<ProviderIdentityRecord, Box<dyn Error>> {
+    Ok(ProviderIdentityRecord::new(ProviderIdentityRecordInput {
+        instrument_id: instrument,
+        source_id: SourceId::try_from("kraken-spot-v2")?,
+        provider_instrument_id: ProviderInstrumentId::try_from("XBTUSD")?,
+        evidence: ProviderIdentityEvidence::from_content_digest(EvidenceDigest::new(
+            DigestAlgorithm::Sha256,
+            [digest_byte; 32],
+        )),
+        source_timestamp: None,
+        observed_at: Timestamp::from_unix_nanos(1),
+        metadata_revision: MetadataRevision::new(SourceIdentifier::try_from(revision)?),
+        validity,
+        supersedes,
+    }))
+}
+
+fn kraken_reference_selection(
+    definition_validity: EffectiveInterval,
+) -> Result<KrakenReferenceSelectionEvidence, Box<dyn Error>> {
+    Ok(KrakenReferenceSelectionEvidence::try_new(
+        MetadataRevision::new(SourceIdentifier::try_from("kraken-reference-v1")?),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [21; 32]),
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [22; 32]),
+        1,
+        definition_validity.starts_at(),
+        definition_validity,
+        EvidenceDigest::new(DigestAlgorithm::Sha256, [23; 32]),
+    )?)
+}
+
+fn kraken_definition(
+    instrument: InstrumentId,
+    provider_identities: Vec<ProviderIdentityRecord>,
+    venue: &str,
+    venue_symbol: &str,
+) -> Result<InstrumentDefinition, Box<dyn Error>> {
+    let usd = Currency::try_from("USD")?;
+    Ok(InstrumentDefinition::try_new(InstrumentDefinitionInput {
+        instrument_id: instrument,
+        definition_revision: InstrumentDefinitionRevision::try_from(1)?,
+        asset_class: market_squawk_domain::AssetClass::Crypto,
+        primary_denomination: Denomination::Currency(usd),
+        quote_currency: usd,
+        tick_size: TickSize::try_from_decimal(Decimal::new(1, 2))?,
+        lot_size: LotSize::try_from_decimal(Decimal::new(1, 8))?,
+        contract_multiplier: Decimal::ONE,
+        venue_mappings: vec![VenueMapping::new(
+            VenueId::try_from(venue)?,
+            VenueSymbol::try_from(venue_symbol)?,
+        )],
+        provider_identities,
+        identifiers: Vec::new(),
+        trading_status: TradingStatus::Active,
+    })?)
 }
 
 fn metadata_input(trades: bool) -> Result<KrakenMetadataInput, Box<dyn Error>> {

@@ -1,4 +1,4 @@
-"""Sealed production driver for deterministic training, candidate export, and admission."""
+"""Common driver for deterministic training, candidate export, and admission."""
 
 from __future__ import annotations
 
@@ -9,39 +9,37 @@ import os
 from pathlib import Path
 import re
 import stat
-import subprocess
 import sys
-from typing import Any, Mapping, Sequence
+from typing import Any, BinaryIO, Mapping, Sequence
 
 from .bundle import (
+    BundleReceipt,
     BundleAuthorityRef,
     BundleExportError,
     _binary_open_flags,
-    _native_release_executable,
-    _native_subprocess_environment,
     _windows_reparse_path,
     _windows_reparse_point,
 )
-from .data import DatasetIntegrityError, UtcNanoseconds, open_dataset
+from .data import DatasetIntegrityError, UtcNanoseconds, open_dataset, _verify_dataset_receipt
 from .finance import OperationContext
 from .training import (
+    TrainingProposal,
     TrainingRun,
     TrainingValidationError,
     training_environment_receipt,
 )
+from .worker_protocol import CandidateEvidence, WorkerProtocolWriter
 
 
 MAX_CONFIG_BYTES = 256 * 1024
 MAX_OUTPUT_BYTES = 8 * 1024 * 1024
-MAX_NATIVE_EXECUTABLE_BYTES = 256 * 1024 * 1024
-NATIVE_READ_BYTES = 1024 * 1024
 IDENTIFIER = re.compile(r"^[a-z0-9][a-z0-9._-]{0,126}[a-z0-9]$|^[a-z0-9]$")
 PATH_COMPONENT = re.compile(r"^[a-z0-9][a-z0-9._-]{0,254}$")
 HEX = re.compile(r"^[0-9a-f]{64}$")
 
 
 class TrainingDriverError(ValueError):
-    """The sealed driver rejected input, authority, publication, or release identity."""
+    """The driver rejected input, authority, publication, or environment identity."""
 
 
 def write_proposal(
@@ -72,14 +70,44 @@ def finalize_candidate(
 
     config = _load_config(config_path)
     proposal = _proposal(config)
-    data_root = Path(config["dataset"]["root"])
-    authority = _authority_ref(Path(authority_path), data_root, proposal.authority_sha256)
-    output_root = _controlled_candidate_parent(data_root, candidate_parent)
-    receipt = proposal.export(
-        output_root,
-        authority,
-        context=_operation_context(config),
+    return _finalize_proposal(
+        config,
+        proposal,
+        authority_path,
+        candidate_parent,
+        request_path,
     )
+
+
+def _finalize_proposal(
+    config: Mapping[str, Any],
+    proposal: TrainingProposal,
+    authority_path: Path | str | None,
+    candidate_parent: str,
+    request_path: Path | str,
+) -> Mapping[str, Any]:
+    data_root = Path(config["dataset"]["root"])
+    output_root = _controlled_candidate_parent(data_root, candidate_parent)
+    if authority_path is None:
+        # The proposal is untrusted. Rust checks its predeclared product plan and
+        # independently revalidates the complete candidate before runtime admission.
+        _verify_dataset_receipt(proposal.dataset, _operation_context(config))
+        root = proposal.candidate._stage_for_product_admission(output_root, proposal.authority_bytes)
+        authority_coordinate = root / "authority-proposal.json"
+        receipt = BundleReceipt(
+            root=root, metadata=root / "bundle.json", artifact=root / proposal.candidate.artifact_path,
+            run_record=root / "training-run.json", metadata_sha256=proposal.candidate.metadata_sha256,
+            artifact_sha256=proposal.candidate.artifact_sha256,
+            training_run_sha256=proposal.candidate.training_run_sha256,
+            authority_sha256=proposal.authority_sha256, dataset_export_sha256=proposal.dataset.export_sha256,
+            dataset_selection_sha256=proposal.dataset.identity.selection_sha256,
+            catalog_identity_sha256=proposal.dataset.identity.catalog_identity_sha256,
+            validated_by_rust=False,
+        )
+    else:
+        authority = _authority_ref(Path(authority_path), data_root, proposal.authority_sha256)
+        authority_coordinate = authority.root / authority.relative_path
+        receipt = proposal.export(output_root, authority, context=_operation_context(config))
     output_semantics = (
         "binary_probability"
         if config["training"]["modelKind"] == "logistic"
@@ -94,11 +122,12 @@ def finalize_candidate(
             "sha256": receipt.metadata_sha256,
         },
         "authority": {
-            "path": str((authority.root / authority.relative_path).resolve()),
+            "path": str(authority_coordinate.resolve()),
             "sha256": receipt.authority_sha256,
         },
         "dataset": {
             "exportSha256": receipt.dataset_export_sha256,
+            "productContract": config["dataset"]["productContract"],
             "asOfUnixNanos": config["dataset"]["asOfUnixNanos"],
             "selectionSha256": receipt.dataset_selection_sha256,
             "catalogIdentitySha256": receipt.catalog_identity_sha256,
@@ -114,81 +143,117 @@ def finalize_candidate(
             "fallback": onnx["fallback"],
         },
     }
-    request_output = _write_exclusive(Path(request_path), _canonical(request))
+    request_bytes = _canonical(request)
+    request_output = _write_exclusive(Path(request_path), request_bytes)
     return {
         "admissionRequest": str(request_output),
+        "admissionRequestSha256": hashlib.sha256(request_bytes).hexdigest(),
         "candidateDirectory": request["candidateDirectory"],
         "metadataSha256": receipt.metadata_sha256,
         "artifactSha256": receipt.artifact_sha256,
         "trainingRunSha256": receipt.training_run_sha256,
         "authoritySha256": receipt.authority_sha256,
+        "datasetExportSha256": receipt.dataset_export_sha256,
+        "datasetSelectionSha256": receipt.dataset_selection_sha256,
+        "catalogIdentitySha256": receipt.catalog_identity_sha256,
     }
 
 
-def admit_candidate(
-    config_path: Path | str,
+def run_worker(
+    config_path: Path | str | None,
+    authority_path: Path | str | None,
+    candidate_parent: str,
     request_path: Path | str,
-) -> Mapping[str, Any]:
-    """Invoke the exact signed sibling application for one confirmed durable admission."""
+    *,
+    run_id: str,
+    generation: int,
+    stream: BinaryIO | None = None,
+) -> int:
+    """Produce one candidate-evidence stream without invoking model admission."""
 
-    config = _load_config(config_path)
-    receipt = training_environment_receipt()
-    release_root = Path(sys.prefix).resolve(strict=True)
-    application = _native_release_executable("market-squawk")
-    worker = _native_release_executable("market-squawk-onnx-worker")
-    validator = _native_release_executable("market-squawk-model-validator")
-    expected = (
-        (application, receipt.application_sha256),
-        (worker, receipt.onnx_worker_sha256),
-        (validator, receipt.validator_sha256),
+    protocol = WorkerProtocolWriter(
+        sys.stdout.buffer if stream is None else stream,
+        run_id=run_id,
+        generation=generation,
     )
-    before = tuple(_executable_sha256(path) for path, _digest in expected)
-    if any(observed != digest for observed, (_path, digest) in zip(before, expected, strict=True)):
-        raise TrainingDriverError("signed native release identity mismatch")
-    request = _strict_regular_file_coordinate(
-        Path(request_path), "model admission request"
-    )
-    command = [
-        str(application),
-        "--data-dir",
-        config["dataset"]["root"],
-        "--training-release-root",
-        str(release_root),
-        "--output",
-        "json",
-        "model",
-        "admit",
-        str(request),
-        "--confirm",
-    ]
+    completed_units = 0
     try:
-        completed = subprocess.run(
-            command,
-            check=False,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=70,
-            env=_native_subprocess_environment(),
+        protocol.progress("validation", "Validating training inputs.", 0, 4)
+        if config_path is None:
+            if authority_path is not None:
+                raise TrainingDriverError("product worker cannot accept caller authority")
+            content = sys.stdin.buffer.read(MAX_CONFIG_BYTES + 1)
+            if not content or len(content) > MAX_CONFIG_BYTES:
+                raise TrainingDriverError("product configuration exceeds its byte bound")
+            try:
+                value = json.loads(content, object_pairs_hook=_unique_object)
+            except (UnicodeDecodeError, json.JSONDecodeError) as error:
+                raise TrainingDriverError("product configuration is invalid") from error
+            config = _validate_config(value)
+        else:
+            if authority_path is None:
+                raise TrainingDriverError("governed worker requires independent authority")
+            config = _load_config(config_path)
+        completed_units = 1
+        protocol.progress("training", "Training deterministic model candidate.", 1, 4)
+        proposal = _proposal(config)
+        completed_units = 2
+        protocol.progress("evaluation", "Candidate evaluation completed.", 2, 4)
+        completed_units = 3
+        protocol.progress("export", "Exporting candidate for Rust validation.", 3, 4)
+        result = _finalize_proposal(
+            config,
+            proposal,
+            authority_path,
+            candidate_parent,
+            request_path,
         )
-    except (OSError, subprocess.TimeoutExpired) as error:
-        raise TrainingDriverError("signed model admission did not complete") from error
-    after = tuple(_executable_sha256(path) for path, _digest in expected)
-    if (
-        before != after
-        or completed.returncode != 0
-        or not completed.stdout
-        or len(completed.stdout) > 64 * 1024
-        or len(completed.stderr) > 64 * 1024
+        environment = training_environment_receipt()
+        candidate_metadata = json.loads(proposal.candidate.metadata_bytes)
+        if (
+            environment.sha256 != candidate_metadata["training_environment_sha256"]
+            or environment.training_code_revision != candidate_metadata["training_code_revision"]
+        ):
+            raise TrainingDriverError("training environment changed during candidate production")
+        protocol.result(
+            "complete",
+            "Model candidate produced for Rust validation.",
+            CandidateEvidence(
+                admission_request_sha256=str(result["admissionRequestSha256"]),
+                candidate_directory=str(result["candidateDirectory"]),
+                metadata_sha256=str(result["metadataSha256"]),
+                artifact_sha256=str(result["artifactSha256"]),
+                training_run_sha256=str(result["trainingRunSha256"]),
+                authority_sha256=str(result["authoritySha256"]),
+                dataset_export_sha256=str(result["datasetExportSha256"]),
+                dataset_selection_sha256=str(result["datasetSelectionSha256"]),
+                catalog_identity_sha256=str(result["catalogIdentitySha256"]),
+                training_environment_sha256=environment.sha256,
+                training_code_revision=environment.training_code_revision,
+            ),
+            completed_units=4,
+            total_units=4,
+        )
+        return 0
+    except (
+        BundleExportError,
+        DatasetIntegrityError,
+        OSError,
+        TrainingDriverError,
+        TrainingValidationError,
+        ValueError,
     ):
-        raise TrainingDriverError("signed model admission was rejected")
-    try:
-        value = json.loads(completed.stdout.decode("ascii"), object_pairs_hook=_unique_object)
-    except (UnicodeDecodeError, json.JSONDecodeError, TrainingDriverError) as error:
-        raise TrainingDriverError("signed model admission evidence is invalid") from error
-    if not isinstance(value, dict):
-        raise TrainingDriverError("signed model admission evidence is invalid")
-    return value
+        try:
+            protocol.error(
+                "failed",
+                "Training candidate production failed.",
+                "TRAINING_REJECTED",
+                completed_units,
+                4,
+            )
+        except (OSError, ValueError):
+            pass
+        return 2
 
 
 def _proposal(config: Mapping[str, Any]):
@@ -197,6 +262,7 @@ def _proposal(config: Mapping[str, Any]):
         dataset_config["root"],
         dataset_config["exportSha256"],
         UtcNanoseconds(dataset_config["asOfUnixNanos"]),
+        product_contract=dataset_config["productContract"],
         max_rows=dataset_config["maximumRows"],
         max_bytes=dataset_config["maximumBytes"],
         context=_operation_context(config),
@@ -229,7 +295,10 @@ def _operation_context(config: Mapping[str, Any]) -> OperationContext:
 
 
 def _load_config(path: Path | str) -> Mapping[str, Any]:
-    value = _read_json(Path(path), MAX_CONFIG_BYTES)
+    return _validate_config(_read_json(Path(path), MAX_CONFIG_BYTES))
+
+
+def _validate_config(value: Any) -> Mapping[str, Any]:
     if not isinstance(value, dict) or set(value) != {
         "schemaVersion",
         "dataset",
@@ -248,10 +317,19 @@ def _load_config(path: Path | str) -> Mapping[str, Any]:
             "asOfUnixNanos",
             "maximumRows",
             "maximumBytes",
+            "productContract",
         },
         "dataset",
     )
     root = _absolute_controlled_directory(dataset["root"], "dataset root")
+    if dataset["productContract"] not in {
+        "market-squawk.feature-dataset.price-return-macro-context-fixed-horizon-forward-return.training/v1",
+        "market-squawk.feature-dataset.native-fiscal-financial-amount.training/v1",
+        "market-squawk.feature-dataset.price-return-macro-context-fixed-horizon-price-higher.training/v1",
+        "market-squawk.feature-dataset.price-return-macro-context-fixed-horizon-benchmark-outperformance.training/v1",
+        "market-squawk.feature-dataset.price-return-macro-context-fixed-horizon-profit-after-costs.training/v1",
+    }:
+        raise TrainingDriverError("training product contract is unsupported")
     _hex(dataset["exportSha256"], "dataset export")
     _integer(dataset["asOfUnixNanos"], -(2**63), 2**63 - 1, "dataset cutoff")
     _integer(dataset["maximumRows"], 1, 100_000, "dataset row limit")
@@ -763,58 +841,6 @@ def _validate_open_directory(parent: Path, descriptor: int, name: str) -> None:
         raise TrainingDriverError(f"{name} parent identity changed")
 
 
-def _executable_sha256(path: Path) -> str:
-    flags = (
-        os.O_RDONLY
-        | getattr(os, "O_CLOEXEC", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-        | _binary_open_flags()
-    )
-    try:
-        named_before = os.stat(path, follow_symlinks=False)
-        descriptor = os.open(path, flags)
-    except OSError as error:
-        raise TrainingDriverError("signed native executable is unavailable") from error
-    try:
-        before = os.fstat(descriptor)
-        executable = (
-            path.suffix.lower() == ".exe" if os.name == "nt" else before.st_mode & 0o111
-        )
-        if (
-            not stat.S_ISREG(before.st_mode)
-            or not stat.S_ISREG(named_before.st_mode)
-            or _windows_reparse_point(named_before)
-            or _windows_reparse_point(before)
-            or not os.path.samestat(before, named_before)
-            or before.st_size <= 0
-            or before.st_size > MAX_NATIVE_EXECUTABLE_BYTES
-            or not executable
-        ):
-            raise TrainingDriverError("signed native executable is invalid")
-        digest = hashlib.sha256()
-        observed = 0
-        while True:
-            chunk = os.read(descriptor, NATIVE_READ_BYTES)
-            if not chunk:
-                break
-            observed += len(chunk)
-            if observed > before.st_size:
-                raise TrainingDriverError("signed native executable changed")
-            digest.update(chunk)
-        after = os.fstat(descriptor)
-        named_after = os.stat(path, follow_symlinks=False)
-        if (
-            observed != before.st_size
-            or _file_identity(before) != _file_identity(after)
-            or _windows_reparse_point(named_after)
-            or not os.path.samestat(after, named_after)
-        ):
-            raise TrainingDriverError("signed native executable changed")
-        return digest.hexdigest()
-    finally:
-        os.close(descriptor)
-
-
 def _file_identity(value: os.stat_result) -> tuple[int, int, int, int, int]:
     return (
         value.st_dev,
@@ -852,22 +878,38 @@ def main(argv: Sequence[str] | None = None) -> int:
     finalize.add_argument("--authority", required=True, type=Path)
     finalize.add_argument("--candidate-parent", required=True)
     finalize.add_argument("--request", required=True, type=Path)
-    admit = commands.add_parser("admit")
-    admit.add_argument("--config", required=True, type=Path)
-    admit.add_argument("--request", required=True, type=Path)
+    worker = commands.add_parser("worker")
+    worker.add_argument("--run-id", required=True)
+    worker.add_argument("--generation", required=True, type=int)
+    worker_input = worker.add_mutually_exclusive_group(required=True)
+    worker_input.add_argument("--config", type=Path)
+    worker_input.add_argument("--product-config-stdin", action="store_true")
+    worker.add_argument("--authority", type=Path)
+    worker.add_argument("--candidate-parent", required=True)
+    worker.add_argument("--request", required=True, type=Path)
     options = parser.parse_args(argv)
+    if options.command == "worker":
+        try:
+            return run_worker(
+                options.config,
+                options.authority,
+                options.candidate_parent,
+                options.request,
+                run_id=options.run_id,
+                generation=options.generation,
+            )
+        except (OSError, ValueError):
+            return 2
     try:
         if options.command == "propose":
             result = write_proposal(options.config, options.output)
-        elif options.command == "finalize":
+        else:
             result = finalize_candidate(
                 options.config,
                 options.authority,
                 options.candidate_parent,
                 options.request,
             )
-        else:
-            result = admit_candidate(options.config, options.request)
     except (
         BundleExportError,
         DatasetIntegrityError,

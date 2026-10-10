@@ -1,6 +1,9 @@
 //! Local directory layout and capability-confined artifact publication.
 
 mod catalog;
+mod decisions;
+mod jobs;
+mod sqlite;
 
 use std::{
     fmt,
@@ -13,16 +16,22 @@ use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt as _};
 use cap_std::fs::{Dir, OpenOptions};
 use thiserror::Error;
 
+use crate::input::{ControlledImportInputRoot, InputFileError};
 use crate::journal::ParentDirectorySync;
 use crate::{
     JournalError, JournalReader, JournalSinkConstructionError, JournalSinkLimits, JournalWriter,
+    SealedResearchJournalStore, SealedResearchJournalStoreError,
 };
 
-use self::catalog::open_prepared_root;
 pub use self::catalog::{
     CatalogFileGuard, CatalogLocation, CatalogRestoreScanGuard, CatalogWriterGuard,
 };
 pub use self::catalog::{CatalogRestoreStage, CatalogRestoreTarget, InstalledCatalogFile};
+pub use self::decisions::{
+    DecisionDatabaseFileGuard, DecisionDatabaseLocation, DecisionDatabaseWriterGuard,
+};
+pub use self::jobs::{JobDatabaseFileGuard, JobDatabaseLocation, JobDatabaseWriterGuard};
+use self::sqlite::open_prepared_root;
 
 const MAX_ARTIFACT_COMPONENT_BYTES: usize = 255;
 const MAX_ARTIFACT_DEPTH: usize = 32;
@@ -58,6 +67,12 @@ pub enum PathError {
     /// Another process owns the prepared catalog writer lock.
     #[error("prepared catalog already has an active writer")]
     CatalogAlreadyLocked,
+    /// Another process owns the prepared job-database writer lock.
+    #[error("prepared job database already has an active writer")]
+    JobDatabaseAlreadyLocked,
+    /// Another process owns the prepared decision-database writer lock.
+    #[error("prepared decision database already has an active writer")]
+    DecisionDatabaseAlreadyLocked,
     /// A catalog restore stage or final target contains different immutable bytes.
     #[error("prepared catalog restore target conflicts with retained state")]
     CatalogRestoreConflict,
@@ -229,6 +244,25 @@ impl ArtifactRoot {
             return Err(PathError::PreparedRootChanged);
         }
         Ok(directory)
+    }
+
+    /// Opens one existing controlled-import directory beneath this retained artifact root.
+    ///
+    /// The relative directory chain is bounded and every component is opened relative to the
+    /// preceding retained handle with no-follow semantics. The result retains this artifact-root
+    /// authority and the exact component identities for revalidation before every file operation.
+    /// It is deliberately distinct from a user-authorized input root and cannot issue original
+    /// local-ownership evidence.
+    ///
+    /// # Errors
+    ///
+    /// Rejects empty, absolute, parent-traversing, over-deep, symlinked, reparsed, replaced, or
+    /// non-directory references and path-redacted capability failures.
+    pub fn open_controlled_import_root(
+        &self,
+        relative: impl AsRef<Path>,
+    ) -> Result<ControlledImportInputRoot, InputFileError> {
+        ControlledImportInputRoot::open_beneath_artifact_root(self, relative.as_ref())
     }
 
     /// Validates a canonical portable reference and binds it to this open directory capability.
@@ -725,6 +759,21 @@ impl LocalPaths {
         source: &str,
     ) -> Result<JournalWriter, JournalSinkConstructionError> {
         self.open_journal_writer_with_limits(source, JournalSinkLimits::standard())
+    }
+
+    /// Opens the single-owner sealed research-segment authority under the prepared journal root.
+    ///
+    /// The returned store retains an exclusive cross-process owner lock. Construct it once during
+    /// application composition and share that owner; a live append journal remains a separate,
+    /// non-authoritative diagnostic sink.
+    pub fn sealed_research_journal_store(
+        &self,
+    ) -> Result<SealedResearchJournalStore, SealedResearchJournalStoreError> {
+        let directory = self
+            .journal_capability
+            .as_ref()
+            .ok_or(SealedResearchJournalStoreError::PreparedCapabilityRequired)?;
+        SealedResearchJournalStore::try_from_journal_directory(Arc::clone(directory))
     }
 
     /// Opens a current journal under explicit, separate fixed sink limits.

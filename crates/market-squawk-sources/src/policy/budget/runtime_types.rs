@@ -80,7 +80,7 @@ pub enum BudgetUnavailableReason {
 /// Atomic dispatch outcome for one shared provider/account budget.
 #[derive(Debug)]
 pub enum BudgetDecision {
-    /// A request slot was atomically reserved until this permit is dropped.
+    /// A response-control operation unexpectedly produced a request permit.
     Ready(BudgetPermit),
     /// Dispatch must wait until the inclusive instant is reached.
     WaitUntil(MonotonicInstant),
@@ -88,13 +88,32 @@ pub enum BudgetDecision {
     Unavailable(BudgetUnavailableReason),
 }
 
+/// Concurrency-reservation outcome before any provider request window is charged.
+#[derive(Debug)]
+pub enum BudgetReservationDecision {
+    /// Concurrency is reserved; the request must still commit at the transport dispatch boundary.
+    Ready(BudgetReservation),
+    /// Reservation must wait until the inclusive instant is reached.
+    WaitUntil(MonotonicInstant),
+    /// Reservation is unavailable without an external state change.
+    Unavailable(BudgetUnavailableReason),
+}
+
+/// Dispatch outcome after consuming one exact concurrency reservation.
+#[derive(Debug)]
+pub enum BudgetDispatchDecision {
+    /// Request windows are durably charged and the permit must span response classification.
+    Ready(BudgetPermit),
+    /// No request was charged; retry at or after the inclusive instant.
+    WaitUntil(MonotonicInstant),
+    /// No request was charged and progress requires an external state change.
+    Unavailable(BudgetUnavailableReason),
+}
+
 #[derive(Debug)]
 pub(in crate::policy) struct BudgetState {
-    pub(in crate::policy) window_started_at: MonotonicInstant,
-    pub(in crate::policy) restored_window_ends_at: Option<MonotonicInstant>,
-    pub(in crate::policy) requests_used: u32,
-    pub(in crate::policy) primary_sliding_releases: VecDeque<MonotonicInstant>,
-    pub(in crate::policy) additional_windows: Vec<BudgetWindowRuntimeState>,
+    pub(in crate::policy) windows: Vec<BudgetWindowRuntimeState>,
+    pub(in crate::policy) last_observed_at: MonotonicInstant,
     pub(in crate::policy) in_flight: u16,
     pub(in crate::policy) unavailable_until: Option<MonotonicInstant>,
     pub(in crate::policy) disabled: bool,
@@ -131,19 +150,25 @@ impl BudgetState {
         policy: &ProviderBudgetPolicy,
         starts_at: MonotonicInstant,
     ) -> Self {
-        let additional_windows = policy
+        let windows = policy
             .windows()
-            .skip(1)
             .map(|window| BudgetWindowRuntimeState::new(window, starts_at))
             .collect();
         Self {
-            window_started_at: starts_at,
-            restored_window_ends_at: None,
-            requests_used: 0,
-            primary_sliding_releases: policy
-                .window(0)
-                .map_or_else(VecDeque::new, preallocated_sliding_releases),
-            additional_windows,
+            windows,
+            last_observed_at: starts_at,
+            in_flight: 0,
+            unavailable_until: None,
+            disabled: false,
+            consecutive_refusals: 0,
+        }
+    }
+
+    // Provider-backed allocations retain ownership only; no local quota storage is allocated.
+    pub(in crate::policy) fn provider_owned(starts_at: MonotonicInstant) -> Self {
+        Self {
+            windows: Vec::new(),
+            last_observed_at: starts_at,
             in_flight: 0,
             unavailable_until: None,
             disabled: false,
@@ -152,19 +177,13 @@ impl BudgetState {
     }
 
     pub(in crate::policy) fn dynamic_retained_bytes(&self) -> Option<usize> {
-        let primary = self
-            .primary_sliding_releases
-            .capacity()
-            .checked_mul(std::mem::size_of::<MonotonicInstant>())?;
         let windows = self
-            .additional_windows
+            .windows
             .capacity()
             .checked_mul(std::mem::size_of::<BudgetWindowRuntimeState>())?;
-        self.additional_windows
-            .iter()
-            .try_fold(primary.checked_add(windows)?, |bytes, window| {
-                bytes.checked_add(window.dynamic_retained_bytes()?)
-            })
+        self.windows.iter().try_fold(windows, |bytes, window| {
+            bytes.checked_add(window.dynamic_retained_bytes()?)
+        })
     }
 }
 
@@ -179,10 +198,13 @@ fn preallocated_sliding_releases(window: ProviderBudgetWindow) -> VecDeque<Monot
 }
 
 pub(in crate::policy) struct BudgetAllocation {
+    pub(in crate::policy) admission: Arc<crate::policy::provider_rate::admission::RequestAdmission>,
     pub(in crate::policy) policy: ProviderBudgetPolicy,
     pub(in crate::policy) state: Mutex<BudgetState>,
     pub(in crate::policy) clock: Arc<dyn BudgetClock>,
     pub(in crate::policy) availability_generation: AtomicU64,
+    // Process-local revocation for established transports; request capacity is separate.
+    pub(in crate::policy) transport_generation: AtomicU64,
     pub(in crate::policy) terminal: AtomicBool,
     pub(in crate::policy) durability: Option<BudgetDurabilityBinding>,
     pub(in crate::policy) provider_rate: Option<ProviderRateBinding>,
@@ -191,7 +213,7 @@ pub(in crate::policy) struct BudgetAllocation {
 #[derive(Clone)]
 pub(in crate::policy) struct BudgetDurabilityBinding {
     pub(in crate::policy) session: Arc<AuthorityDurabilitySession>,
-    pub(in crate::policy) slot: usize,
+    pub(in crate::policy) slot: Option<usize>,
 }
 
 impl std::fmt::Debug for BudgetDurabilityBinding {

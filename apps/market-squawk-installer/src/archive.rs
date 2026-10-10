@@ -11,8 +11,7 @@ use thiserror::Error;
 use zip::{CompressionMethod, ZipArchive};
 
 use crate::manifest::{
-    ArtifactIdentity, ComponentIdentity, ComponentRole, MAXIMUM_ARCHIVE_ENTRIES,
-    MAXIMUM_EXPANDED_BYTES, TargetRelease,
+    ArtifactIdentity, ComponentIdentity, ComponentRole, MAXIMUM_ARCHIVE_ENTRIES, TargetRelease,
 };
 
 const HASH_BUFFER_BYTES: usize = 64 * 1024;
@@ -217,8 +216,7 @@ fn inspect_archive(
         expanded = expanded
             .checked_add(entry.size())
             .ok_or(ArchiveError::SizeOverflow)?;
-        if expanded > MAXIMUM_EXPANDED_BYTES
-            || !portable_paths.insert(raw_name.to_ascii_lowercase())
+        if !portable_paths.insert(raw_name.to_ascii_lowercase())
             || indexes.insert(raw_name.into(), index).is_some()
         {
             return Err(ArchiveError::EntrySet);
@@ -510,7 +508,7 @@ pub enum ArchiveError {
     ComponentSize,
     #[error("release component identity does not match the manifest: {path}")]
     ComponentIdentity { path: Box<str> },
-    #[error("release archive or installed tree exceeds its fixed size bound")]
+    #[error("release archive or installed tree exceeds its declared size")]
     SizeLimit,
     #[error("release archive size arithmetic overflowed")]
     SizeOverflow,

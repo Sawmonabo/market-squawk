@@ -97,6 +97,19 @@ impl QueryLimitsWire {
         })
     }
 
+    /// Study-only output budget is derived from this request's existing worker and retained
+    /// limits. Generic query caps and default worker memory are unchanged.
+    pub(super) fn for_study(mut self, retained_bytes: usize) -> Result<Self, RecipeError> {
+        self.max_bytes = self
+            .max_memory_bytes
+            .checked_div(2)
+            .ok_or(RecipeError::Invalid)?
+            .min(u64::try_from(retained_bytes).map_err(|_| RecipeError::Invalid)? / 2)
+            .min(128 * 1024 * 1024);
+        self.build()?;
+        Ok(self)
+    }
+
     pub(super) const fn max_bytes(self) -> u64 {
         self.max_bytes
     }
@@ -390,6 +403,13 @@ impl ExperimentWire {
         })
     }
 
+    /// True only when selected parameters may differ while the exact search and selection design
+    /// remains shared by every independently materialized cohort member.
+    pub(super) fn same_design(&self, other: &Self) -> bool {
+        self.search_space == other.search_space
+            && self.selection_criterion == other.selection_criterion
+    }
+
     fn validate(&self) -> Result<(), RecipeError> {
         if self.parameters.len() > MAX_EXPERIMENT_PARAMETERS
             || self.search_space.len() > MAX_SEARCH_DIMENSIONS
@@ -446,9 +466,9 @@ impl ExperimentWire {
 
 #[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-struct ParameterWire {
-    name: SourceIdentifier,
-    value: SourceIdentifier,
+pub(super) struct ParameterWire {
+    pub(super) name: SourceIdentifier,
+    pub(super) value: SourceIdentifier,
 }
 
 impl From<TrialParameter> for ParameterWire {
@@ -457,6 +477,12 @@ impl From<TrialParameter> for ParameterWire {
             name: value.name().clone(),
             value: value.value().clone(),
         }
+    }
+}
+
+impl ParameterWire {
+    pub(super) fn into_trial_parameter(self) -> TrialParameter {
+        TrialParameter::new(self.name, self.value)
     }
 }
 

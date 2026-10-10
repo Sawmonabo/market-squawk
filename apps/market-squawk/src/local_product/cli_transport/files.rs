@@ -108,7 +108,7 @@ pub(super) async fn ingest_local_file(
         "sourceCoverage": [provider],
     }))?;
     let discovery = invoke(
-        product,
+        super::CliAuthority::Local(product),
         "Source.Discover",
         &mut discovery_arguments,
         None,
@@ -153,7 +153,7 @@ pub(super) async fn ingest_local_file(
         "sourceCoverage": [provider],
     }))?;
     invoke(
-        product,
+        super::CliAuthority::Local(product),
         "Research.IngestSource",
         &mut arguments,
         None,

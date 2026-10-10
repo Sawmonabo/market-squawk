@@ -231,6 +231,7 @@ impl<'de> Deserialize<'de> for BackoffPolicy {
 pub(in crate::policy) const MAX_PROVIDER_BUDGET_WINDOWS: usize = 4;
 const MAX_ADDITIONAL_PROVIDER_BUDGET_WINDOWS: usize = MAX_PROVIDER_BUDGET_WINDOWS - 1;
 pub(in crate::policy) const MAX_SLIDING_WINDOW_RELEASES: usize = 4_096;
+pub(in crate::policy) const MAX_PROVIDER_WEIGHTED_WINDOWS: usize = 8;
 
 /// Whether a provider request limit resets as a fixed interval or rolls per request.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -330,13 +331,13 @@ fn no_additional_budget_windows(
     windows.is_empty()
 }
 
-/// Published request-window and local concurrency limits for one shared scope.
+/// Numeric request capacity, when known, and local concurrency for one shared scope.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ProviderBudgetPolicy {
     scope: BudgetScope,
-    requests_per_window: NonZeroU32,
-    window_nanos: NonZeroU64,
+    requests_per_window: Option<NonZeroU32>,
+    window_nanos: Option<NonZeroU64>,
     max_concurrent: NonZeroU16,
     backoff: BackoffPolicy,
     #[serde(
@@ -349,9 +350,33 @@ pub struct ProviderBudgetPolicy {
         skip_serializing_if = "no_additional_budget_windows"
     )]
     additional_windows: BoundedVec<ProviderBudgetWindow, MAX_ADDITIONAL_PROVIDER_BUDGET_WINDOWS>,
+    weighted_windows: BoundedVec<crate::ProviderRateWeightedWindow, MAX_PROVIDER_WEIGHTED_WINDOWS>,
 }
 
 impl ProviderBudgetPolicy {
+    /// Constructs a policy without an asserted numeric request quota.
+    ///
+    /// Concurrency, provider refusal backoff and Retry-After remain enforced. This does not
+    /// assert unlimited provider capacity; it records that no numeric window is known.
+    pub fn try_new_unknown_capacity(
+        scope: BudgetScope,
+        max_concurrent: NonZeroU16,
+        backoff: BackoffPolicy,
+    ) -> Result<Self, NetworkPolicyError> {
+        Ok(Self {
+            scope,
+            requests_per_window: None,
+            window_nanos: None,
+            max_concurrent,
+            backoff,
+            window_semantics: BudgetWindowSemantics::Tumbling,
+            additional_windows: BoundedVec::try_new(Vec::new())
+                .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?,
+            weighted_windows: BoundedVec::try_new(Vec::new())
+                .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?,
+        })
+    }
+
     /// Constructs a provider budget with no alternate identity, endpoint, or shard policy.
     pub fn try_new(
         scope: BudgetScope,
@@ -387,7 +412,32 @@ impl ProviderBudgetPolicy {
         max_concurrent: NonZeroU16,
         backoff: BackoffPolicy,
     ) -> Result<Self, NetworkPolicyError> {
+        Self::try_new_weighted_conjunctive(scope, windows, &[], max_concurrent, backoff)
+    }
+
+    /// Constructs a canonical conjunction of request and weighted response windows.
+    ///
+    /// Request windows are ordered by duration. Weighted windows are ordered by dimension and
+    /// duration. Duplicate request durations or duplicate weighted dimension/duration pairs are
+    /// rejected. Dispatch against a policy containing weighted windows must reserve an exact
+    /// worst-case response claim and terminalize the resulting permit once.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`NetworkPolicyError::InvalidBudgetPolicy`] for the request-window failures
+    /// documented by [`Self::try_new_conjunctive`], an oversized weighted conjunction, or a
+    /// duplicate/unrepresentable weighted window.
+    pub fn try_new_weighted_conjunctive(
+        scope: BudgetScope,
+        windows: &[ProviderBudgetWindow],
+        weighted_windows: &[crate::ProviderRateWeightedWindow],
+        max_concurrent: NonZeroU16,
+        backoff: BackoffPolicy,
+    ) -> Result<Self, NetworkPolicyError> {
         if windows.is_empty() || windows.len() > MAX_PROVIDER_BUDGET_WINDOWS {
+            return Err(NetworkPolicyError::InvalidBudgetPolicy);
+        }
+        if weighted_windows.len() > MAX_PROVIDER_WEIGHTED_WINDOWS {
             return Err(NetworkPolicyError::InvalidBudgetPolicy);
         }
         let mut canonical = Vec::new();
@@ -428,14 +478,33 @@ impl ProviderBudgetPolicy {
         additional.extend(canonical);
         let additional_windows =
             BoundedVec::try_new(additional).map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?;
+        let mut canonical_weighted = Vec::new();
+        canonical_weighted
+            .try_reserve(weighted_windows.len())
+            .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?;
+        canonical_weighted.extend_from_slice(weighted_windows);
+        canonical_weighted
+            .sort_unstable_by_key(|window| (window.dimension(), window.window_nanos()));
+        if canonical_weighted
+            .iter()
+            .zip(canonical_weighted.iter().skip(1))
+            .any(|(left, right)| {
+                left.dimension() == right.dimension() && left.window_nanos() == right.window_nanos()
+            })
+        {
+            return Err(NetworkPolicyError::InvalidBudgetPolicy);
+        }
+        let weighted_windows = BoundedVec::try_new(canonical_weighted)
+            .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)?;
         Ok(Self {
             scope,
-            requests_per_window: primary.requests_per_window,
-            window_nanos: primary.window_nanos,
+            requests_per_window: Some(primary.requests_per_window),
+            window_nanos: Some(primary.window_nanos),
             max_concurrent,
             backoff,
             window_semantics: primary.semantics,
             additional_windows,
+            weighted_windows,
         })
     }
 
@@ -444,40 +513,76 @@ impl ProviderBudgetPolicy {
         &self.scope
     }
 
-    /// Returns the maximum number of requests accepted in one window.
-    pub const fn requests_per_window(&self) -> u32 {
-        self.requests_per_window.get()
+    /// Returns the first numeric request limit, or `None` when capacity is unknown.
+    pub fn requests_per_window(&self) -> Option<u32> {
+        self.requests_per_window.map(NonZeroU32::get)
     }
 
-    /// Returns the request-window duration in nanoseconds.
-    pub const fn window_nanos(&self) -> u64 {
-        self.window_nanos.get()
+    /// Returns the first request-window duration, or `None` when capacity is unknown.
+    pub fn window_nanos(&self) -> Option<u64> {
+        self.window_nanos.map(NonZeroU64::get)
     }
 
     /// Returns the number of conjunctive request windows.
     pub fn window_count(&self) -> usize {
-        self.additional_windows.len() + 1
+        self.additional_windows.len() + usize::from(self.requests_per_window.is_some())
     }
 
     /// Returns a canonical request window by ascending duration.
     pub fn window(&self, index: usize) -> Option<ProviderBudgetWindow> {
         if index == 0 {
-            return Some(self.primary_window());
+            return self.primary_window();
         }
         self.additional_windows.as_slice().get(index - 1).copied()
     }
 
     pub(in crate::policy) fn windows(&self) -> impl Iterator<Item = ProviderBudgetWindow> + '_ {
-        std::iter::once(self.primary_window())
+        self.primary_window()
+            .into_iter()
             .chain(self.additional_windows.as_slice().iter().copied())
     }
 
-    const fn primary_window(&self) -> ProviderBudgetWindow {
-        ProviderBudgetWindow {
-            requests_per_window: self.requests_per_window,
-            window_nanos: self.window_nanos,
+    /// Returns the number of conjunctive weighted response windows.
+    pub fn weighted_window_count(&self) -> usize {
+        self.weighted_windows.len()
+    }
+
+    /// Returns one canonical weighted response window.
+    pub fn weighted_window(&self, index: usize) -> Option<crate::ProviderRateWeightedWindow> {
+        self.weighted_windows.as_slice().get(index).copied()
+    }
+
+    pub(in crate::policy) fn weighted_windows(
+        &self,
+    ) -> impl Iterator<Item = crate::ProviderRateWeightedWindow> + '_ {
+        self.weighted_windows.as_slice().iter().copied()
+    }
+
+    pub(in crate::policy) fn has_weighted_windows(&self) -> bool {
+        !self.weighted_windows.is_empty()
+    }
+
+    pub(in crate::policy) fn dispatch_claim(
+        &self,
+        maximum_response_bytes: NonZeroU64,
+    ) -> Result<crate::ProviderRateDispatchClaim, NetworkPolicyError> {
+        let response_bytes = self
+            .weighted_windows()
+            .any(|window| window.dimension() == crate::ProviderRateWeightedDimension::ResponseBytes)
+            .then_some(maximum_response_bytes);
+        let provider_error_units = u8::from(self.weighted_windows().any(|window| {
+            window.dimension() == crate::ProviderRateWeightedDimension::ProviderErrors
+        }));
+        crate::ProviderRateDispatchClaim::try_new(response_bytes, provider_error_units)
+            .map_err(|_| NetworkPolicyError::InvalidBudgetPolicy)
+    }
+
+    fn primary_window(&self) -> Option<ProviderBudgetWindow> {
+        Some(ProviderBudgetWindow {
+            requests_per_window: self.requests_per_window?,
+            window_nanos: self.window_nanos?,
             semantics: self.window_semantics,
-        }
+        })
     }
 
     /// Returns the maximum number of requests concurrently in flight.
@@ -505,6 +610,21 @@ impl ProviderBudgetPolicy {
         Ok(qualified)
     }
 
+    pub(in crate::policy) fn with_request_concurrency(
+        &self,
+        max_concurrent: NonZeroU16,
+    ) -> Result<Self, NetworkPolicyError> {
+        if self
+            .windows()
+            .any(|window| u32::from(max_concurrent.get()) > window.requests_per_window())
+        {
+            return Err(NetworkPolicyError::InvalidBudgetPolicy);
+        }
+        let mut policy = self.clone();
+        policy.max_concurrent = max_concurrent;
+        Ok(policy)
+    }
+
     pub(crate) fn has_same_limits_as(&self, other: &Self) -> bool {
         self.requests_per_window == other.requests_per_window
             && self.window_nanos == other.window_nanos
@@ -512,6 +632,7 @@ impl ProviderBudgetPolicy {
             && self.backoff == other.backoff
             && self.window_semantics == other.window_semantics
             && self.additional_windows == other.additional_windows
+            && self.weighted_windows == other.weighted_windows
     }
 
     pub(in crate::policy) fn dynamic_retained_bytes(&self) -> Option<usize> {
@@ -523,12 +644,18 @@ impl ProviderBudgetPolicy {
             backoff,
             window_semantics: _,
             additional_windows,
+            weighted_windows,
         } = self;
         scope
             .dynamic_retained_bytes()?
             .checked_add(backoff.dynamic_retained_bytes()?)
             .and_then(|bytes| {
                 additional_windows
+                    .checked_allocation_bytes()
+                    .and_then(|windows| bytes.checked_add(windows))
+            })
+            .and_then(|bytes| {
+                weighted_windows
                     .checked_allocation_bytes()
                     .and_then(|windows| bytes.checked_add(windows))
             })
@@ -539,14 +666,26 @@ impl ProviderBudgetPolicy {
 #[serde(deny_unknown_fields)]
 struct ProviderBudgetPolicyWire {
     scope: BudgetScope,
-    requests_per_window: NonZeroU32,
-    window_nanos: NonZeroU64,
+    #[serde(deserialize_with = "deserialize_explicit_capacity")]
+    requests_per_window: Option<NonZeroU32>,
+    #[serde(deserialize_with = "deserialize_explicit_capacity")]
+    window_nanos: Option<NonZeroU64>,
     max_concurrent: NonZeroU16,
     backoff: BackoffPolicy,
     #[serde(default = "default_window_semantics")]
     window_semantics: BudgetWindowSemantics,
     #[serde(default = "empty_additional_budget_windows")]
     additional_windows: BoundedVec<ProviderBudgetWindow, MAX_ADDITIONAL_PROVIDER_BUDGET_WINDOWS>,
+    weighted_windows: BoundedVec<crate::ProviderRateWeightedWindow, MAX_PROVIDER_WEIGHTED_WINDOWS>,
+}
+
+// Missing fields are malformed policy evidence; explicit null records unknown capacity.
+fn deserialize_explicit_capacity<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 impl<'de> Deserialize<'de> for ProviderBudgetPolicy {
@@ -555,21 +694,44 @@ impl<'de> Deserialize<'de> for ProviderBudgetPolicy {
         D: Deserializer<'de>,
     {
         let wire = ProviderBudgetPolicyWire::deserialize(deserializer)?;
+        let (requests_per_window, window_nanos) =
+            match (wire.requests_per_window, wire.window_nanos) {
+                (Some(requests), Some(duration)) => (requests, duration),
+                (None, None)
+                    if wire.additional_windows.is_empty()
+                        && wire.weighted_windows.is_empty()
+                        && wire.window_semantics == BudgetWindowSemantics::Tumbling =>
+                {
+                    return Self::try_new_unknown_capacity(
+                        wire.scope,
+                        wire.max_concurrent,
+                        wire.backoff,
+                    )
+                    .map_err(serde::de::Error::custom);
+                }
+                _ => {
+                    return Err(serde::de::Error::custom(
+                        NetworkPolicyError::InvalidBudgetPolicy,
+                    ));
+                }
+            };
         let mut windows = Vec::new();
         windows
             .try_reserve(wire.additional_windows.len() + 1)
             .map_err(|_| serde::de::Error::custom(NetworkPolicyError::InvalidBudgetPolicy))?;
         windows.push(
-            ProviderBudgetWindow::try_new(
-                wire.requests_per_window,
-                wire.window_nanos,
-                wire.window_semantics,
-            )
-            .map_err(serde::de::Error::custom)?,
+            ProviderBudgetWindow::try_new(requests_per_window, window_nanos, wire.window_semantics)
+                .map_err(serde::de::Error::custom)?,
         );
         windows.extend(wire.additional_windows.into_vec());
-        Self::try_new_conjunctive(wire.scope, &windows, wire.max_concurrent, wire.backoff)
-            .map_err(serde::de::Error::custom)
+        Self::try_new_weighted_conjunctive(
+            wire.scope,
+            &windows,
+            wire.weighted_windows.as_slice(),
+            wire.max_concurrent,
+            wire.backoff,
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 

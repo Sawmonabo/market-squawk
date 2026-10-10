@@ -87,17 +87,8 @@ run_policy() {
   python3 scripts/check_workspace_boundaries.py
   python3 scripts/check_generated_artifacts.py
   cargo deny check
-  # The exact exceptions, upstream constraints, and refresh gates are documented in deny.toml.
   cargo audit --deny warnings \
     --ignore RUSTSEC-2024-0370 \
-    --ignore RUSTSEC-2024-0411 \
-    --ignore RUSTSEC-2024-0412 \
-    --ignore RUSTSEC-2024-0413 \
-    --ignore RUSTSEC-2024-0415 \
-    --ignore RUSTSEC-2024-0416 \
-    --ignore RUSTSEC-2024-0418 \
-    --ignore RUSTSEC-2024-0419 \
-    --ignore RUSTSEC-2024-0420 \
     --ignore RUSTSEC-2024-0436 \
     --ignore RUSTSEC-2025-0075 \
     --ignore RUSTSEC-2025-0080 \

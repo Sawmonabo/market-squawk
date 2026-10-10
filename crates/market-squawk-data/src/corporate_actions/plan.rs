@@ -22,7 +22,8 @@ impl CorporateActionPlan {
     /// Builds one bounded immutable plan from source records and two independent cutoffs.
     ///
     /// An action is admitted only when conservative availability is no later than
-    /// `knowledge_cutoff` and its exact effective instant is no later than `valuation_cutoff`.
+    /// `knowledge_cutoff` and its exact source instant or separately retained daily application boundary is no later than
+    /// `valuation_cutoff`.
     /// Raw records are moved into the result unchanged; adjustment steps refer to their canonical
     /// admitted index and never mutate source evidence.
     ///
@@ -108,6 +109,7 @@ impl CorporateActionPlan {
         )?;
         require_retained_limit(retained_bytes, limits.max_retained_bytes.get())?;
         Ok(Self {
+            source_coverage: None,
             policy,
             knowledge_cutoff,
             valuation_cutoff,
@@ -148,13 +150,13 @@ pub(super) fn exclusion_reason(
         AvailabilityEvidence::Evidenced { .. }
         | AvailabilityEvidence::LocalFirstObserved { .. } => {}
     }
-    let Some(effective_at) = record
-        .observation
-        .context()
-        .time()
-        .effective()
-        .exact_timestamp()
-    else {
+    if record
+        .application()
+        .is_some_and(|application| application.available_at() > knowledge_cutoff)
+    {
+        return Some(CorporateActionExclusionReason::FutureAvailability);
+    }
+    let Some(effective_at) = record.application_at() else {
         return Some(CorporateActionExclusionReason::AmbiguousEffectiveTime);
     };
     if effective_at > valuation_cutoff {

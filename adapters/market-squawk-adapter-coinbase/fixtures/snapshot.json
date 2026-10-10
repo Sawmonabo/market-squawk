@@ -1,1 +1,1 @@
-{"type":"snapshot","product_id":"BTC-USD","bids":[["100.10","1.2500"]],"asks":[["100.20","2.5000"]]}
+{"channel":"l2_data","client_id":"","timestamp":"2026-08-08T12:00:00.123456Z","sequence_num":0,"events":[{"type":"snapshot","product_id":"BTC-USD","updates":[{"side":"bid","event_time":"2026-08-08T12:00:00.123456Z","price_level":"100.10","new_quantity":"1.2500"},{"side":"offer","event_time":"2026-08-08T12:00:00.123456Z","price_level":"100.20","new_quantity":"2.5000"}]}]}

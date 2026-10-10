@@ -48,7 +48,7 @@ class VisualizationAndExamplesContracts(unittest.TestCase):
                 namespace = runpy.run_path(
                     str(ROOT / "python" / "examples" / "pit_research.py")
                 )
-                self.assertEqual(namespace["RESULT"]["rows"], 2)
+                self.assertEqual(namespace["RESULT"]["rows"], 1)
 
                 notebook = json.loads(
                     (ROOT / "python" / "examples" / "pit_research.ipynb").read_text()
@@ -57,7 +57,7 @@ class VisualizationAndExamplesContracts(unittest.TestCase):
                 for cell in notebook["cells"]:
                     if cell["cell_type"] == "code":
                         exec("".join(cell["source"]), scope, scope)
-                self.assertEqual(scope["RESULT"]["rows"], 2)
+                self.assertEqual(scope["RESULT"]["rows"], 1)
 
 
 if __name__ == "__main__":

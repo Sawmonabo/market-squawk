@@ -1,7 +1,8 @@
-//! Independent verification of the installed Python training release authority.
+//! Explicit source development provenance and installed Python release verification.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fs::{self, File, Metadata};
+use std::hash::{DefaultHasher, Hash as _, Hasher as _};
 use std::io::Read as _;
 use std::path::{Component, Path, PathBuf};
 
@@ -16,22 +17,23 @@ const ENVIRONMENT_RECEIPT: &str = "share/market-squawk/training-environment.json
 const RELEASE_MANIFEST: &str = "share/market-squawk/market-squawk-release.json";
 const MAX_AUTHORITY_BYTES: u64 = 16 * 1024;
 const MAX_RECORD_BYTES: u64 = 2 * 1024 * 1024;
-const MAX_DISTRIBUTION_FILE_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_APPLICATION_EXECUTABLE_BYTES: u64 = 768 * 1024 * 1024;
-const MAX_ONNX_WORKER_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_VALIDATOR_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
-const MAX_TRAINING_LAUNCHER_BYTES: u64 = 32 * 1024 * 1024;
-const MAX_DISTRIBUTION_BYTES: u64 = 1024 * 1024 * 1024;
-const MAX_DISTRIBUTION_FILES: usize = 8_192;
+const MAX_DISTRIBUTION_FILES: usize = 16_384;
+const MAX_DISTRIBUTION_EXTERNAL_PATHS: usize = 256;
 const MAX_DISTRIBUTION_ROOTS: usize = 64;
 const MAX_RUNTIME_DISTRIBUTIONS: usize = 32;
 const RECORD_SET_DOMAIN: &[u8] = b"market-squawk-record-set-v1\0";
 const RELEASE_MANIFEST_DOMAIN: &[u8] = b"market-squawk-release-manifest-v1\0";
-const ENVIRONMENT_RECEIPT_DOMAIN: &[u8] = b"market-squawk-training-environment-v1\0";
+const ENVIRONMENT_RECEIPT_DOMAIN: &[u8] = b"market-squawk-training-environment-v2\0";
 
 /// Installed training-release verification failed closed.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum TrainingEnvironmentError {
+    /// The owning operation was cancelled before verification completed.
+    #[error("training environment verification was cancelled")]
+    Cancelled,
+    /// The owning operation exhausted its original deadline.
+    #[error("training environment verification deadline elapsed")]
+    DeadlineExceeded,
     /// The build-time foundation is absent, malformed, or non-canonical.
     #[error("embedded training foundation is invalid")]
     EmbeddedFoundation,
@@ -50,6 +52,341 @@ pub enum TrainingEnvironmentError {
     /// The active interpreter, extension, or validator is not the admitted release object.
     #[error("active training runtime differs from the admitted release")]
     RuntimeWitness,
+    /// Source development metadata is missing, malformed, or inconsistent.
+    #[error("source development training environment is invalid; refresh the managed environment")]
+    SourceDevelopment,
+}
+
+/// Origin of training provenance; source metadata does not attest software bytes.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TrainingEnvironmentOrigin {
+    /// Editable project and managed dependencies selected explicitly by development setup.
+    SourceDevelopment,
+    /// Signed installed release provenance.
+    InstalledRelease,
+}
+
+/// Provenance coordinates used to bind a training recipe before execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TrainingEnvironmentIdentity {
+    origin: TrainingEnvironmentOrigin,
+    receipt_sha256: [u8; 32],
+    training_code_revision: Box<str>,
+}
+
+impl TrainingEnvironmentIdentity {
+    /// Reads the same signed receipt and manifest used by full environment verification.
+    ///
+    /// # Errors
+    /// Fails on an untrusted root, signature, foundation, receipt, manifest or caller control.
+    pub fn read_controlled(
+        root: &Path,
+        check: &dyn Fn() -> Result<(), TrainingEnvironmentError>,
+    ) -> Result<Self, TrainingEnvironmentError> {
+        let authority = verify_installed_authority(root, check)?;
+        check()?;
+        Ok(Self {
+            origin: TrainingEnvironmentOrigin::InstalledRelease,
+            receipt_sha256: authority.receipt_sha256,
+            training_code_revision: authority.environment.training_code_revision.into(),
+        })
+    }
+
+    /// Returns the metadata identity; source metadata is not software attestation.
+    #[must_use]
+    pub const fn receipt_sha256(&self) -> [u8; 32] {
+        self.receipt_sha256
+    }
+
+    /// Returns the recorded revision used by the prepared recipe.
+    #[must_use]
+    pub fn training_code_revision(&self) -> &str {
+        &self.training_code_revision
+    }
+
+    /// Returns whether these coordinates describe editable source or an installed release.
+    #[must_use]
+    pub const fn origin(&self) -> TrainingEnvironmentOrigin {
+        self.origin
+    }
+}
+
+/// One explicitly selected environment used by the common training/admission pipeline.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ConfiguredTrainingEnvironment {
+    /// Managed editable source metadata; grants no signed-release claims.
+    SourceDevelopment(SourceDevelopmentEnvironment),
+    /// Independently verified installed release, kept distinct from source metadata.
+    InstalledRelease(VerifiedTrainingEnvironment),
+}
+
+impl From<VerifiedTrainingEnvironment> for ConfiguredTrainingEnvironment {
+    fn from(value: VerifiedTrainingEnvironment) -> Self {
+        Self::InstalledRelease(value)
+    }
+}
+
+impl ConfiguredTrainingEnvironment {
+    /// Opens bounded source metadata without inspecting software contents.
+    ///
+    /// # Errors
+    /// Rejects missing/malformed metadata, invalid configured paths, or caller cancellation.
+    pub fn open_source(
+        root: &Path,
+        check: &dyn Fn() -> Result<(), TrainingEnvironmentError>,
+    ) -> Result<Self, TrainingEnvironmentError> {
+        SourceDevelopmentEnvironment::open(root, check).map(Self::SourceDevelopment)
+    }
+
+    /// Returns common provenance coordinates without manufacturing installed evidence.
+    #[must_use]
+    pub fn identity(&self) -> TrainingEnvironmentIdentity {
+        match self {
+            Self::SourceDevelopment(source) => source.identity.clone(),
+            Self::InstalledRelease(installed) => TrainingEnvironmentIdentity {
+                origin: TrainingEnvironmentOrigin::InstalledRelease,
+                receipt_sha256: installed.receipt_sha256(),
+                training_code_revision: installed.training_code_revision().into(),
+            },
+        }
+    }
+
+    /// Returns a receipt/descriptor metadata identity, not necessarily release attestation.
+    #[must_use]
+    pub fn receipt_sha256(&self) -> [u8; 32] {
+        match self {
+            Self::SourceDevelopment(source) => source.identity.receipt_sha256(),
+            Self::InstalledRelease(installed) => installed.receipt_sha256(),
+        }
+    }
+
+    /// Returns the recorded source revision, explicitly editable for source development.
+    #[must_use]
+    pub fn training_code_revision(&self) -> &str {
+        match self {
+            Self::SourceDevelopment(source) => source.identity.training_code_revision(),
+            Self::InstalledRelease(installed) => installed.training_code_revision(),
+        }
+    }
+
+    /// Returns source configuration only for explicitly selected development.
+    #[must_use]
+    pub const fn source(&self) -> Option<&SourceDevelopmentEnvironment> {
+        match self {
+            Self::SourceDevelopment(source) => Some(source),
+            Self::InstalledRelease(_) => None,
+        }
+    }
+
+    /// Returns actual installed proof only when installed verification occurred.
+    #[must_use]
+    pub const fn installed(&self) -> Option<&VerifiedTrainingEnvironment> {
+        match self {
+            Self::InstalledRelease(installed) => Some(installed),
+            Self::SourceDevelopment(_) => None,
+        }
+    }
+}
+
+/// Bounded metadata for the managed editable environment, never a file-integrity receipt.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SourceDevelopmentEnvironment {
+    root: PathBuf,
+    interpreter: PathBuf,
+    identity: TrainingEnvironmentIdentity,
+    descriptor: SourceDevelopmentWire,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+struct SourceDevelopmentWire {
+    editable: bool,
+    interpreter_relative_path: String,
+    kind: String,
+    native_build_revision: String,
+    onnx_worker: PathBuf,
+    project_version: String,
+    python_tag: String,
+    python_version: String,
+    requirements_lock_sha256: String,
+    runtime_distributions: BTreeMap<String, String>,
+    schema_version: u32,
+    source_revision: String,
+    source_root: PathBuf,
+    validator: PathBuf,
+}
+
+impl SourceDevelopmentEnvironment {
+    fn open(
+        root: &Path,
+        check: &dyn Fn() -> Result<(), TrainingEnvironmentError>,
+    ) -> Result<Self, TrainingEnvironmentError> {
+        check()?;
+        if !root.is_absolute() {
+            return Err(TrainingEnvironmentError::SourceDevelopment);
+        }
+        verify_directory(root)?;
+        let root = canonical(root)?;
+        let metadata = read_controlled(
+            &root,
+            Path::new("source-development.json"),
+            MAX_AUTHORITY_BYTES,
+            false,
+            check,
+        )?;
+        let descriptor: SourceDevelopmentWire = serde_json::from_slice(&metadata.bytes)
+            .map_err(|_| TrainingEnvironmentError::SourceDevelopment)?;
+        let expected_interpreter = if cfg!(windows) {
+            "Scripts/python.exe"
+        } else {
+            "bin/python"
+        };
+        if descriptor.schema_version != 1
+            || descriptor.kind != "source-development"
+            || !descriptor.editable
+            || !descriptor.source_revision.starts_with("development-")
+            || !descriptor.source_revision.ends_with("-editable")
+            || !valid_source_revision(&descriptor.source_revision)
+            || !valid_source_revision(&descriptor.native_build_revision)
+            || !valid_release_version(&descriptor.project_version)
+            || descriptor.python_version != "3.14.6"
+            || descriptor.python_tag != "cp314"
+            || descriptor.interpreter_relative_path != expected_interpreter
+            || !valid_hex(&descriptor.requirements_lock_sha256)
+            || descriptor.runtime_distributions.is_empty()
+            || descriptor.runtime_distributions.len() > MAX_RUNTIME_DISTRIBUTIONS
+            || descriptor
+                .runtime_distributions
+                .iter()
+                .any(|(name, version)| {
+                    !valid_distribution_name(name) || !valid_release_version(version)
+                })
+            || !descriptor.source_root.is_absolute()
+            || !descriptor.onnx_worker.is_absolute()
+            || !descriptor.validator.is_absolute()
+        {
+            return Err(TrainingEnvironmentError::SourceDevelopment);
+        }
+        verify_directory(&descriptor.source_root)?;
+        let interpreter = root.join(&descriptor.interpreter_relative_path);
+        // Preserve the venv invocation path even when uv points it at a managed interpreter.
+        source_program_metadata(&interpreter, true)?;
+        source_program_metadata(&descriptor.onnx_worker, false)?;
+        source_program_metadata(&descriptor.validator, false)?;
+        check()?;
+        // Formatting is not authority. Bind the parsed metadata in a stable key order.
+        let canonical_metadata = serde_json::to_value(&descriptor)
+            .and_then(|value| serde_json::to_vec(&value))
+            .map_err(|_| TrainingEnvironmentError::SourceDevelopment)?;
+        check()?;
+        Ok(Self {
+            root,
+            interpreter,
+            identity: TrainingEnvironmentIdentity {
+                origin: TrainingEnvironmentOrigin::SourceDevelopment,
+                receipt_sha256: hash(&canonical_metadata),
+                training_code_revision: descriptor.source_revision.clone().into(),
+            },
+            descriptor,
+        })
+    }
+
+    /// Managed venv root containing `source-development.json`.
+    #[must_use]
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Managed interpreter invocation path, retaining the venv symlink when present.
+    #[must_use]
+    pub fn interpreter(&self) -> &Path {
+        &self.interpreter
+    }
+
+    /// Editable checkout selected by setup.
+    #[must_use]
+    pub fn source_root(&self) -> &Path {
+        &self.descriptor.source_root
+    }
+
+    /// Explicit native validator from the development build.
+    #[must_use]
+    pub fn validator(&self) -> &Path {
+        &self.descriptor.validator
+    }
+
+    /// Explicit ONNX helper from the development build.
+    #[must_use]
+    pub fn onnx_worker(&self) -> &Path {
+        &self.descriptor.onnx_worker
+    }
+
+    /// Recorded native-extension build revision, separate from editable Python source.
+    #[must_use]
+    pub fn native_build_revision(&self) -> &str {
+        &self.descriptor.native_build_revision
+    }
+
+    /// Expected project/native package version.
+    #[must_use]
+    pub fn project_version(&self) -> &str {
+        &self.descriptor.project_version
+    }
+
+    /// Expected managed interpreter version.
+    #[must_use]
+    pub fn python_version(&self) -> &str {
+        &self.descriptor.python_version
+    }
+
+    /// Expected interpreter compatibility tag.
+    #[must_use]
+    pub fn python_tag(&self) -> &str {
+        &self.descriptor.python_tag
+    }
+
+    /// Lock metadata identity recorded by setup, not a runtime distribution file scan.
+    #[must_use]
+    pub fn requirements_lock_sha256(&self) -> &str {
+        &self.descriptor.requirements_lock_sha256
+    }
+
+    /// Exact normalized distribution versions expected by the native Python witness.
+    #[must_use]
+    pub fn runtime_distributions(&self) -> &BTreeMap<String, String> {
+        &self.descriptor.runtime_distributions
+    }
+}
+
+fn valid_source_revision(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value.bytes().all(|byte| {
+            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.' | b'_')
+        })
+}
+
+fn source_program_metadata(
+    path: &Path,
+    allow_symlink: bool,
+) -> Result<(), TrainingEnvironmentError> {
+    let named =
+        fs::symlink_metadata(path).map_err(|_| TrainingEnvironmentError::SourceDevelopment)?;
+    if named.file_type().is_symlink() && !allow_symlink {
+        return Err(TrainingEnvironmentError::SourceDevelopment);
+    }
+    let metadata = fs::metadata(path).map_err(|_| TrainingEnvironmentError::SourceDevelopment)?;
+    if !metadata.is_file() || metadata.len() == 0 {
+        return Err(TrainingEnvironmentError::SourceDevelopment);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if metadata.permissions().mode() & 0o111 == 0 {
+            return Err(TrainingEnvironmentError::SourceDevelopment);
+        }
+    }
+    Ok(())
 }
 
 /// Independently verified identity of one installed Python training environment.
@@ -63,6 +400,35 @@ pub struct VerifiedTrainingEnvironment {
     python_tag: Box<str>,
     python_version: Box<str>,
     training_code_revision: Box<str>,
+    training_worker: VerifiedTrainingWorkerProgram,
+}
+
+/// Exact installed launcher identity for process-supervised candidate production.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerifiedTrainingWorkerProgram {
+    path: PathBuf,
+    sha256: [u8; 32],
+    size_bytes: u64,
+}
+
+impl VerifiedTrainingWorkerProgram {
+    /// Returns the canonical installed launcher path.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Returns the signed launcher digest rechecked by training-environment verification.
+    #[must_use]
+    pub const fn sha256(&self) -> [u8; 32] {
+        self.sha256
+    }
+
+    /// Returns the signed launcher byte length.
+    #[must_use]
+    pub const fn size_bytes(&self) -> u64 {
+        self.size_bytes
+    }
 }
 
 impl VerifiedTrainingEnvironment {
@@ -112,6 +478,12 @@ impl VerifiedTrainingEnvironment {
     #[must_use]
     pub fn training_code_revision(&self) -> &str {
         &self.training_code_revision
+    }
+
+    /// Returns the exact launcher evidence for the process-tree supervisor.
+    #[must_use]
+    pub const fn training_worker(&self) -> &VerifiedTrainingWorkerProgram {
+        &self.training_worker
     }
 }
 
@@ -216,6 +588,7 @@ struct RelativeFileWire {
 #[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct DistributionWire {
+    external_paths: Vec<String>,
     file_count: usize,
     file_set_sha256: String,
     name: String,
@@ -242,10 +615,13 @@ struct VerifiedFiles {
     onnx_worker_sha256: [u8; 32],
     onnx_worker_size_bytes: u64,
     validator_sha256: [u8; 32],
+    training_driver_sha256: [u8; 32],
+    training_driver_size_bytes: u64,
     root: PathBuf,
 }
 
 struct FileIdentity {
+    // Only bounded authority and RECORD files retain bytes for parsing.
     bytes: Vec<u8>,
     sha256: [u8; 32],
     size_bytes: u64,
@@ -264,7 +640,8 @@ pub fn verify_python_training_environment(
     python_tag: &str,
     native_extension: &Path,
 ) -> Result<VerifiedTrainingEnvironment, TrainingEnvironmentError> {
-    let verified = verify_installed_files(root)?;
+    let check = &|| Ok(());
+    let verified = verify_installed_files(root, check)?;
     let expected_interpreter = verified.root.join(relative_path(
         &verified.environment.interpreter.executable_relative_path,
     )?);
@@ -291,7 +668,8 @@ pub fn verify_validator_training_environment(
     root: &Path,
     validator: &Path,
 ) -> Result<VerifiedTrainingEnvironment, TrainingEnvironmentError> {
-    let verified = verify_installed_files(root)?;
+    let check = &|| Ok(());
+    let verified = verify_installed_files(root, check)?;
     let expected = verified.root.join(format!(
         "bin/market-squawk-model-validator{}",
         std::env::consts::EXE_SUFFIX
@@ -315,20 +693,43 @@ pub fn verify_application_training_environment(
     application: &Path,
     onnx_worker: &Path,
 ) -> Result<VerifiedTrainingEnvironment, TrainingEnvironmentError> {
-    let verified = verify_installed_files(root)?;
-    verify_runtime_program_identity(
+    VerifiedTrainingEnvironment::verify_application_controlled(
+        root,
         application,
-        verified.application_sha256,
-        verified.application_size_bytes,
-        MAX_APPLICATION_EXECUTABLE_BYTES,
-    )?;
-    verify_runtime_program_identity(
         onnx_worker,
-        verified.onnx_worker_sha256,
-        verified.onnx_worker_size_bytes,
-        MAX_ONNX_WORKER_EXECUTABLE_BYTES,
-    )?;
-    verified.into_public()
+        &|| Ok(()),
+    )
+}
+
+impl VerifiedTrainingEnvironment {
+    /// Verifies the complete signed release while retaining the caller's cancellation and deadline.
+    /// The callback is checked between files and every hash chunk; no work is detached.
+    ///
+    /// # Errors
+    /// Returns the original integrity error or the owning operation's control failure.
+    pub fn verify_application_controlled(
+        root: &Path,
+        application: &Path,
+        onnx_worker: &Path,
+        check: &dyn Fn() -> Result<(), TrainingEnvironmentError>,
+    ) -> Result<Self, TrainingEnvironmentError> {
+        check()?;
+        let verified = verify_installed_files(root, check)?;
+        verify_runtime_program_identity(
+            application,
+            verified.application_sha256,
+            verified.application_size_bytes,
+            check,
+        )?;
+        verify_runtime_program_identity(
+            onnx_worker,
+            verified.onnx_worker_sha256,
+            verified.onnx_worker_size_bytes,
+            check,
+        )?;
+        check()?;
+        verified.into_public()
+    }
 }
 
 impl VerifiedFiles {
@@ -342,11 +743,29 @@ impl VerifiedFiles {
             python_tag: self.environment.interpreter.python_tag.into(),
             python_version: self.environment.interpreter.version.into(),
             training_code_revision: self.environment.training_code_revision.into(),
+            training_worker: VerifiedTrainingWorkerProgram {
+                path: self.root.join(training_driver_relative_path()),
+                sha256: self.training_driver_sha256,
+                size_bytes: self.training_driver_size_bytes,
+            },
         })
     }
 }
 
-fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironmentError> {
+struct InstalledAuthority {
+    canonical_root: PathBuf,
+    foundation: FoundationWire,
+    environment: EnvironmentWire,
+    manifest: ReleaseManifestWire,
+    receipt_sha256: [u8; 32],
+    release_manifest_sha256: [u8; 32],
+}
+
+fn verify_installed_authority(
+    root: &Path,
+    check: &dyn Fn() -> Result<(), TrainingEnvironmentError>,
+) -> Result<InstalledAuthority, TrainingEnvironmentError> {
+    check()?;
     verify_directory(root).map_err(|_| TrainingEnvironmentError::ControlledRoot)?;
     verify_directory(&root.join(AUTHORITY_DIRECTORY))
         .map_err(|_| TrainingEnvironmentError::ControlledRoot)?;
@@ -363,6 +782,7 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
         Path::new(ENVIRONMENT_RECEIPT),
         MAX_AUTHORITY_BYTES,
         false,
+        check,
     )?;
     let signed_environment: SignedEnvironmentWire = canonical_wire(
         &receipt_file.bytes,
@@ -373,12 +793,13 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
         Path::new(RELEASE_MANIFEST),
         MAX_AUTHORITY_BYTES,
         false,
+        check,
     )?;
     let signed_manifest: SignedReleaseManifestWire = canonical_wire(
         &manifest_file.bytes,
         TrainingEnvironmentError::ReleaseManifest,
     )?;
-    if signed_environment.schema_version != 1
+    if signed_environment.schema_version != 2
         || signed_manifest.schema_version != 3
         || !verify_signature(
             &foundation.release_public_key,
@@ -414,11 +835,35 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
         return Err(TrainingEnvironmentError::EnvironmentReceipt);
     }
 
-    let interpreter = read_controlled(
+    check()?;
+    Ok(InstalledAuthority {
+        canonical_root,
+        foundation,
+        environment,
+        manifest,
+        receipt_sha256: receipt_file.sha256,
+        release_manifest_sha256: manifest_file.sha256,
+    })
+}
+
+fn verify_installed_files(
+    root: &Path,
+    check: &dyn Fn() -> Result<(), TrainingEnvironmentError>,
+) -> Result<VerifiedFiles, TrainingEnvironmentError> {
+    let InstalledAuthority {
+        canonical_root,
+        foundation,
+        environment,
+        manifest,
+        receipt_sha256,
+        release_manifest_sha256,
+    } = verify_installed_authority(root, check)?;
+
+    let interpreter = hash_controlled(
         &canonical_root,
         relative_path(&environment.interpreter.executable_relative_path)?,
-        MAX_DISTRIBUTION_FILE_BYTES,
         true,
+        check,
     )?;
     exact_file(
         &interpreter,
@@ -427,14 +872,14 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
         TrainingEnvironmentError::RuntimeWitness,
     )?;
 
-    let validator = read_controlled(
+    let validator = hash_controlled(
         &canonical_root,
         Path::new(&format!(
             "bin/market-squawk-model-validator{}",
             std::env::consts::EXE_SUFFIX
         )),
-        MAX_VALIDATOR_EXECUTABLE_BYTES,
         false,
+        check,
     )?;
     exact_file(
         &validator,
@@ -443,30 +888,25 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
         TrainingEnvironmentError::RuntimeWitness,
     )?;
 
-    let application = read_controlled(
-        &canonical_root,
-        Path::new(&format!(
-            "bin/market-squawk{}",
-            std::env::consts::EXE_SUFFIX
-        )),
-        MAX_APPLICATION_EXECUTABLE_BYTES,
-        false,
-    )?;
-    exact_file(
-        &application,
-        &manifest.application.sha256,
+    let application_path =
+        canonical_root.join(format!("bin/market-squawk{}", std::env::consts::EXE_SUFFIX));
+    verify_parent_chain(&canonical_root, &application_path)?;
+    let application_sha256 = parse_hex(&manifest.application.sha256)?;
+    verify_runtime_program_identity(
+        &application_path,
+        application_sha256,
         manifest.application.size_bytes,
-        TrainingEnvironmentError::RuntimeWitness,
+        check,
     )?;
 
-    let onnx_worker = read_controlled(
+    let onnx_worker = hash_controlled(
         &canonical_root,
         Path::new(&format!(
             "bin/market-squawk-onnx-worker{}",
             std::env::consts::EXE_SUFFIX
         )),
-        MAX_ONNX_WORKER_EXECUTABLE_BYTES,
         false,
+        check,
     )?;
     exact_file(
         &onnx_worker,
@@ -475,11 +915,11 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
         TrainingEnvironmentError::RuntimeWitness,
     )?;
 
-    let training_driver = read_controlled(
+    let training_driver = hash_controlled(
         &canonical_root,
         Path::new(training_driver_relative_path()),
-        MAX_TRAINING_LAUNCHER_BYTES,
         false,
+        check,
     )?;
     exact_file(
         &training_driver,
@@ -488,11 +928,11 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
         TrainingEnvironmentError::RuntimeWitness,
     )?;
 
-    let wheel = read_controlled(
+    let wheel = hash_controlled(
         &canonical_root,
         &Path::new(AUTHORITY_DIRECTORY).join(&manifest.project_wheel.filename),
-        MAX_DISTRIBUTION_FILE_BYTES,
         false,
+        check,
     )?;
     exact_file(
         &wheel,
@@ -501,16 +941,18 @@ fn verify_installed_files(root: &Path) -> Result<VerifiedFiles, TrainingEnvironm
         TrainingEnvironmentError::ReleaseManifest,
     )?;
 
-    verify_distributions(&canonical_root, &environment, &foundation)?;
+    verify_distributions(&canonical_root, &environment, &foundation, check)?;
     Ok(VerifiedFiles {
         environment,
-        receipt_sha256: receipt_file.sha256,
-        release_manifest_sha256: manifest_file.sha256,
-        application_sha256: application.sha256,
-        application_size_bytes: application.size_bytes,
+        receipt_sha256,
+        release_manifest_sha256,
+        application_sha256,
+        application_size_bytes: manifest.application.size_bytes,
         onnx_worker_sha256: onnx_worker.sha256,
         onnx_worker_size_bytes: onnx_worker.size_bytes,
         validator_sha256: validator.sha256,
+        training_driver_sha256: training_driver.sha256,
+        training_driver_size_bytes: training_driver.size_bytes,
         root: canonical_root,
     })
 }
@@ -519,9 +961,9 @@ fn verify_runtime_program_identity(
     path: &Path,
     expected_sha256: [u8; 32],
     expected_size_bytes: u64,
-    maximum_bytes: u64,
+    check: &dyn Fn() -> Result<(), TrainingEnvironmentError>,
 ) -> Result<(), TrainingEnvironmentError> {
-    if expected_size_bytes == 0 || expected_size_bytes > maximum_bytes {
+    if expected_size_bytes == 0 {
         return Err(TrainingEnvironmentError::RuntimeWitness);
     }
     let named = fs::symlink_metadata(path).map_err(|_| TrainingEnvironmentError::RuntimeWitness)?;
@@ -550,6 +992,7 @@ fn verify_runtime_program_identity(
     let mut buffer = [0_u8; 64 * 1024];
     let mut observed = 0_u64;
     loop {
+        check()?;
         let read = file
             .read(&mut buffer)
             .map_err(|_| TrainingEnvironmentError::RuntimeWitness)?;
@@ -558,7 +1001,7 @@ fn verify_runtime_program_identity(
         }
         observed = observed
             .checked_add(u64::try_from(read).map_err(|_| TrainingEnvironmentError::RuntimeWitness)?)
-            .filter(|value| *value <= maximum_bytes)
+            .filter(|value| *value <= expected_size_bytes)
             .ok_or(TrainingEnvironmentError::RuntimeWitness)?;
         digest.update(&buffer[..read]);
     }
@@ -617,6 +1060,8 @@ fn embedded_foundation() -> Result<FoundationWire, TrainingEnvironmentError> {
 
 struct VerifiedDistribution {
     entries: BTreeMap<String, ([u8; 32], u64)>,
+    external_paths: BTreeSet<String>,
+    owned_paths: Vec<PathBuf>,
     roots: BTreeSet<String>,
     site_packages: PathBuf,
 }
@@ -625,6 +1070,7 @@ fn verify_distributions(
     root: &Path,
     environment: &EnvironmentWire,
     foundation: &FoundationWire,
+    check: &dyn Fn() -> Result<(), TrainingEnvironmentError>,
 ) -> Result<(), TrainingEnvironmentError> {
     if environment.project_distribution.name != "market-squawk"
         || environment.project_distribution.version != env!("CARGO_PKG_VERSION")
@@ -632,12 +1078,14 @@ fn verify_distributions(
     {
         return Err(TrainingEnvironmentError::InstalledDistribution);
     }
-    let project = verify_distribution(root, &environment.project_distribution)?;
+    let project = verify_distribution(root, &environment.project_distribution, check)?;
     let expected_site_packages = expected_site_packages(root, &environment.interpreter.version)?;
     if canonical(&project.site_packages)? != canonical(&expected_site_packages)? {
         return Err(TrainingEnvironmentError::InstalledDistribution);
     }
     let mut owned_roots = project.roots.clone();
+    let mut owned_external_paths = project.external_paths.clone();
+    let mut owned_paths = project.owned_paths.clone();
     for (wire, requirement) in environment
         .runtime_distributions
         .iter()
@@ -646,16 +1094,22 @@ fn verify_distributions(
         if wire.name != requirement.name || wire.version != requirement.version {
             return Err(TrainingEnvironmentError::InstalledDistribution);
         }
-        let verified = verify_distribution(root, wire)?;
+        let verified = verify_distribution(root, wire, check)?;
         if canonical(&verified.site_packages)? != canonical(&project.site_packages)?
             || verified
                 .roots
                 .iter()
                 .any(|value| !owned_roots.insert(value.clone()))
+            || verified
+                .external_paths
+                .iter()
+                .any(|value| !owned_external_paths.insert(value.clone()))
         {
             return Err(TrainingEnvironmentError::InstalledDistribution);
         }
+        owned_paths.extend(verified.owned_paths);
     }
+    verify_unique_owned_files(&owned_paths, check)?;
 
     let native_relative = relative_path(&environment.native_extension.relative_path)?;
     let native_path = root.join(native_relative);
@@ -680,12 +1134,13 @@ fn verify_distributions(
 fn verify_distribution(
     root: &Path,
     distribution: &DistributionWire,
+    check: &dyn Fn() -> Result<(), TrainingEnvironmentError>,
 ) -> Result<VerifiedDistribution, TrainingEnvironmentError> {
     if !valid_distribution(distribution) {
         return Err(TrainingEnvironmentError::InstalledDistribution);
     }
     let record_relative = relative_path(&distribution.record_relative_path)?;
-    let record = read_controlled(root, record_relative, MAX_RECORD_BYTES, false)?;
+    let record = read_controlled(root, record_relative, MAX_RECORD_BYTES, false, check)?;
     exact_file(
         &record,
         &distribution.record_sha256,
@@ -705,6 +1160,12 @@ fn verify_distribution(
         .ok_or(TrainingEnvironmentError::InstalledDistribution)?
         .replace('\\', "/");
     let roots = distribution.roots.iter().cloned().collect::<BTreeSet<_>>();
+    let external_paths = distribution
+        .external_paths
+        .iter()
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    let mut owned_paths = vec![canonical(&record_path)?];
 
     let mut reader = csv::ReaderBuilder::new()
         .has_headers(false)
@@ -716,8 +1177,8 @@ fn verify_distribution(
         distribution.name == "market-squawk" && distribution.version == env!("CARGO_PKG_VERSION");
     let training_driver_record_path = training_driver_record_path();
     let mut saw_training_driver = false;
-    let mut total_bytes = 0_u64;
     for row in reader.records() {
+        check()?;
         let row = row.map_err(|_| TrainingEnvironmentError::InstalledDistribution)?;
         if row.len() != 3 || entries.len() >= MAX_DISTRIBUTION_FILES {
             return Err(TrainingEnvironmentError::InstalledDistribution);
@@ -738,18 +1199,19 @@ fn verify_distribution(
             saw_record = true;
             continue;
         }
+        let is_external = external_paths.contains(name);
         let is_training_driver = require_training_driver && name == training_driver_record_path;
-        let file = if is_training_driver {
-            if saw_training_driver || digest.is_empty() || size.is_empty() {
+        let owned_path;
+        let file = if is_external {
+            if digest.is_empty() || size.is_empty() || (is_training_driver && saw_training_driver) {
                 return Err(TrainingEnvironmentError::InstalledDistribution);
             }
-            saw_training_driver = true;
-            read_controlled(
-                root,
-                Path::new(training_driver_relative_path()),
-                MAX_DISTRIBUTION_FILE_BYTES,
-                false,
-            )?
+            if is_training_driver {
+                saw_training_driver = true;
+            }
+            let relative = external_distribution_relative_path(name)?;
+            owned_path = root.join(&relative);
+            hash_controlled(root, &relative, false, check)?
         } else {
             let relative = relative_path(name)?;
             let first = relative
@@ -763,8 +1225,10 @@ fn verify_distribution(
             if !roots.contains(first) {
                 return Err(TrainingEnvironmentError::InstalledDistribution);
             }
-            read_controlled(site_packages, relative, MAX_DISTRIBUTION_FILE_BYTES, false)?
+            owned_path = site_packages.join(relative);
+            hash_controlled(site_packages, relative, false, check)?
         };
+        owned_paths.push(canonical(&owned_path)?);
         let size = if digest.is_empty() && size.is_empty() {
             file.size_bytes
         } else {
@@ -779,12 +1243,6 @@ fn verify_distribution(
             }
             size
         };
-        total_bytes = total_bytes
-            .checked_add(size)
-            .ok_or(TrainingEnvironmentError::InstalledDistribution)?;
-        if total_bytes > MAX_DISTRIBUTION_BYTES {
-            return Err(TrainingEnvironmentError::InstalledDistribution);
-        }
         if entries
             .insert(name.to_owned(), (file.sha256, size))
             .is_some()
@@ -792,8 +1250,15 @@ fn verify_distribution(
             return Err(TrainingEnvironmentError::InstalledDistribution);
         }
     }
+    let observed_external_paths = entries
+        .keys()
+        .filter(|name| external_paths.contains(name.as_str()))
+        .cloned()
+        .collect::<BTreeSet<_>>();
     if !saw_record
         || require_training_driver != saw_training_driver
+        || require_training_driver != external_paths.contains(training_driver_record_path)
+        || observed_external_paths != external_paths
         || entries.len() != distribution.file_count
         || record_set_digest(&entries) != parse_hex(&distribution.file_set_sha256)?
     {
@@ -801,15 +1266,17 @@ fn verify_distribution(
     }
     let mut expected_paths = entries
         .keys()
-        .filter(|name| name.as_str() != training_driver_record_path)
+        .filter(|name| !external_paths.contains(name.as_str()))
         .cloned()
         .collect::<BTreeSet<_>>();
     expected_paths.insert(record_entry);
-    if scan_distribution_paths(site_packages, &roots)? != expected_paths {
+    if scan_distribution_paths(site_packages, &roots, check)? != expected_paths {
         return Err(TrainingEnvironmentError::InstalledDistribution);
     }
     Ok(VerifiedDistribution {
         entries,
+        external_paths,
+        owned_paths,
         roots,
         site_packages: site_packages.to_path_buf(),
     })
@@ -843,9 +1310,59 @@ const fn training_driver_record_path() -> &'static str {
     }
 }
 
+fn external_distribution_relative_path(value: &str) -> Result<PathBuf, TrainingEnvironmentError> {
+    let (prefix, directory) = if cfg!(windows) {
+        ("../../Scripts/", "Scripts")
+    } else {
+        ("../../../bin/", "bin")
+    };
+    let filename = value
+        .strip_prefix(prefix)
+        .ok_or(TrainingEnvironmentError::InstalledDistribution)?;
+    let path = Path::new(filename);
+    if filename.is_empty()
+        || filename.len() > 255
+        || filename.contains(['/', '\\'])
+        || path.components().count() != 1
+        || !matches!(path.components().next(), Some(Component::Normal(_)))
+    {
+        return Err(TrainingEnvironmentError::InstalledDistribution);
+    }
+    Ok(Path::new(directory).join(path))
+}
+
+fn verify_unique_owned_files(
+    paths: &[PathBuf],
+    check: &dyn Fn() -> Result<(), TrainingEnvironmentError>,
+) -> Result<(), TrainingEnvironmentError> {
+    let mut canonical_paths = BTreeSet::new();
+    let mut identities: HashMap<u64, Vec<&Path>> = HashMap::new();
+    for path in paths {
+        check()?;
+        if !canonical_paths.insert(path.clone()) {
+            return Err(TrainingEnvironmentError::InstalledDistribution);
+        }
+        let handle = same_file::Handle::from_path(path)
+            .map_err(|_| TrainingEnvironmentError::InstalledDistribution)?;
+        let mut hasher = DefaultHasher::new();
+        handle.hash(&mut hasher);
+        let candidates = identities.entry(hasher.finish()).or_default();
+        for candidate in candidates.iter().copied() {
+            if same_file::is_same_file(candidate, path)
+                .map_err(|_| TrainingEnvironmentError::InstalledDistribution)?
+            {
+                return Err(TrainingEnvironmentError::InstalledDistribution);
+            }
+        }
+        candidates.push(path);
+    }
+    Ok(())
+}
+
 fn scan_distribution_paths(
     site_packages: &Path,
     roots: &BTreeSet<String>,
+    check: &dyn Fn() -> Result<(), TrainingEnvironmentError>,
 ) -> Result<BTreeSet<String>, TrainingEnvironmentError> {
     let mut files = BTreeSet::new();
     let mut pending = roots.iter().map(PathBuf::from).collect::<Vec<_>>();
@@ -856,6 +1373,7 @@ fn scan_distribution_paths(
         .ok_or(TrainingEnvironmentError::InstalledDistribution)?;
     let mut discovered = pending.len();
     while let Some(relative) = pending.pop() {
+        check()?;
         let path = site_packages.join(&relative);
         let metadata = fs::symlink_metadata(&path)
             .map_err(|_| TrainingEnvironmentError::InstalledDistribution)?;
@@ -888,6 +1406,7 @@ fn scan_distribution_paths(
         for entry in
             fs::read_dir(path).map_err(|_| TrainingEnvironmentError::InstalledDistribution)?
         {
+            check()?;
             let entry = entry.map_err(|_| TrainingEnvironmentError::InstalledDistribution)?;
             let name = entry.file_name();
             if name.to_str().is_none() {
@@ -950,6 +1469,26 @@ fn read_controlled(
     relative: &Path,
     maximum: u64,
     allow_file_symlink: bool,
+    check: &dyn Fn() -> Result<(), TrainingEnvironmentError>,
+) -> Result<FileIdentity, TrainingEnvironmentError> {
+    inspect_controlled(root, relative, Some(maximum), allow_file_symlink, check)
+}
+
+fn hash_controlled(
+    root: &Path,
+    relative: &Path,
+    allow_file_symlink: bool,
+    check: &dyn Fn() -> Result<(), TrainingEnvironmentError>,
+) -> Result<FileIdentity, TrainingEnvironmentError> {
+    inspect_controlled(root, relative, None, allow_file_symlink, check)
+}
+
+fn inspect_controlled(
+    root: &Path,
+    relative: &Path,
+    maximum: Option<u64>,
+    allow_file_symlink: bool,
+    check: &dyn Fn() -> Result<(), TrainingEnvironmentError>,
 ) -> Result<FileIdentity, TrainingEnvironmentError> {
     if !relative
         .components()
@@ -973,20 +1512,36 @@ fn read_controlled(
         .metadata()
         .map_err(|_| TrainingEnvironmentError::ControlledRoot)?;
     verify_file_metadata(&before, maximum)?;
-    let capacity =
-        usize::try_from(before.len()).map_err(|_| TrainingEnvironmentError::ControlledRoot)?;
-    let mut bytes = Vec::with_capacity(capacity);
-    file.read_to_end(&mut bytes)
-        .map_err(|_| TrainingEnvironmentError::ControlledRoot)?;
+    let mut bytes = Vec::new();
+    let mut digest = Sha256::new();
+    let mut observed = 0_u64;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        check()?;
+        let read = file
+            .read(&mut buffer)
+            .map_err(|_| TrainingEnvironmentError::ControlledRoot)?;
+        if read == 0 {
+            break;
+        }
+        observed = observed
+            .checked_add(u64::try_from(read).map_err(|_| TrainingEnvironmentError::ControlledRoot)?)
+            .filter(|value| *value <= before.len() && maximum.is_none_or(|bound| *value <= bound))
+            .ok_or(TrainingEnvironmentError::ControlledRoot)?;
+        digest.update(&buffer[..read]);
+        if maximum.is_some() {
+            bytes.extend_from_slice(&buffer[..read]);
+        }
+    }
     let after = file
         .metadata()
         .map_err(|_| TrainingEnvironmentError::ControlledRoot)?;
-    if !same_file(&before, &after) || bytes.len() as u64 != before.len() {
+    if !same_file(&before, &after) || observed != before.len() {
         return Err(TrainingEnvironmentError::ControlledRoot);
     }
     Ok(FileIdentity {
-        sha256: hash(&bytes),
-        size_bytes: before.len(),
+        sha256: digest.finalize().into(),
+        size_bytes: observed,
         bytes,
     })
 }
@@ -1014,8 +1569,11 @@ fn verify_directory(path: &Path) -> Result<(), TrainingEnvironmentError> {
     controlled_metadata(&metadata)
 }
 
-fn verify_file_metadata(metadata: &Metadata, maximum: u64) -> Result<(), TrainingEnvironmentError> {
-    if !metadata.is_file() || metadata.len() > maximum {
+fn verify_file_metadata(
+    metadata: &Metadata,
+    maximum: Option<u64>,
+) -> Result<(), TrainingEnvironmentError> {
+    if !metadata.is_file() || maximum.is_some_and(|bound| metadata.len() > bound) {
         return Err(TrainingEnvironmentError::ControlledRoot);
     }
     controlled_metadata(metadata)
@@ -1162,6 +1720,15 @@ fn valid_runtime_requirements(values: &[RuntimeRequirementWire]) -> bool {
 fn valid_distribution(value: &DistributionWire) -> bool {
     value.file_count > 0
         && value.file_count <= MAX_DISTRIBUTION_FILES
+        && value.external_paths.len() <= MAX_DISTRIBUTION_EXTERNAL_PATHS
+        && value
+            .external_paths
+            .iter()
+            .all(|path| external_distribution_relative_path(path).is_ok())
+        && value
+            .external_paths
+            .windows(2)
+            .all(|pair| pair[0].as_str() < pair[1].as_str())
         && valid_hex(&value.file_set_sha256)
         && valid_distribution_name(&value.name)
         && valid_hex(&value.record_sha256)
@@ -1305,7 +1872,108 @@ fn base64_url(bytes: &[u8; 32]) -> String {
 mod tests {
     use std::fs;
 
-    use super::{TrainingEnvironmentError, hash, verify_runtime_program_identity};
+    use super::{
+        ConfiguredTrainingEnvironment, TrainingEnvironmentError, TrainingEnvironmentOrigin, hash,
+        verify_runtime_program_identity, verify_unique_owned_files,
+    };
+
+    #[test]
+    fn source_environment_binds_metadata_without_attesting_editable_code()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let root = temporary.path().canonicalize()?;
+        let relative_python = if cfg!(windows) {
+            "Scripts/python.exe"
+        } else {
+            "bin/python"
+        };
+        let interpreter = root.join(relative_python);
+        fs::create_dir_all(interpreter.parent().ok_or("interpreter parent missing")?)?;
+        let managed_python = root.join("managed-python");
+        fs::write(&managed_python, b"managed interpreter fixture")?;
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&managed_python, &interpreter)?;
+        #[cfg(not(unix))]
+        fs::copy(&managed_python, &interpreter)?;
+        let helper = root.join("helper");
+        fs::write(&helper, b"editable helper fixture")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            for path in [&interpreter, &helper] {
+                fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        let mut descriptor = serde_json::json!({
+            "schema_version": 1,
+            "kind": "source-development",
+            "editable": true,
+            "source_root": root,
+            "source_revision": "development-local-editable",
+            "native_build_revision": "local-native-build",
+            "project_version": "1.0.0",
+            "python_version": "3.14.6",
+            "python_tag": "cp314",
+            "requirements_lock_sha256": "11".repeat(32),
+            "runtime_distributions": {"numpy": "2.4.0"},
+            "interpreter_relative_path": relative_python,
+            "onnx_worker": helper,
+            "validator": helper,
+        });
+        let descriptor_path = root.join("source-development.json");
+        fs::write(&descriptor_path, serde_json::to_vec_pretty(&descriptor)?)?;
+        let environment = ConfiguredTrainingEnvironment::open_source(&root, &|| Ok(()))?;
+        assert_eq!(
+            environment.identity().origin(),
+            TrainingEnvironmentOrigin::SourceDevelopment
+        );
+        assert!(environment.installed().is_none());
+        assert_eq!(
+            environment.source().ok_or("source missing")?.interpreter(),
+            interpreter
+        );
+        fs::write(&descriptor_path, serde_json::to_vec(&descriptor)?)?;
+        fs::write(&helper, b"changed editable program contents")?;
+        assert_eq!(
+            ConfiguredTrainingEnvironment::open_source(&root, &|| Ok(()))?.identity(),
+            environment.identity(),
+        );
+        assert_eq!(
+            ConfiguredTrainingEnvironment::open_source(&root, &|| Err(
+                TrainingEnvironmentError::Cancelled
+            )),
+            Err(TrainingEnvironmentError::Cancelled),
+        );
+        descriptor["native_build_revision"] = serde_json::json!("next-native-build");
+        fs::write(&descriptor_path, serde_json::to_vec(&descriptor)?)?;
+        assert_ne!(
+            ConfiguredTrainingEnvironment::open_source(&root, &|| Ok(()))?.identity(),
+            environment.identity(),
+        );
+        descriptor["editable"] = serde_json::json!(false);
+        fs::write(&descriptor_path, serde_json::to_vec(&descriptor)?)?;
+        assert_eq!(
+            ConfiguredTrainingEnvironment::open_source(&root, &|| Ok(())),
+            Err(TrainingEnvironmentError::SourceDevelopment),
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn distribution_ownership_rejects_distinct_hard_link_paths()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let temporary = tempfile::tempdir()?;
+        let first = temporary.path().join("first");
+        let second = temporary.path().join("second");
+        fs::write(&first, b"one physical distribution file")?;
+        fs::hard_link(&first, &second)?;
+
+        assert_eq!(
+            verify_unique_owned_files(&[first, second], &|| Ok(())),
+            Err(TrainingEnvironmentError::InstalledDistribution)
+        );
+        Ok(())
+    }
 
     #[test]
     fn runtime_program_identity_accepts_a_copy_and_rejects_a_substitution()
@@ -1322,8 +1990,27 @@ mod tests {
             &selected,
             expected,
             b"signed program bytes".len() as u64,
-            1024,
+            &|| Ok(()),
         )?;
+
+        // Cancellation after the first read must stop this hash before it yields authority.
+        let reads = std::cell::Cell::new(0);
+        assert_eq!(
+            verify_runtime_program_identity(
+                &selected,
+                expected,
+                b"signed program bytes".len() as u64,
+                &|| {
+                    reads.set(reads.get() + 1);
+                    if reads.get() > 1 {
+                        Err(TrainingEnvironmentError::Cancelled)
+                    } else {
+                        Ok(())
+                    }
+                },
+            ),
+            Err(TrainingEnvironmentError::Cancelled)
+        );
 
         fs::write(&selected, b"tamper program bytes")?;
         assert_eq!(
@@ -1331,7 +2018,7 @@ mod tests {
                 &selected,
                 expected,
                 b"signed program bytes".len() as u64,
-                1024,
+                &|| Ok(())
             ),
             Err(TrainingEnvironmentError::RuntimeWitness)
         );

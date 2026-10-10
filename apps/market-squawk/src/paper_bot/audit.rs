@@ -1,9 +1,10 @@
 //! Owned durable consumers for mandatory execution and paper audit streams.
 
 use std::{
+    collections::VecDeque,
     fs::File,
     io::Write as _,
-    sync::mpsc,
+    sync::{Arc, Mutex, mpsc},
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -21,12 +22,186 @@ use market_squawk_execution::{
 use serde::Serialize;
 use thiserror::Error;
 
+// Version 2 is retained intentionally: target-reference evidence is an optional additive field on
+// the existing append-only execution record. Audit output is never replayed for recovery, so old
+// v2 records remain valid historical evidence and require no rewrite or migration.
 const EXECUTION_AUDIT_SCHEMA_VERSION: u16 = 2;
 const PAPER_AUDIT_SCHEMA_VERSION: u16 = 1;
 const MAXIMUM_ENCODED_RECORD_BYTES: usize = 64 * 1024;
 const IDLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const EXECUTION_AUDIT_FILE: &str = "paper-execution-audit-v2.jsonl";
 const PAPER_AUDIT_FILE: &str = "paper-state-audit-v1.jsonl";
+const MAXIMUM_RETAINED_EXECUTION_AUDIT_RECORDS: usize = 256;
+
+/// One durable execution-audit decision retained for the bounded application read image.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ProductionExecutionAuditRecord {
+    sequence: u64,
+    event: ExecutionAuditEvent,
+}
+
+impl ProductionExecutionAuditRecord {
+    pub const fn sequence(&self) -> u64 {
+        self.sequence
+    }
+    pub const fn event(&self) -> ExecutionAuditEvent {
+        self.event
+    }
+}
+
+/// Immutable bounded page of decisions already committed to the production audit file.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProductionExecutionAuditSnapshot {
+    records: Box<[ProductionExecutionAuditRecord]>,
+    returned_items: usize,
+    available_items: usize,
+    total_published: u64,
+    oldest_sequence: Option<u64>,
+    latest_sequence: Option<u64>,
+    cursor_expired: bool,
+    next_cursor: Option<u64>,
+}
+
+impl ProductionExecutionAuditSnapshot {
+    pub const fn records(&self) -> &[ProductionExecutionAuditRecord] {
+        &self.records
+    }
+    pub const fn returned_items(&self) -> usize {
+        self.returned_items
+    }
+    pub const fn available_items(&self) -> usize {
+        self.available_items
+    }
+    pub const fn total_published(&self) -> u64 {
+        self.total_published
+    }
+    pub const fn oldest_sequence(&self) -> Option<u64> {
+        self.oldest_sequence
+    }
+    pub const fn latest_sequence(&self) -> Option<u64> {
+        self.latest_sequence
+    }
+    pub const fn cursor_expired(&self) -> bool {
+        self.cursor_expired
+    }
+    pub const fn next_cursor(&self) -> Option<u64> {
+        self.next_cursor
+    }
+}
+
+/// Failure to obtain an immutable audit read image without touching its sole stream consumer.
+#[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
+pub enum ProductionExecutionAuditReadError {
+    #[error("production execution-audit read image is unavailable")]
+    Unavailable,
+    #[error("production execution-audit read image allocation failed")]
+    Allocation,
+}
+
+#[derive(Clone, Debug)]
+pub(super) struct ProductionExecutionAuditReadView {
+    image: Arc<Mutex<ExecutionAuditReadImage>>,
+}
+
+impl ProductionExecutionAuditReadView {
+    fn try_new() -> Result<Self, ProductionExecutionAuditReadError> {
+        let mut records = VecDeque::new();
+        records
+            .try_reserve_exact(MAXIMUM_RETAINED_EXECUTION_AUDIT_RECORDS)
+            .map_err(|_| ProductionExecutionAuditReadError::Allocation)?;
+        Ok(Self {
+            image: Arc::new(Mutex::new(ExecutionAuditReadImage {
+                records,
+                total_published: 0,
+            })),
+        })
+    }
+
+    pub(super) fn snapshot_after(
+        &self,
+        cursor: Option<u64>,
+        maximum_items: usize,
+    ) -> Result<ProductionExecutionAuditSnapshot, ProductionExecutionAuditReadError> {
+        self.image
+            .lock()
+            .map_err(|_| ProductionExecutionAuditReadError::Unavailable)?
+            .snapshot_after(cursor, maximum_items)
+    }
+
+    fn publish(&self, event: ExecutionAuditEvent) -> Result<(), ProductionExecutionAuditReadError> {
+        self.image
+            .lock()
+            .map_err(|_| ProductionExecutionAuditReadError::Unavailable)?
+            .publish(event)
+    }
+}
+
+#[derive(Debug)]
+struct ExecutionAuditReadImage {
+    records: VecDeque<ProductionExecutionAuditRecord>,
+    total_published: u64,
+}
+
+impl ExecutionAuditReadImage {
+    fn publish(
+        &mut self,
+        event: ExecutionAuditEvent,
+    ) -> Result<(), ProductionExecutionAuditReadError> {
+        let sequence = self
+            .total_published
+            .checked_add(1)
+            .ok_or(ProductionExecutionAuditReadError::Unavailable)?;
+        if self.records.len() == MAXIMUM_RETAINED_EXECUTION_AUDIT_RECORDS {
+            self.records.pop_front();
+        }
+        self.records
+            .push_back(ProductionExecutionAuditRecord { sequence, event });
+        self.total_published = sequence;
+        Ok(())
+    }
+
+    fn snapshot_after(
+        &self,
+        cursor: Option<u64>,
+        maximum_items: usize,
+    ) -> Result<ProductionExecutionAuditSnapshot, ProductionExecutionAuditReadError> {
+        let oldest_sequence = self.records.front().map(|record| record.sequence());
+        let latest_sequence = self.records.back().map(|record| record.sequence());
+        let cursor_expired = cursor.is_some_and(|cursor| {
+            oldest_sequence
+                .is_some_and(|oldest| cursor.checked_add(1).is_none_or(|next| next < oldest))
+        });
+        let start = if cursor_expired {
+            oldest_sequence
+        } else {
+            cursor.and_then(|value| value.checked_add(1))
+        };
+        let matching = self
+            .records
+            .iter()
+            .filter(|record| start.is_none_or(|start| record.sequence() >= start));
+        let available_items = matching.clone().count();
+        let returned_items = available_items.min(maximum_items);
+        let mut records = Vec::new();
+        records
+            .try_reserve_exact(returned_items)
+            .map_err(|_| ProductionExecutionAuditReadError::Allocation)?;
+        records.extend(matching.take(returned_items).copied());
+        let next_cursor = (returned_items < available_items)
+            .then(|| records.last().map(|record| record.sequence()))
+            .flatten();
+        Ok(ProductionExecutionAuditSnapshot {
+            records: records.into_boxed_slice(),
+            returned_items,
+            available_items,
+            total_published: self.total_published,
+            oldest_sequence,
+            latest_sequence,
+            cursor_expired,
+            next_cursor,
+        })
+    }
+}
 
 /// Sole owner of both mandatory production audit consumers and their durable files.
 #[derive(Debug)]
@@ -34,6 +209,7 @@ pub(super) struct ProductionAuditService {
     control: mpsc::SyncSender<AuditControl>,
     worker: Option<JoinHandle<Result<ProductionAuditEvidence, ProductionAuditError>>>,
     drop_deadline: Duration,
+    execution_read_view: ProductionExecutionAuditReadView,
 }
 
 #[derive(Debug)]
@@ -51,18 +227,33 @@ impl ProductionAuditService {
     ) -> Result<Self, ProductionAuditError> {
         let execution_file = open_audit_file(&directory, EXECUTION_AUDIT_FILE)?;
         let paper_file = open_audit_file(&directory, PAPER_AUDIT_FILE)?;
+        let execution_read_view =
+            ProductionExecutionAuditReadView::try_new().map_err(ProductionAuditError::ReadImage)?;
+        let worker_read_view = execution_read_view.clone();
         let (control, commands) = mpsc::sync_channel(1);
         let worker = thread::Builder::new()
             .name(String::from("market-squawk-paper-audit"))
             .spawn(move || {
-                run_audit_service(execution, paper, execution_file, paper_file, commands)
+                run_audit_service(
+                    execution,
+                    paper,
+                    execution_file,
+                    paper_file,
+                    commands,
+                    worker_read_view,
+                )
             })
             .map_err(ProductionAuditError::Io)?;
         Ok(Self {
             control,
             worker: Some(worker),
             drop_deadline,
+            execution_read_view,
         })
+    }
+
+    pub(super) fn execution_read_view(&self) -> ProductionExecutionAuditReadView {
+        self.execution_read_view.clone()
     }
 
     pub(super) async fn flush(
@@ -84,7 +275,7 @@ impl ProductionAuditService {
     }
 
     pub(super) async fn shutdown(
-        self,
+        mut self,
         deadline: tokio::time::Instant,
         producers_complete: bool,
     ) -> ProductionAuditShutdown {
@@ -94,6 +285,18 @@ impl ProductionAuditService {
                 self,
             );
         }
+        let status = self.finish_shutdown(deadline).await;
+        if self.worker.is_some() {
+            ProductionAuditShutdown::with_owner(status, self)
+        } else {
+            ProductionAuditShutdown::new(status)
+        }
+    }
+
+    async fn finish_shutdown(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> ProductionAuditShutdownStatus {
         if self
             .worker
             .as_ref()
@@ -103,35 +306,33 @@ impl ProductionAuditService {
         }
         match self.control.try_send(AuditControl::Stop) {
             Ok(()) | Err(mpsc::TrySendError::Disconnected(_)) => self.join_worker(deadline).await,
-            Err(mpsc::TrySendError::Full(_)) => ProductionAuditShutdown::with_owner(
-                ProductionAuditShutdownStatus::ControlSaturated,
-                self,
-            ),
+            Err(mpsc::TrySendError::Full(_)) => ProductionAuditShutdownStatus::ControlSaturated,
         }
     }
 
-    async fn join_worker(mut self, deadline: tokio::time::Instant) -> ProductionAuditShutdown {
-        let Some(worker) = self.worker.take() else {
-            return ProductionAuditShutdown::new(ProductionAuditShutdownStatus::Panicked);
-        };
-        while !worker.is_finished() {
+    async fn join_worker(
+        &mut self,
+        deadline: tokio::time::Instant,
+    ) -> ProductionAuditShutdownStatus {
+        // Keep the actual thread handle owned across every await. If a waiter is cancelled,
+        // the retained service can still stop and join this same writer.
+        while self
+            .worker
+            .as_ref()
+            .is_some_and(|worker| !worker.is_finished())
+        {
             if tokio::time::Instant::now() >= deadline {
-                self.worker = Some(worker);
-                return ProductionAuditShutdown::with_owner(
-                    ProductionAuditShutdownStatus::DeadlineExceeded,
-                    self,
-                );
+                return ProductionAuditShutdownStatus::DeadlineExceeded;
             }
             tokio::time::sleep(IDLE_POLL_INTERVAL).await;
         }
+        let Some(worker) = self.worker.take() else {
+            return ProductionAuditShutdownStatus::Panicked;
+        };
         match worker.join() {
-            Ok(Ok(evidence)) => {
-                ProductionAuditShutdown::new(ProductionAuditShutdownStatus::Complete(evidence))
-            }
-            Ok(Err(error)) => {
-                ProductionAuditShutdown::new(ProductionAuditShutdownStatus::Failed(error))
-            }
-            Err(_) => ProductionAuditShutdown::new(ProductionAuditShutdownStatus::Panicked),
+            Ok(Ok(evidence)) => ProductionAuditShutdownStatus::Complete(evidence),
+            Ok(Err(error)) => ProductionAuditShutdownStatus::Failed(error),
+            Err(_) => ProductionAuditShutdownStatus::Panicked,
         }
     }
 }
@@ -160,6 +361,7 @@ fn run_audit_service(
     execution_file: File,
     paper_file: File,
     commands: mpsc::Receiver<AuditControl>,
+    execution_read_view: ProductionExecutionAuditReadView,
 ) -> Result<ProductionAuditEvidence, ProductionAuditError> {
     let mut worker = AuditWorker {
         execution,
@@ -170,6 +372,7 @@ fn run_audit_service(
         paper_closed: false,
         execution_records: 0,
         paper_records: 0,
+        execution_read_view,
     };
     let result = run_audit_worker(&mut worker, &commands);
     if result.is_err() {
@@ -188,6 +391,7 @@ struct AuditWorker {
     paper_closed: bool,
     execution_records: u64,
     paper_records: u64,
+    execution_read_view: ProductionExecutionAuditReadView,
 }
 
 impl AuditWorker {
@@ -198,6 +402,7 @@ impl AuditWorker {
             &mut self.execution_file,
             &mut self.execution_closed,
             &mut self.execution_records,
+            &self.execution_read_view,
         )? {
             progressed = true;
         }
@@ -246,13 +451,20 @@ fn drain_execution_once(
     execution_file: &mut File,
     execution_closed: &mut bool,
     execution_records: &mut u64,
+    read_view: &ProductionExecutionAuditReadView,
 ) -> Result<bool, ProductionAuditError> {
     if *execution_closed {
         return Ok(false);
     }
     match execution.try_next_record() {
         Ok(Some(record)) => {
+            let event = record.execution_event();
             append_durable(execution_file, &ExecutionAuditEnvelopeV2::try_from(record)?)?;
+            if let Some(event) = event {
+                read_view
+                    .publish(event)
+                    .map_err(ProductionAuditError::ReadImage)?;
+            }
             *execution_records = execution_records
                 .checked_add(1)
                 .ok_or(ProductionAuditError::RecordCountOverflow)?;
@@ -378,6 +590,7 @@ struct ExecutionAuditEventV2 {
     assessment_digest_sha256: Option<String>,
     evidence_binding_digest_sha256: Option<String>,
     execution_identity_digest_sha256: Option<String>,
+    target_reference_digest_sha256: Option<String>,
     risk_policy_digest_sha256: String,
     risk_policy_ruleset_version: u32,
     market_observed_at_unix_nanos: i64,
@@ -401,6 +614,7 @@ impl From<&ExecutionAuditEvent> for ExecutionAuditEventV2 {
             assessment_digest_sha256: event.assessment_digest().map(hex),
             evidence_binding_digest_sha256: event.evidence_binding_digest().map(hex),
             execution_identity_digest_sha256: event.execution_identity_digest().map(hex),
+            target_reference_digest_sha256: event.target_reference_digest().map(hex),
             risk_policy_digest_sha256: hex(policy.digest()),
             risk_policy_ruleset_version: policy.ruleset_version().get(),
             market_observed_at_unix_nanos: event.market_observed_at().unix_nanos(),
@@ -526,6 +740,37 @@ impl ProductionAuditShutdown {
         }
     }
 
+    /// Only admission saturation or an unfinished join can be resumed without changing producer facts.
+    pub(crate) fn can_resume(&self) -> bool {
+        self.owner.is_some()
+            && matches!(
+                self.status,
+                ProductionAuditShutdownStatus::DeadlineExceeded
+                    | ProductionAuditShutdownStatus::ControlSaturated
+            )
+    }
+
+    pub(super) async fn resume_after_timeout(&mut self, deadline: tokio::time::Instant) {
+        if !self.can_resume() {
+            return;
+        }
+        let join_only = matches!(self.status, ProductionAuditShutdownStatus::DeadlineExceeded);
+        let Some(owner) = self.owner.as_mut() else {
+            return;
+        };
+        // A previous join timeout already sent Stop. Retain and join that same operation;
+        // only prior admission saturation requires another attempt to send the command.
+        let status = if join_only {
+            owner.join_worker(deadline).await
+        } else {
+            owner.finish_shutdown(deadline).await
+        };
+        if owner.worker.is_none() {
+            self.owner = None;
+        }
+        self.status = status;
+    }
+
     pub const fn is_complete(&self) -> bool {
         matches!(self.status, ProductionAuditShutdownStatus::Complete(_)) && self.owner.is_none()
     }
@@ -571,6 +816,8 @@ pub enum ProductionAuditError {
     RecordTooLarge,
     #[error("production audit record count overflowed")]
     RecordCountOverflow,
+    #[error("production execution-audit read image failed: {0}")]
+    ReadImage(ProductionExecutionAuditReadError),
     #[error("production execution audit reader failed: {0}")]
     ExecutionReader(ExecutionAuditError),
     #[error("production audit I/O failed: {0}")]
@@ -627,17 +874,20 @@ mod tests {
 
         let mut closed = false;
         let mut records = 0;
+        let read_view = ProductionExecutionAuditReadView::try_new()?;
         assert!(drain_execution_once(
             &mut reader,
             &mut file,
             &mut closed,
             &mut records,
+            &read_view,
         )?);
         assert!(drain_execution_once(
             &mut reader,
             &mut file,
             &mut closed,
             &mut records,
+            &read_view,
         )?);
         assert_eq!(records, 2);
         assert!(!closed);
@@ -664,7 +914,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn shutdown_joins_a_naturally_completed_worker_before_sending_stop() {
+    async fn shutdown_joins_a_naturally_completed_worker_before_sending_stop()
+    -> Result<(), ProductionExecutionAuditReadError> {
         let expected = ProductionAuditEvidence {
             execution_records: 7,
             paper_records: 11,
@@ -682,10 +933,81 @@ mod tests {
             control,
             worker: Some(worker),
             drop_deadline: Duration::from_secs(1),
+            execution_read_view: ProductionExecutionAuditReadView::try_new()?,
         };
         let shutdown = service.shutdown(tokio::time::Instant::now(), true).await;
 
         assert!(shutdown.is_complete());
         assert_eq!(shutdown.evidence(), Some(expected));
+
+        // This owner is declared before the release guard, so unwinding releases the real
+        // thread before the audit owner's synchronous Drop attempts its bounded join.
+        let mut retained: Option<ProductionAuditShutdown>;
+        let (release, wait) = mpsc::channel::<()>();
+        let (control, commands) = mpsc::sync_channel(1);
+        let worker = thread::spawn(move || {
+            let _released_or_disconnected = wait.recv();
+            drop(commands);
+            Ok(expected)
+        });
+        let original_thread = worker.thread().id();
+        let service = ProductionAuditService {
+            control,
+            worker: Some(worker),
+            drop_deadline: Duration::from_secs(1),
+            execution_read_view: ProductionExecutionAuditReadView::try_new()?,
+        };
+        let mut pending = Box::pin(
+            service.shutdown(tokio::time::Instant::now() + Duration::from_millis(5), true),
+        );
+        // Also declared after the consuming shutdown future: a panic during its first wait
+        // disconnects the gate before that future drops its still-owned audit service.
+        let release_guard = release;
+        retained = Some(pending.as_mut().await);
+        let shutdown = retained
+            .as_mut()
+            .ok_or(ProductionExecutionAuditReadError::Unavailable)?;
+        assert!(matches!(
+            shutdown.status(),
+            ProductionAuditShutdownStatus::DeadlineExceeded
+        ));
+        assert_eq!(
+            shutdown
+                .owner
+                .as_ref()
+                .and_then(|owner| owner.worker.as_ref())
+                .map(|worker| worker.thread().id()),
+            Some(original_thread)
+        );
+        assert!(!shutdown.is_complete());
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(5),
+                shutdown
+                    .resume_after_timeout(tokio::time::Instant::now() + Duration::from_secs(1),)
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            shutdown
+                .owner
+                .as_ref()
+                .and_then(|owner| owner.worker.as_ref())
+                .map(|worker| worker.thread().id()),
+            Some(original_thread)
+        );
+        assert!(matches!(
+            shutdown.status(),
+            ProductionAuditShutdownStatus::DeadlineExceeded
+        ));
+        drop(release_guard);
+        shutdown
+            .resume_after_timeout(tokio::time::Instant::now() + Duration::from_secs(1))
+            .await;
+        assert!(shutdown.is_complete());
+        assert!(shutdown.owner.is_none());
+        assert_eq!(shutdown.evidence(), Some(expected));
+        Ok(())
     }
 }

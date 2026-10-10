@@ -7,19 +7,20 @@ use serde_json::{Map, Value};
 use thiserror::Error;
 
 use crate::{
-    JsonStructureLimits, ProgressError, RequestContext, ScopeRequirement, ServiceContractError,
-    TOOL_CONFIRMATION_FIELD, TOOL_INSTRUMENT_IDS_FIELD, TOOL_RESULT_LIMITS_FIELD,
-    TOOL_SOURCE_COVERAGE_FIELD, TOOL_TIME_RANGE_FIELD, ToolAuthorization, ToolContract, ToolScope,
-    TypedToolResult, output_schema, validate_json_contract,
+    JsonStructureLimits, ProgressError, RequestContext, ResultEnvelopeProjection, ScopeRequirement,
+    ServiceContractError, TOOL_CONFIRMATION_FIELD, TOOL_INSTRUMENT_IDS_FIELD,
+    TOOL_RESULT_LIMITS_FIELD, TOOL_SOURCE_COVERAGE_FIELD, TOOL_TIME_RANGE_FIELD, ToolAuthorization,
+    ToolContract, ToolScope, TypedToolResult, output_schema, validate_json_contract,
 };
 
 const CONTRACT_METADATA_KEY: &str = "org.market-squawk/tool-contract";
 const MAXIMUM_TOOL_NAME_BYTES: usize = 128;
 const MAXIMUM_TOOL_VERSION_BYTES: usize = 64;
 const MAXIMUM_TOOL_DESCRIPTION_BYTES: usize = 1024;
-const MAXIMUM_TOOLS: usize = 256;
-const MAXIMUM_DESCRIPTOR_SCHEMA_BYTES: usize = 64 * 1024;
-const MAXIMUM_DESCRIPTOR_SCHEMA_DEPTH: usize = 32;
+// Closed production contracts are intentionally detailed; these bounds still cap every retained
+// descriptor independently while allowing the complete Source and Market schema graphs.
+const MAXIMUM_DESCRIPTOR_SCHEMA_BYTES: usize = 256 * 1024;
+const MAXIMUM_DESCRIPTOR_SCHEMA_DEPTH: usize = 64;
 const MAXIMUM_DESCRIPTOR_METADATA_BYTES: usize = 8 * 1024;
 const MAXIMUM_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 
@@ -34,6 +35,7 @@ pub struct ToolDescriptor {
     output_data_schema: Value,
     output_schema: Map<String, Value>,
     output_schema_bytes: usize,
+    result_projection: ResultEnvelopeProjection,
     contract: ToolContract,
     metadata: Map<String, Value>,
     effects: ToolEffects,
@@ -189,8 +191,12 @@ impl ToolDescriptor {
         if require_specific_output && !output_schema::validate_data_schema(&output_data_schema) {
             return Err(ServiceCapabilityError::InvalidOutputSchema);
         }
-        let output_schema =
-            output_schema::output_schema(&output_data_schema, contract.result().artifact());
+        let result_projection = ResultEnvelopeProjection::NativeEvidenceV1;
+        let output_schema = output_schema::output_schema(
+            &output_data_schema,
+            contract.result().artifact(),
+            result_projection,
+        );
         let output_schema_bytes = validate_json_contract(
             &Value::Object(output_schema.clone()),
             schema_limits,
@@ -229,6 +235,7 @@ impl ToolDescriptor {
             output_data_schema,
             output_schema,
             output_schema_bytes,
+            result_projection,
             contract,
             metadata,
             effects,
@@ -293,6 +300,77 @@ impl ToolDescriptor {
         &self.output_schema
     }
 
+    /// Projects this native descriptor into the ordinary provider-neutral V1 product boundary.
+    ///
+    /// The returned descriptor retains the native contract and result validation used by dispatch,
+    /// while omitting source selection from public input, native metadata from discovery, and
+    /// artifact references from the advertised result shape.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ServiceCapabilityError`] when the projected schema exceeds the descriptor limits
+    /// or does not contain the expected closed input object.
+    pub fn try_into_product_v1<A>(
+        mut self,
+        input_admission: A,
+    ) -> Result<Self, ServiceCapabilityError>
+    where
+        A: ToolInputAdmission,
+    {
+        let properties = self
+            .input_schema
+            .get_mut("properties")
+            .and_then(Value::as_object_mut)
+            .ok_or(ServiceCapabilityError::InvalidSchema)?;
+        properties.remove(TOOL_SOURCE_COVERAGE_FIELD);
+        if let Some(required) = self.input_schema.get_mut("required") {
+            let required = required
+                .as_array_mut()
+                .ok_or(ServiceCapabilityError::InvalidSchema)?;
+            required.retain(|field| field.as_str() != Some(TOOL_SOURCE_COVERAGE_FIELD));
+            if required.is_empty() {
+                self.input_schema.remove("required");
+            }
+        }
+        let schema_limits =
+            JsonStructureLimits::try_new(MAXIMUM_DESCRIPTOR_SCHEMA_DEPTH, 8 * 1024, 1_000, 1_000)
+                .map_err(|_| ServiceCapabilityError::InvalidSchema)?;
+        self.input_schema_bytes = validate_json_contract(
+            &Value::Object(self.input_schema.clone()),
+            schema_limits,
+            MAXIMUM_DESCRIPTOR_SCHEMA_BYTES,
+        )
+        .map_err(|_| ServiceCapabilityError::InvalidSchema)?;
+
+        let projection = ResultEnvelopeProjection::ProductV1;
+        let output_schema = output_schema::output_schema(
+            &self.output_data_schema,
+            self.contract.result().artifact(),
+            projection,
+        );
+        let schema_limits =
+            JsonStructureLimits::try_new(MAXIMUM_DESCRIPTOR_SCHEMA_DEPTH, 8 * 1024, 1_000, 1_000)
+                .map_err(|_| ServiceCapabilityError::InvalidOutputSchema)?;
+        let output_schema_bytes = validate_json_contract(
+            &Value::Object(output_schema.clone()),
+            schema_limits,
+            MAXIMUM_DESCRIPTOR_SCHEMA_BYTES,
+        )
+        .map_err(|_| ServiceCapabilityError::InvalidOutputSchema)?;
+        self.output_schema = output_schema;
+        self.output_schema_bytes = output_schema_bytes;
+        self.result_projection = projection;
+        self.metadata.clear();
+        self.input_admission = Arc::new(input_admission);
+        Ok(self)
+    }
+
+    /// Explicit V1 result projection represented by the advertised output schema.
+    #[must_use]
+    pub const fn result_projection(&self) -> ResultEnvelopeProjection {
+        self.result_projection
+    }
+
     /// Validates operation-owned result data before any transport may publish it.
     #[must_use]
     pub(crate) fn validates_output_data(&self, data: &Value) -> bool {
@@ -325,7 +403,7 @@ impl ToolDescriptor {
     /// arguments.
     pub fn admit(&self, arguments: Map<String, Value>) -> Result<TypedToolRequest, ServiceError> {
         let bounded_arguments = Value::Object(arguments);
-        let argument_limits = JsonStructureLimits::try_new(32, 64 * 1024, 10_000, 2_000)
+        let argument_limits = JsonStructureLimits::try_new(32, 128 * 1024, 10_000, 2_000)
             .map_err(|_| ServiceError::Internal)?;
         validate_json_contract(
             &bounded_arguments,
@@ -540,16 +618,11 @@ impl ServiceCapabilities {
     ///
     /// # Errors
     ///
-    /// Returns [`ServiceCapabilityError`] for duplicate names or more than 256 operations.
+    /// Returns [`ServiceCapabilityError`] for duplicate names. Descriptors are constructed by
+    /// the application, not supplied by requests; each descriptor validates its own schema bounds.
     pub fn try_new(mut tools: Vec<ToolDescriptor>) -> Result<Self, ServiceCapabilityError> {
-        if tools.len() > MAXIMUM_TOOLS {
-            return Err(ServiceCapabilityError::TooManyTools {
-                maximum: MAXIMUM_TOOLS,
-            });
-        }
         tools.sort_unstable_by(|left, right| left.name().cmp(right.name()));
-        let mut names = HashSet::with_capacity(tools.len());
-        if tools.iter().any(|tool| !names.insert(tool.name())) {
+        if tools.windows(2).any(|pair| pair[0].name() == pair[1].name()) {
             return Err(ServiceCapabilityError::DuplicateName);
         }
         Ok(Self {

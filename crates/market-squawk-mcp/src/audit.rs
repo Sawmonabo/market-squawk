@@ -9,6 +9,8 @@ use thiserror::Error;
 /// Honest local identity evidence available to a plain inherited stdio transport.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LocalProcessIdentityClass {
+    /// The installed service authenticated an owner-scoped loopback credential before dispatch.
+    AuthenticatedInstalledClient,
     /// The peer reached this process over inherited stdio, which does not authenticate the peer.
     InheritedStdioUnverified,
     /// I/O was supplied by the caller; locality, inheritance, and peer identity are unverified.
@@ -29,6 +31,15 @@ pub enum AuditOperation {
         /// Exact registered operation name.
         name: Arc<str>,
         /// Exact registered contract version.
+        version: Arc<str>,
+    },
+    /// One closed provider-neutral product resource read.
+    ReadResource {
+        /// Stable product resource kind without its opaque token.
+        name: Arc<str>,
+        /// Exact registered application operation.
+        operation: Arc<str>,
+        /// Exact registered operation contract version.
         version: Arc<str>,
     },
     /// Known notification or unsupported request.

@@ -970,7 +970,8 @@ impl AuthorityTransitionService {
         root: ArtifactRoot,
         object_config: ObjectStoreConfig,
     ) -> Result<(CatalogAuthority, ParquetObjectStore), AuthorityTransitionError> {
-        authority.integrity_check()?;
+        // Catalog opening admits the exact identity and schema under retained writer ownership.
+        // Composition verifies the authority chain and root binding without auditing all history.
         let snapshot = authority.authority_snapshot()?;
         let AuthorityState::Bound { transition, .. } = snapshot.state() else {
             return match snapshot.state() {

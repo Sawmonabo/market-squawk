@@ -68,6 +68,10 @@ pub enum LiveEventClass {
     InstrumentStatus,
     /// Corporate-action announcement.
     CorporateAction,
+    /// Source chart update without completed historical-bar authority.
+    Chart,
+    /// Whole source-scoped ranked cohort; not an instrument price or execution observation.
+    Screener,
 }
 
 impl LiveEventClass {
@@ -230,6 +234,19 @@ impl BookStateBinding {
     }
 }
 
+/// Closed scope of a live observation. Only screener cohorts may omit an instrument.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    content = "identity",
+    rename_all = "snake_case",
+    deny_unknown_fields
+)]
+pub enum LiveEvidenceScope {
+    Instrument(InstrumentId),
+    SourceCohort(SourceIdentifier),
+}
+
 /// Complete immutable key preventing evidence transplant between live observations.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -239,7 +256,7 @@ pub struct LiveEvidenceBinding {
     metadata_revision: MetadataRevision,
     authorization_basis: AuthorizationBasis,
     venue_id: VenueId,
-    instrument_id: InstrumentId,
+    scope: LiveEvidenceScope,
     connection_generation: ConnectionGeneration,
     provider_product: ProviderProduct,
     provider_channel: ProviderChannel,
@@ -277,6 +294,9 @@ impl LiveEvidenceBinding {
         canonical_state_digest: CanonicalStateDigest,
         book_state: Option<BookStateBinding>,
     ) -> Result<Self, BindingError> {
+        if event_class == LiveEventClass::Screener {
+            return Err(BindingError::InvalidEventScope);
+        }
         if event_class.requires_book_state() {
             let state = book_state.as_ref().ok_or(BindingError::MissingBookState)?;
             if state.state_digest != canonical_state_digest {
@@ -291,7 +311,7 @@ impl LiveEvidenceBinding {
             metadata_revision,
             authorization_basis,
             venue_id,
-            instrument_id,
+            scope: LiveEvidenceScope::Instrument(instrument_id),
             connection_generation,
             provider_product,
             provider_channel,
@@ -301,6 +321,46 @@ impl LiveEvidenceBinding {
             canonical_state_digest,
             book_state,
         })
+    }
+
+    /// Binds a genuine source cohort without fabricating an instrument or execution scope.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the complete cohort anti-transplant key remains atomic"
+    )]
+    pub fn new_source_cohort(
+        source_id: SourceId,
+        session_id: SourceIdentifier,
+        metadata_revision: MetadataRevision,
+        authorization_basis: AuthorizationBasis,
+        venue_id: VenueId,
+        connection_generation: ConnectionGeneration,
+        provider_product: ProviderProduct,
+        provider_channel: ProviderChannel,
+        cohort_key: SourceIdentifier,
+        payload_digest: EvidenceDigest,
+        canonical_state_digest: CanonicalStateDigest,
+    ) -> Self {
+        Self {
+            source_id,
+            session_id,
+            metadata_revision,
+            authorization_basis,
+            venue_id,
+            scope: LiveEvidenceScope::SourceCohort(cohort_key.clone()),
+            connection_generation,
+            provider_product,
+            provider_channel,
+            event_class: LiveEventClass::Screener,
+            source_identifier: cohort_key,
+            payload_digest,
+            canonical_state_digest,
+            book_state: None,
+        }
+    }
+
+    pub const fn scope(&self) -> &LiveEvidenceScope {
+        &self.scope
     }
 
     /// Returns the source identity.
@@ -324,8 +384,11 @@ impl LiveEvidenceBinding {
         &self.venue_id
     }
     /// Returns the instrument identity.
-    pub const fn instrument_id(&self) -> InstrumentId {
-        self.instrument_id
+    pub const fn instrument_id(&self) -> Option<InstrumentId> {
+        match &self.scope {
+            LiveEvidenceScope::Instrument(instrument) => Some(*instrument),
+            LiveEvidenceScope::SourceCohort(_) => None,
+        }
     }
     /// Returns the connection generation.
     pub const fn connection_generation(&self) -> ConnectionGeneration {
@@ -369,7 +432,7 @@ struct LiveEvidenceBindingWire {
     metadata_revision: MetadataRevision,
     authorization_basis: AuthorizationBasis,
     venue_id: VenueId,
-    instrument_id: InstrumentId,
+    scope: LiveEvidenceScope,
     connection_generation: ConnectionGeneration,
     provider_product: ProviderProduct,
     provider_channel: ProviderChannel,
@@ -386,23 +449,46 @@ impl<'de> Deserialize<'de> for LiveEvidenceBinding {
         D: Deserializer<'de>,
     {
         let wire = LiveEvidenceBindingWire::deserialize(deserializer)?;
-        Self::new(
-            wire.source_id,
-            wire.session_id,
-            wire.metadata_revision,
-            wire.authorization_basis,
-            wire.venue_id,
-            wire.instrument_id,
-            wire.connection_generation,
-            wire.provider_product,
-            wire.provider_channel,
-            wire.event_class,
-            wire.source_identifier,
-            wire.payload_digest,
-            wire.canonical_state_digest,
-            wire.book_state,
-        )
-        .map_err(serde::de::Error::custom)
+        match wire.scope {
+            LiveEvidenceScope::Instrument(instrument_id) => Self::new(
+                wire.source_id,
+                wire.session_id,
+                wire.metadata_revision,
+                wire.authorization_basis,
+                wire.venue_id,
+                instrument_id,
+                wire.connection_generation,
+                wire.provider_product,
+                wire.provider_channel,
+                wire.event_class,
+                wire.source_identifier,
+                wire.payload_digest,
+                wire.canonical_state_digest,
+                wire.book_state,
+            )
+            .map_err(serde::de::Error::custom),
+            LiveEvidenceScope::SourceCohort(key) => {
+                if wire.event_class != LiveEventClass::Screener
+                    || wire.book_state.is_some()
+                    || key != wire.source_identifier
+                {
+                    return Err(serde::de::Error::custom(BindingError::InvalidEventScope));
+                }
+                Ok(Self::new_source_cohort(
+                    wire.source_id,
+                    wire.session_id,
+                    wire.metadata_revision,
+                    wire.authorization_basis,
+                    wire.venue_id,
+                    wire.connection_generation,
+                    wire.provider_product,
+                    wire.provider_channel,
+                    key,
+                    wire.payload_digest,
+                    wire.canonical_state_digest,
+                ))
+            }
+        }
     }
 }
 
@@ -515,6 +601,8 @@ where
 /// Failure to construct a live binding or validity window.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BindingError {
+    /// A source cohort was attached to an instrument event, or its key differed.
+    InvalidEventScope,
     /// A book event omitted its exact book-state identity.
     MissingBookState,
     /// A non-book event supplied an order-book state binding.
@@ -530,6 +618,9 @@ pub enum BindingError {
 impl fmt::Display for BindingError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
+            Self::InvalidEventScope => {
+                formatter.write_str("live observation scope does not match its event class")
+            }
             Self::MissingBookState => {
                 formatter.write_str("book events require a book-state binding")
             }

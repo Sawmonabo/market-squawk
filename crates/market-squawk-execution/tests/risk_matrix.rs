@@ -16,11 +16,22 @@ use market_squawk_domain::{
 };
 use market_squawk_execution::{
     AccountBootstrap, AccountCoordinatorConfig, AccountIdempotencyBootstrap,
-    AccountRiskCoordinator, AccountRiskViolation, ExecutionAuditConfig, ExecutionAuditWriter,
-    MarketRiskInput, OrderIntent, OrderIntentInput, PreAuthorityRiskOutcome, RiskLimits,
-    RiskLimitsInput, RiskPolicyIdentity, RiskRejectionCode, RiskService, RiskServiceConfig,
+    AccountRiskCoordinator, AccountRiskReservation, AccountRiskViolation, ApprovedOrder,
+    ExecutionAuditConfig, ExecutionAuditWriter, MarketRiskInput, OrderIntent, OrderIntentInput,
+    PaperRiskAdvisoryDraft, PreAuthorityRiskOutcome, RiskAdvisoryAuthority, RiskAdvisoryCheck,
+    RiskAdvisoryEvidence, RiskAdvisoryOutcome, RiskLimits, RiskLimitsInput, RiskOutcome,
+    RiskPolicyIdentity, RiskRejectionCode, RiskService, RiskServiceConfig,
 };
 use rust_decimal::Decimal;
+use static_assertions::assert_not_impl_any;
+
+assert_not_impl_any!(
+    RiskAdvisoryEvidence:
+        Into<AccountRiskReservation>,
+        Into<ApprovedOrder>,
+        Into<PreAuthorityRiskOutcome>,
+        Into<RiskOutcome>
+);
 
 #[test]
 fn risk_returns_stably_ordered_source_market_and_account_reasons_before_mutation() {
@@ -153,6 +164,179 @@ fn risk_returns_stably_ordered_source_market_and_account_reasons_before_mutation
                 AccountRiskViolation::OrderNotionalLimit
             ))
     );
+}
+
+#[test]
+fn paper_risk_advisory_is_analysis_only_and_preserves_exact_state() {
+    let fixture = Fixture::new();
+    let account_config = AccountCoordinatorConfig {
+        maximum_intent_lifetime_nanos: NonZeroU64::new(i64::MAX as u64)
+            .unwrap_or_else(|| panic!("fixture intent lifetime is nonzero")),
+        ..AccountCoordinatorConfig::default()
+    };
+    let mut account = fixture.account(Decimal::new(500, 0));
+    account.positions.clear();
+    account.position_cost_basis.clear();
+    let coordinator = Arc::new(
+        AccountRiskCoordinator::try_new(account_config, [account])
+            .unwrap_or_else(|error| panic!("valid coordinator: {error}")),
+    );
+    let (audit, mut audit_reader) = ExecutionAuditWriter::try_new(ExecutionAuditConfig {
+        maximum_records: NonZeroUsize::new(8)
+            .unwrap_or_else(|| panic!("fixture audit count is nonzero")),
+        maximum_bytes: NonZeroU32::new(8_192)
+            .unwrap_or_else(|| panic!("fixture audit bytes are nonzero")),
+    })
+    .unwrap_or_else(|error| panic!("valid audit fixture: {error}"));
+    let limits = fixture.limits();
+    let limits_digest = limits.digest();
+    let policy = RiskPolicyIdentity::new(
+        &SourceIdentifier::try_from("risk/default")
+            .unwrap_or_else(|error| panic!("valid policy identity: {error}")),
+        RuleVersion::new(1).unwrap_or_else(|error| panic!("valid policy version: {error}")),
+    );
+    let service = RiskService::try_new(
+        Arc::clone(&coordinator),
+        super::portfolio_state_integration::portfolio_capability(
+            fixture.account_id,
+            fixture.usd,
+            Decimal::new(500, 0),
+        )
+        .unwrap_or_else(|error| panic!("valid portfolio fixture: {error}")),
+        limits,
+        audit,
+        RiskServiceConfig {
+            policy,
+            policy_valid_until: Timestamp::from_unix_nanos(i64::MAX),
+            maximum_approval_lifetime: std::time::Duration::from_secs(1),
+        },
+    )
+    .unwrap_or_else(|error| panic!("valid risk service: {error}"));
+    let intent = fixture.intent(5, 1, 100, 50);
+    let market = MarketRiskInput::try_new(
+        fixture.terms,
+        DataQuality::DirectVerified,
+        true,
+        true,
+        Timestamp::from_unix_nanos(1),
+        Timestamp::from_unix_nanos(i64::MAX),
+        PriceTicks::new(100),
+        PriceTicks::new(100),
+    )
+    .unwrap_or_else(|error| panic!("valid advisory market input: {error}"));
+    let same_market = MarketRiskInput::try_new(
+        fixture.terms,
+        DataQuality::DirectVerified,
+        true,
+        true,
+        Timestamp::from_unix_nanos(1),
+        Timestamp::from_unix_nanos(i64::MAX),
+        PriceTicks::new(100),
+        PriceTicks::new(100),
+    )
+    .unwrap_or_else(|error| panic!("valid duplicate market input: {error}"));
+    let changed_market = MarketRiskInput::try_new(
+        fixture.terms,
+        DataQuality::DirectVerified,
+        true,
+        true,
+        Timestamp::from_unix_nanos(1),
+        Timestamp::from_unix_nanos(i64::MAX),
+        PriceTicks::new(101),
+        PriceTicks::new(100),
+    )
+    .unwrap_or_else(|error| panic!("valid changed market input: {error}"));
+    assert_eq!(market.digest(), same_market.digest());
+    assert_ne!(market.digest(), changed_market.digest());
+
+    let account_before = coordinator
+        .snapshot_recovery_state(fixture.account_id)
+        .unwrap_or_else(|error| panic!("account state available before advisory: {error}"));
+    let idempotency_before = coordinator
+        .snapshot_idempotency(fixture.account_id)
+        .unwrap_or_else(|error| panic!("idempotency state available before advisory: {error}"));
+    assert_eq!(
+        audit_reader
+            .try_next_record()
+            .unwrap_or_else(|error| panic!("audit reader available before advisory: {error}")),
+        None
+    );
+
+    let generation = service
+        .current_advisory_generation(&intent)
+        .unwrap_or_else(|error| panic!("current advisory generation available: {error}"));
+    let draft = PaperRiskAdvisoryDraft::new(&intent, market, &generation);
+    let evidence = service
+        .evaluate_advisory(&draft)
+        .unwrap_or_else(|error| panic!("current advisory evaluation succeeds: {error}"));
+
+    assert_eq!(evidence.intent_digest(), intent.digest());
+    assert_eq!(evidence.generation(), &generation);
+    assert_eq!(evidence.policy_digest(), policy.digest());
+    assert_eq!(evidence.ruleset_version(), policy.ruleset_version());
+    assert_eq!(evidence.limits_digest(), limits_digest);
+    assert_eq!(evidence.market_input_digest(), market.digest());
+    assert_ne!(evidence.digest(), [0; 32]);
+    assert!(!evidence.kill_switch());
+    assert_eq!(
+        evidence.checks_evaluated(),
+        [
+            RiskAdvisoryCheck::Policy,
+            RiskAdvisoryCheck::Market,
+            RiskAdvisoryCheck::AccountGeneration,
+            RiskAdvisoryCheck::PositionGeneration,
+            RiskAdvisoryCheck::AccountLimits,
+            RiskAdvisoryCheck::StateRecheck,
+        ]
+    );
+    assert!(evidence.checks_unavailable().is_empty());
+    assert!(evidence.reasons().is_empty());
+    assert_eq!(
+        evidence.outcome(),
+        RiskAdvisoryOutcome::WouldPassAtEvaluation
+    );
+    assert_eq!(evidence.authority(), RiskAdvisoryAuthority::AnalysisOnly);
+    assert!(evidence.valid_until() >= evidence.evaluated_at());
+
+    let changed_draft = PaperRiskAdvisoryDraft::new(&intent, changed_market, &generation);
+    let changed_evidence = service
+        .evaluate_advisory(&changed_draft)
+        .unwrap_or_else(|error| panic!("changed market advisory remains evaluable: {error}"));
+    assert_eq!(
+        changed_evidence.market_input_digest(),
+        changed_market.digest()
+    );
+    assert_ne!(
+        changed_evidence.market_input_digest(),
+        evidence.market_input_digest()
+    );
+    assert_ne!(changed_evidence.digest(), evidence.digest());
+
+    let account_after = coordinator
+        .snapshot_recovery_state(fixture.account_id)
+        .unwrap_or_else(|error| panic!("account state available after advisory: {error}"));
+    let idempotency_after = coordinator
+        .snapshot_idempotency(fixture.account_id)
+        .unwrap_or_else(|error| panic!("idempotency state available after advisory: {error}"));
+    let generation_after = service
+        .current_advisory_generation(&intent)
+        .unwrap_or_else(|error| panic!("advisory generation unchanged: {error}"));
+    assert_eq!(account_after, account_before);
+    assert_eq!(idempotency_after, idempotency_before);
+    assert_eq!(generation_after, generation);
+    assert_eq!(
+        audit_reader
+            .try_next_record()
+            .unwrap_or_else(|error| panic!("audit reader available after advisory: {error}")),
+        None
+    );
+
+    let PreAuthorityRiskOutcome::Reserved(reservation) =
+        service.evaluate_pre_authority(&intent, &market)
+    else {
+        panic!("separate current-authority risk must still be able to reserve capacity");
+    };
+    drop(reservation);
 }
 
 pub(super) struct Fixture {

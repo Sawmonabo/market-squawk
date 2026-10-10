@@ -1,4 +1,4 @@
-//! Closed JSON DTO conversion into invariant-preserving dataset-build contracts.
+//! Closed JSON DTO conversion into invariant-preserving phase-one generation requests.
 
 use std::{
     num::{NonZeroU16, NonZeroU32, NonZeroUsize},
@@ -10,17 +10,19 @@ use market_squawk_data::{
     ChronologicalSplitPolicy, ComponentAdjustmentEvidence, ComponentKind, ComponentScope,
     ComponentSelector, ComponentValue, CorporateActionAdjustment, CorporateActionLimits,
     CorporateActionPolicy, CorporateActionSensitivity, DatasetBuildInputs, DatasetBuildLimits,
-    DatasetBuildPolicy, DatasetBuildRequest, DatasetExample, DatasetId, DatasetManifestRef,
-    DatasetOutputAuthorization, DatasetSchemaRef, DatasetSchemaRegistry,
-    FeatureLabelComponentInput, FeatureLabelComponentSpec, MissingValuePolicy,
+    DatasetBuildPolicy, DatasetBuildPurpose, DatasetBuildRequest, DatasetExample, DatasetId,
+    DatasetManifestRef, DatasetOutputAuthorization, DatasetSchemaRef, DatasetSchemaRegistry,
+    DatasetStudyPolicy, FeatureLabelComponentInput, FeatureLabelComponentSpec, MissingValuePolicy,
     ObservationFamilyKey, PointInTimeLimits, PointInTimePolicy, PointInTimeRevisionMode,
     ResearchUse, ResearchUseLimits, RightsBasis, Sha256Digest, UniverseId, UniverseLimits,
     UniverseMembership,
 };
 use market_squawk_domain::{
-    AvailabilityEvidence, CalendarDate, Currency, DigestAlgorithm, EffectiveInterval,
-    EvidenceDigest, InstrumentId, ResearchPeriod, ResearchTemporalCoordinate, SchemaVersion,
-    SourceId, SourceIdentifier, Timestamp,
+    AvailabilityEvidence, BarTimestampBasis, CalendarDate, CompanyObservationSubject, Currency,
+    DigestAlgorithm, EffectiveInterval, EvidenceDigest, FundamentalPeriod, HistoricalStudyBasis,
+    InstrumentId, MarketBarAdjustment, MarketBarSessionEvidence, ProviderInstrumentId,
+    ResearchPeriod, ResearchTemporalCoordinate, SchemaVersion, SourceId, SourceIdentifier,
+    Timestamp, VenueId,
 };
 use market_squawk_platform::UserOwnedInputEvidence;
 use rust_decimal::Decimal;
@@ -30,7 +32,7 @@ use super::CliDatasetError;
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub(super) struct DatasetBuildRequestDto {
+pub(crate) struct PhaseOneDerivedGenerationRequestDto {
     output_dataset: String,
     parents: Vec<ManifestDto>,
     universe: UniverseDto,
@@ -43,10 +45,10 @@ pub(super) struct DatasetBuildRequestDto {
     limits: BuildLimitsDto,
 }
 
-impl DatasetBuildRequestDto {
-    pub(super) fn into_domain(
+impl PhaseOneDerivedGenerationRequestDto {
+    pub(crate) fn into_domain(
         self,
-        ownership: UserOwnedInputEvidence,
+        ownership: Option<UserOwnedInputEvidence>,
     ) -> Result<DatasetBuildRequest, CliDatasetError> {
         let parents = convert_all(self.parents, ManifestDto::into_domain)?;
         let component_specs = convert_all(self.component_specs, ComponentSpecDto::into_domain)?;
@@ -262,18 +264,25 @@ impl CorporateActionSensitivityDto {
 struct ExampleDto {
     example_id: String,
     instrument_id: InstrumentId,
-    cutoff_at_unix_nanos: i64,
-    label_cutoff_at_unix_nanos: i64,
+    source_selection_as_of_unix_nanos: i64,
+    #[serde(deserialize_with = "required_nullable")]
+    label_selection_as_of_unix_nanos: Option<i64>,
+    decision_at_unix_nanos: i64,
+    effective_cutoff: TemporalCoordinateDto,
+    label_effective_cutoff: TemporalCoordinateDto,
     components: Vec<ComponentInputDto>,
 }
 
 impl ExampleDto {
     fn into_domain(self) -> Result<DatasetExample, CliDatasetError> {
-        DatasetExample::try_new(
+        DatasetExample::try_new_with_temporal_cutoffs(
             self.example_id,
             self.instrument_id,
-            timestamp(self.cutoff_at_unix_nanos),
-            timestamp(self.label_cutoff_at_unix_nanos),
+            timestamp(self.source_selection_as_of_unix_nanos),
+            self.label_selection_as_of_unix_nanos.map(timestamp),
+            timestamp(self.decision_at_unix_nanos),
+            self.effective_cutoff.into_domain()?,
+            self.label_effective_cutoff.into_domain()?,
             convert_all(self.components, ComponentInputDto::into_domain)?,
         )
         .map_err(|_| CliDatasetError::InvalidRequest)
@@ -286,6 +295,8 @@ struct ComponentInputDto {
     spec: ComponentSpecDto,
     value: ComponentValueDto,
     selectors: Vec<ObservationFamilyDto>,
+    selection_effective_cutoff: TemporalCoordinateDto,
+    label_selection_effective_cutoff: Option<TemporalCoordinateDto>,
     adjustment: AdjustmentEvidenceDto,
 }
 
@@ -299,6 +310,10 @@ impl ComponentInputDto {
                 .map(ObservationFamilyDto::into_domain)
                 .map(|result| result.map(ComponentSelector::new))
                 .collect::<Result<Vec<_>, _>>()?,
+            self.selection_effective_cutoff.into_domain()?,
+            self.label_selection_effective_cutoff
+                .map(TemporalCoordinateDto::into_domain)
+                .transpose()?,
             self.adjustment.into_domain()?,
         )
         .map_err(|_| CliDatasetError::InvalidRequest)
@@ -400,20 +415,35 @@ impl AdjustmentEvidenceDto {
 enum ObservationFamilyDto {
     Filing {
         source_id: SourceId,
-        instrument_id: InstrumentId,
+        subject: CompanyObservationSubject,
         accession: SourceIdentifier,
     },
     Fundamental {
         source_id: SourceId,
-        instrument_id: InstrumentId,
-        source_record: SourceIdentifier,
+        subject: CompanyObservationSubject,
         concept: SourceIdentifier,
         unit: SourceIdentifier,
-        effective: TemporalCoordinateDto,
+        period: FundamentalPeriod,
     },
     Macro {
         source_id: SourceId,
         series: SourceIdentifier,
+        effective: TemporalCoordinateDto,
+    },
+    MarketBar {
+        source_id: SourceId,
+        instrument_id: InstrumentId,
+        venue_id: VenueId,
+        provider_instrument_id: ProviderInstrumentId,
+        feed: SourceIdentifier,
+        interval: SourceIdentifier,
+        adjustment: MarketBarAdjustment,
+        #[serde(deserialize_with = "required_nullable")]
+        timestamp_basis: Option<BarTimestampBasis>,
+        #[serde(deserialize_with = "required_nullable")]
+        session: Option<MarketBarSessionEvidence>,
+        #[serde(deserialize_with = "required_nullable")]
+        nominal_ruleset: Option<SourceIdentifier>,
         effective: TemporalCoordinateDto,
     },
     PortfolioPosition {
@@ -454,27 +484,25 @@ impl ObservationFamilyDto {
         Ok(match self {
             Self::Filing {
                 source_id,
-                instrument_id,
+                subject,
                 accession,
             } => ObservationFamilyKey::Filing {
                 source_id,
-                instrument_id,
+                subject,
                 accession,
             },
             Self::Fundamental {
                 source_id,
-                instrument_id,
-                source_record,
+                subject,
                 concept,
                 unit,
-                effective,
+                period,
             } => ObservationFamilyKey::Fundamental {
                 source_id,
-                instrument_id,
-                source_record,
+                subject,
                 concept,
                 unit,
-                effective: effective.into_domain()?,
+                period,
             },
             Self::Macro {
                 source_id,
@@ -485,6 +513,45 @@ impl ObservationFamilyDto {
                 series,
                 effective: effective.into_domain()?,
             },
+            Self::MarketBar {
+                source_id,
+                instrument_id,
+                venue_id,
+                provider_instrument_id,
+                feed,
+                interval,
+                adjustment,
+                timestamp_basis,
+                session,
+                nominal_ruleset,
+                effective,
+            } => {
+                let valid_precision = match &effective {
+                    TemporalCoordinateDto::ExactTimestamp { .. } => {
+                        timestamp_basis.is_some() && session.is_some() && nominal_ruleset.is_none()
+                    }
+                    TemporalCoordinateDto::CalendarDate { .. } => {
+                        timestamp_basis.is_none() && session.is_none() && nominal_ruleset.is_some()
+                    }
+                    TemporalCoordinateDto::SourcePeriod { .. } => false,
+                };
+                if !valid_precision {
+                    return Err(CliDatasetError::InvalidRequest);
+                }
+                ObservationFamilyKey::MarketBar {
+                    source_id,
+                    instrument_id,
+                    venue_id,
+                    provider_instrument_id,
+                    feed,
+                    interval,
+                    adjustment,
+                    timestamp_basis,
+                    session,
+                    nominal_ruleset,
+                    effective: effective.into_domain()?,
+                }
+            }
             Self::PortfolioPosition {
                 source_id,
                 instrument_id,
@@ -608,6 +675,8 @@ struct PolicyDto {
     corporate_actions: CorporateActionPolicyDto,
     missing_values: MissingValuePolicyDto,
     implementation_revision: SourceIdentifier,
+    #[serde(deserialize_with = "required_nullable")]
+    study: Option<StudyPolicyDto>,
 }
 
 impl PolicyDto {
@@ -618,8 +687,45 @@ impl PolicyDto {
             self.corporate_actions.into_domain()?,
             self.missing_values.into_domain(),
             self.implementation_revision,
+            self.study.map(StudyPolicyDto::into_domain).transpose()?,
         ))
     }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct StudyPolicyDto {
+    basis: HistoricalStudyBasis,
+    purpose: DatasetBuildPurpose,
+    snapshot_as_of_unix_nanos: i64,
+    #[serde(deserialize_with = "required_nullable")]
+    decision_lag_nanos: Option<u64>,
+    target_horizon_nanos: u64,
+}
+
+impl StudyPolicyDto {
+    fn into_domain(self) -> Result<DatasetStudyPolicy, CliDatasetError> {
+        DatasetStudyPolicy::try_new(
+            self.basis,
+            self.purpose,
+            timestamp(self.snapshot_as_of_unix_nanos),
+            self.decision_lag_nanos.map(Duration::from_nanos),
+            market_squawk_data::DatasetTargetHorizon::ExactElapsed(Duration::from_nanos(
+                self.target_horizon_nanos,
+            )),
+        )
+        .map_err(|_| CliDatasetError::InvalidRequest)
+    }
+}
+
+// Explicit null and an omitted clock/policy are different requests. No default can silently
+// remove historical qualification or manufacture a label/source knowledge time.
+fn required_nullable<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
 }
 
 #[derive(Deserialize)]
@@ -783,14 +889,16 @@ struct OutputAuthorizationDto {
 impl OutputAuthorizationDto {
     fn into_domain(
         self,
-        ownership: UserOwnedInputEvidence,
+        ownership: Option<UserOwnedInputEvidence>,
     ) -> Result<DatasetOutputAuthorization, CliDatasetError> {
         let basis = match self.basis {
             RightsBasisDto::ReviewedTerms { url, terms_sha256 } => {
                 RightsBasis::reviewed_terms(url, evidence(&terms_sha256)?)
                     .map_err(|_| CliDatasetError::InvalidRequest)?
             }
-            RightsBasisDto::RequestFileOwnership => RightsBasis::user_owned_local(ownership),
+            RightsBasisDto::RequestFileOwnership => {
+                RightsBasis::user_owned_local(ownership.ok_or(CliDatasetError::InvalidRequest)?)
+            }
         };
         DatasetOutputAuthorization::try_new(
             self.source_id,

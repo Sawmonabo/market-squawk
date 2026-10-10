@@ -152,6 +152,17 @@ fn expected_batch_contract(
     name: &str,
 ) -> Option<(&'static [&'static str], &'static [&'static str])> {
     let contract = match name {
+        "research.reported-financial-amount" => (
+            &[
+                "reported_amount",
+                "role",
+                "basis",
+                "share_convention",
+                "fiscal_period",
+                "source_selection_as_of",
+            ][..],
+            &[][..],
+        ),
         "research.price-return"
         | "risk.maximum-drawdown"
         | "risk.maximum-drawdown-peak-index"
@@ -248,7 +259,17 @@ fn expected_batch_contract(
 
 fn expected_input_shape(name: &str) -> Option<(FeatureDataType, FeatureUnit)> {
     let shape = match name {
-        "timestamps" => (FeatureDataType::Timestamp, FeatureUnit::Nanoseconds),
+        "timestamps" | "source_selection_as_of" => {
+            (FeatureDataType::Timestamp, FeatureUnit::Nanoseconds)
+        }
+        "reported_amount" => (FeatureDataType::MonetaryValue, FeatureUnit::CurrencyAmount),
+        "role" | "basis" | "share_convention" => {
+            (FeatureDataType::CanonicalIdentifier, FeatureUnit::Unitless)
+        }
+        "fiscal_period" => (
+            FeatureDataType::FinancialPeriodEvidence,
+            FeatureUnit::Unitless,
+        ),
         "prices" => (FeatureDataType::StatisticalF64, FeatureUnit::CurrencyAmount),
         "money_prices" | "distributions" => (FeatureDataType::Money, FeatureUnit::CurrencyAmount),
         "returns" | "risk_free_return" | "target_return" | "asset_returns"

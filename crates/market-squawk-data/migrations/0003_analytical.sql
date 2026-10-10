@@ -25,7 +25,7 @@ CREATE TABLE analytical_generations (
 CREATE TABLE analytical_generation_objects (
     dataset_id TEXT NOT NULL,
     manifest_version INTEGER NOT NULL,
-    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    ordinal INTEGER NOT NULL CHECK (ordinal BETWEEN 0 AND 1023),
     artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
     content_hash BLOB NOT NULL CHECK (length(content_hash) = 32),
     row_count INTEGER NOT NULL CHECK (row_count > 0),
@@ -62,3 +62,20 @@ CREATE TRIGGER analytical_generation_objects_immutable_delete
 BEFORE DELETE ON analytical_generation_objects BEGIN
     SELECT RAISE(ABORT, 'analytical generation objects are immutable');
 END;
+
+-- Lead-owned canonical schema integration. Preserve existing owner data when applying locally.
+-- ArtifactRecord semantics without an invented ingest run or temporary query reservation.
+CREATE TABLE sec_prepared_indexes (
+    generation_digest BLOB PRIMARY KEY NOT NULL CHECK(length(generation_digest)=32),
+    source_artifact_id TEXT NOT NULL REFERENCES artifacts(artifact_id),
+    artifact_id TEXT NOT NULL UNIQUE,
+    relative_reference TEXT NOT NULL UNIQUE,
+    content_algorithm INTEGER NOT NULL CHECK(content_algorithm=1),
+    content_digest BLOB NOT NULL CHECK(length(content_digest)=32),
+    size_bytes INTEGER NOT NULL CHECK(size_bytes>0),
+    created_at_ns INTEGER NOT NULL
+) STRICT;
+CREATE TRIGGER sec_prepared_indexes_no_update BEFORE UPDATE ON sec_prepared_indexes
+BEGIN SELECT RAISE(ABORT,'SEC prepared indexes are immutable'); END;
+CREATE TRIGGER sec_prepared_indexes_no_delete BEFORE DELETE ON sec_prepared_indexes
+BEGIN SELECT RAISE(ABORT,'SEC prepared indexes are immutable'); END;

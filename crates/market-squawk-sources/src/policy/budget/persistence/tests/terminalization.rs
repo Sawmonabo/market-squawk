@@ -77,17 +77,7 @@ fn durable_budget(index: u8) -> TestResult<DurableBudgetFixture> {
     let session = AuthorityDurabilitySession::open(store.clone(), Timestamp::from_unix_nanos(100))?;
     let declaration = declaration(index)?;
     let clock = Arc::new(SwitchableClock::new(100, 0));
-    let state = BudgetState {
-        window_started_at: MonotonicInstant::from_nanos(0),
-        restored_window_ends_at: None,
-        requests_used: 0,
-        primary_sliding_releases: VecDeque::new(),
-        additional_windows: Vec::new(),
-        in_flight: 0,
-        unavailable_until: None,
-        disabled: false,
-        consecutive_refusals: 0,
-    };
+    let state = BudgetState::new(declaration.policy(), MonotonicInstant::from_nanos(0));
     let observation = clock
         .observation()
         .map_err(|reason| format!("clock setup failed: {reason:?}"))?;
@@ -104,7 +94,7 @@ fn durable_budget(index: u8) -> TestResult<DurableBudgetFixture> {
         clock.clone(),
         BudgetDurabilityBinding {
             session: session.clone(),
-            slot,
+            slot: Some(slot),
         },
     );
     Ok(DurableBudgetFixture {
@@ -259,7 +249,7 @@ fn fatal_integrity_faults_cannot_recover_in_the_same_session() -> TestResult {
                     .state
                     .lock()
                     .map_err(|_| "budget state lock poisoned")?
-                    .window_started_at = MonotonicInstant::from_nanos(1);
+                    .last_observed_at = MonotonicInstant::from_nanos(1);
             }
             FatalIntegrityFault::WindowDeadlineOverflow => {
                 clock.set(i64::MAX, u64::MAX)?;
@@ -268,6 +258,9 @@ fn fatal_integrity_faults_cannot_recover_in_the_same_session() -> TestResult {
                     .state
                     .lock()
                     .map_err(|_| "budget state lock poisoned")?
+                    .windows
+                    .first_mut()
+                    .ok_or("numeric request window missing")?
                     .window_started_at = MonotonicInstant::from_nanos(u64::MAX);
             }
             FatalIntegrityFault::RetryDeadlineOverflow => {
@@ -319,17 +312,7 @@ fn one_fatal_scope_revokes_alias_peer_future_registration_shutdown_and_restart()
     let peer_declaration = declaration(2)?;
     let peer_checkpoint = checkpoint_from_runtime(
         peer_declaration.policy(),
-        &BudgetState {
-            window_started_at: MonotonicInstant::from_nanos(0),
-            restored_window_ends_at: None,
-            requests_used: 0,
-            primary_sliding_releases: VecDeque::new(),
-            additional_windows: Vec::new(),
-            in_flight: 0,
-            unavailable_until: None,
-            disabled: false,
-            consecutive_refusals: 0,
-        },
+        &BudgetState::new(peer_declaration.policy(), MonotonicInstant::from_nanos(0)),
         clock
             .observation()
             .map_err(|reason| format!("clock setup failed: {reason:?}"))?,
@@ -348,7 +331,7 @@ fn one_fatal_scope_revokes_alias_peer_future_registration_shutdown_and_restart()
         clock.clone(),
         BudgetDurabilityBinding {
             session: session.clone(),
-            slot: peer_slot,
+            slot: Some(peer_slot),
         },
     );
 
@@ -485,17 +468,7 @@ fn clean_close_winner_rejects_stale_runtime_entry_without_terminal_io() -> TestR
         .map_err(|reason| format!("clock setup failed: {reason:?}"))?;
     let checkpoint = checkpoint_from_runtime(
         declaration.policy(),
-        &BudgetState {
-            window_started_at: observation.monotonic,
-            restored_window_ends_at: None,
-            requests_used: 0,
-            primary_sliding_releases: VecDeque::new(),
-            additional_windows: Vec::new(),
-            in_flight: 0,
-            unavailable_until: None,
-            disabled: false,
-            consecutive_refusals: 0,
-        },
+        &BudgetState::new(declaration.policy(), observation.monotonic),
         observation,
         1,
         false,
@@ -512,7 +485,7 @@ fn clean_close_winner_rejects_stale_runtime_entry_without_terminal_io() -> TestR
         clock,
         BudgetDurabilityBinding {
             session: session.clone(),
-            slot,
+            slot: Some(slot),
         },
     );
     store.block_next_store();
@@ -561,17 +534,7 @@ fn terminal_fault_publishes_the_global_latch_before_the_terminal_store_finishes(
         let declaration = declaration(index)?;
         let checkpoint = checkpoint_from_runtime(
             declaration.policy(),
-            &BudgetState {
-                window_started_at: observation.monotonic,
-                restored_window_ends_at: None,
-                requests_used: 0,
-                primary_sliding_releases: VecDeque::new(),
-                additional_windows: Vec::new(),
-                in_flight: 0,
-                unavailable_until: None,
-                disabled: false,
-                consecutive_refusals: 0,
-            },
+            &BudgetState::new(declaration.policy(), observation.monotonic),
             observation,
             1,
             false,
@@ -588,7 +551,7 @@ fn terminal_fault_publishes_the_global_latch_before_the_terminal_store_finishes(
             clock.clone(),
             BudgetDurabilityBinding {
                 session: session.clone(),
-                slot,
+                slot: Some(slot),
             },
         ))
     };

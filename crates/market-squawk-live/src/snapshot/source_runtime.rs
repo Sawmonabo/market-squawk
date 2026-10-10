@@ -78,9 +78,12 @@ impl SourceRuntimeEvidenceSnapshot {
         {
             return Err(SourceRuntimeEvidenceError::EvidenceMismatch);
         }
+        let instrument_id = binding
+            .instrument_id()
+            .ok_or(SourceRuntimeEvidenceError::EvidenceMismatch)?;
         Ok(Self {
             session_id: health.session_id().as_source_identifier().clone(),
-            instrument_id: binding.instrument_id(),
+            instrument_id,
             connection_generation: binding.connection_generation(),
             health_epoch,
             state_revision,

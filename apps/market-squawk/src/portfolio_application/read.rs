@@ -1,17 +1,24 @@
 //! Bounded point-in-time portfolio request admission and result construction.
 
-use std::collections::BTreeSet;
+use std::{
+    collections::BTreeSet,
+    ops::Bound::{Excluded, Unbounded},
+};
 
 use chrono::{DateTime, Utc};
-use market_squawk_domain::{AccountId, InstrumentId, Timestamp};
+use market_squawk_adapter_portfolio::{LotMethod, TransactionKind};
+use market_squawk_data::MarketDataInstrumentReadCapability;
+use market_squawk_domain::{AccountId, InstrumentId, Money, Timestamp};
 use market_squawk_services::{
     RequestContext, ServiceLimits, ToolResultMetadata, TypedToolRequest, TypedToolResult,
 };
+use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
+use uuid::Uuid;
 
 use super::analytics;
 use super::import::hex;
-use super::model::{PortfolioReadImage, PublishedRevision};
+use super::model::{BasisResolution, PortfolioReadImage, PortfolioTransaction, PublishedRevision};
 use super::{PortfolioApplicationLimits, PortfolioApplicationServiceError};
 
 pub(super) struct ReadScope {
@@ -21,11 +28,10 @@ pub(super) struct ReadScope {
     pub(super) end: Option<Timestamp>,
     pub(super) maximum_items: usize,
     pub(super) maximum_bytes: usize,
-    pub(super) sources: BTreeSet<String>,
 }
 
 impl ReadScope {
-    fn from_request(
+    pub(super) fn from_request(
         request: &TypedToolRequest,
         application_limits: PortfolioApplicationLimits,
     ) -> Result<Self, PortfolioApplicationServiceError> {
@@ -36,6 +42,34 @@ impl ReadScope {
             .ok_or(PortfolioApplicationServiceError::InvalidRequest)?
             .parse()
             .map_err(|_| PortfolioApplicationServiceError::InvalidRequest)?;
+        Self::from_request_with_account(request, application_limits, account_id)
+    }
+
+    pub(super) fn from_product_request(
+        image: &PortfolioReadImage,
+        request: &TypedToolRequest,
+        application_limits: PortfolioApplicationLimits,
+    ) -> Result<Self, PortfolioApplicationServiceError> {
+        let account_token = request
+            .arguments()
+            .get("accountToken")
+            .and_then(Value::as_str)
+            .ok_or(PortfolioApplicationServiceError::InvalidRequest)?;
+        if request.name() == "Portfolio.GetRisk"
+            && request.arguments().contains_key("instrumentIds")
+        {
+            return Err(PortfolioApplicationServiceError::InvalidRequest);
+        }
+        let catalog = super::product::account_catalog(image)?;
+        let account_id = super::product::resolve_account_token(&catalog, account_token)?;
+        Self::from_request_with_account(request, application_limits, account_id)
+    }
+
+    fn from_request_with_account(
+        request: &TypedToolRequest,
+        application_limits: PortfolioApplicationLimits,
+        account_id: AccountId,
+    ) -> Result<Self, PortfolioApplicationServiceError> {
         let instruments = request
             .arguments()
             .get("instrumentIds")
@@ -78,23 +112,6 @@ impl ReadScope {
             .and_then(|value| usize::try_from(value).ok())
             .ok_or(PortfolioApplicationServiceError::InvalidRequest)?
             .min(application_limits.max_retained_bytes);
-        let sources = request
-            .arguments()
-            .get("sourceCoverage")
-            .and_then(Value::as_array)
-            .map(|values| {
-                values
-                    .iter()
-                    .map(|value| {
-                        value
-                            .as_str()
-                            .map(ToOwned::to_owned)
-                            .ok_or(PortfolioApplicationServiceError::InvalidRequest)
-                    })
-                    .collect()
-            })
-            .transpose()?
-            .unwrap_or_default();
         Ok(Self {
             account_id,
             instruments,
@@ -102,7 +119,6 @@ impl ReadScope {
             end,
             maximum_items,
             maximum_bytes,
-            sources,
         })
     }
 
@@ -116,25 +132,249 @@ impl ReadScope {
     }
 }
 
+pub(super) fn check_context(
+    context: &RequestContext,
+) -> Result<(), PortfolioApplicationServiceError> {
+    if context.cancellation().is_cancelled() {
+        Err(PortfolioApplicationServiceError::Cancelled)
+    } else if std::time::Instant::now() >= context.deadline() {
+        Err(PortfolioApplicationServiceError::DeadlineExceeded)
+    } else {
+        Ok(())
+    }
+}
+
 pub(super) fn call(
     image: &PortfolioReadImage,
     request: &TypedToolRequest,
     context: &RequestContext,
     limits: PortfolioApplicationLimits,
+    instruments: Option<&MarketDataInstrumentReadCapability>,
 ) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
-    let scope = ReadScope::from_request(request, limits)?;
-    let revision = select_revision(image, &scope)?;
+    if request.name() == "Portfolio.ListAccounts" {
+        return list_accounts(image, request, context, limits);
+    }
+    let scope = if matches!(
+        request.name(),
+        "Portfolio.GetPerformance"
+            | "Portfolio.GetRisk"
+            | "Portfolio.EvaluateScenario"
+            | "Portfolio.EvaluateScenarioBatch"
+            | "Portfolio.ProposeRebalance"
+    ) {
+        ReadScope::from_product_request(image, request, limits)?
+    } else {
+        ReadScope::from_request(request, limits)?
+    };
+    let revision = if matches!(
+        request.name(),
+        "Portfolio.EvaluateScenario"
+            | "Portfolio.EvaluateScenarioBatch"
+            | "Portfolio.ProposeRebalance"
+    ) {
+        let token = request
+            .arguments()
+            .get("snapshotToken")
+            .and_then(Value::as_str)
+            .ok_or(PortfolioApplicationServiceError::InvalidRequest)?;
+        super::snapshot_page::selected_revision(image, &scope, token, context)?
+    } else {
+        select_revision(image, &scope)?
+    };
     match request.name() {
-        "Portfolio.GetHoldings" => holdings(revision, &scope, context),
-        "Portfolio.GetTransactions" => transactions(revision, &scope, context),
         "Portfolio.GetPerformance" => analytics::performance(image, revision, &scope, context),
-        "Portfolio.GetExposure" => analytics::exposure(revision, &scope, context),
         "Portfolio.GetRisk" => analytics::risk(image, revision, &scope, context),
+        "Portfolio.EvaluateScenario"
+        | "Portfolio.EvaluateScenarioBatch"
+        | "Portfolio.ProposeRebalance" => {
+            super::advanced::call(revision, &scope, request, context, instruments)
+        }
         _ => Err(PortfolioApplicationServiceError::InvalidRequest),
     }
 }
 
-fn select_revision<'image>(
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AccountPageCursor {
+    version: u8,
+    catalog_digest: [u8; 32],
+    after_account: Uuid,
+}
+
+fn list_accounts(
+    image: &PortfolioReadImage,
+    request: &TypedToolRequest,
+    context: &RequestContext,
+    application_limits: PortfolioApplicationLimits,
+) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
+    let (maximum_items, maximum_bytes) = read_result_limits(request, application_limits)?;
+    let limit = request
+        .arguments()
+        .get("limit")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            value
+                .as_u64()
+                .and_then(|value| usize::try_from(value).ok())
+                .filter(|value| (1..=100).contains(value))
+                .ok_or(PortfolioApplicationServiceError::InvalidRequest)
+        })
+        .transpose()?
+        .unwrap_or(25)
+        .min(maximum_items)
+        .min(context.limits().maximum_result_items());
+    if limit == 0 {
+        return Err(PortfolioApplicationServiceError::InvalidRequest);
+    }
+    let after = request
+        .arguments()
+        .get("cursor")
+        .filter(|value| !value.is_null())
+        .map(|value| {
+            let encoded = value
+                .as_str()
+                .filter(|value| !value.is_empty() && value.len() <= 512)
+                .ok_or(PortfolioApplicationServiceError::InvalidRequest)?;
+            let cursor: AccountPageCursor = serde_json::from_str(encoded)
+                .map_err(|_| PortfolioApplicationServiceError::InvalidRequest)?;
+            if cursor.version != 1 || cursor.catalog_digest != image.account_catalog_digest {
+                return Err(PortfolioApplicationServiceError::InvalidRequest);
+            }
+            let account = AccountId::try_from(cursor.after_account)
+                .map_err(|_| PortfolioApplicationServiceError::InvalidRequest)?;
+            if image
+                .account_ordinals
+                .binary_search_by_key(&account, |(id, _)| *id)
+                .is_err()
+            {
+                return Err(PortfolioApplicationServiceError::InvalidRequest);
+            }
+            Ok(account)
+        })
+        .transpose()?;
+    let start = after.map_or(Unbounded, Excluded);
+    let mut rows = Vec::new();
+    rows.try_reserve_exact(limit.saturating_add(1))
+        .map_err(|_| PortfolioApplicationServiceError::ResourceExhausted)?;
+    for (account_id, history) in image
+        .accounts
+        .range((start, Unbounded))
+        .take(limit.saturating_add(1))
+    {
+        check_context(context)?;
+        let ordinal = image
+            .account_ordinals
+            .binary_search_by_key(account_id, |(id, _)| *id)
+            .ok()
+            .and_then(|index| image.account_ordinals.get(index))
+            .map(|(_, ordinal)| *ordinal)
+            .ok_or(PortfolioApplicationServiceError::CorruptPublication)?;
+        let binding = super::product::account_binding(*account_id, ordinal)?;
+        let head = history
+            .revisions
+            .last()
+            .ok_or(PortfolioApplicationServiceError::CorruptPublication)?;
+        rows.push((*account_id, account_summary(&binding, head)?));
+    }
+    let limits = narrowed_limits(context, maximum_items, maximum_bytes)?;
+    let metadata = ToolResultMetadata::try_complete(
+        json!({"scope":"portfolio_accounts","snapshotDigest":hex(&image.account_catalog_digest)}),
+        json!({"state":"available","confidence":"limited"}),
+    )
+    .map_err(|_| PortfolioApplicationServiceError::Publication)?;
+    let mut count = rows.len().min(limit);
+    loop {
+        let next_cursor = if count < rows.len() {
+            let account = rows
+                .get(count.saturating_sub(1))
+                .filter(|_| count > 0)
+                .ok_or(PortfolioApplicationServiceError::ResourceExhausted)?
+                .0;
+            Some(
+                serde_json::to_string(&AccountPageCursor {
+                    version: 1,
+                    catalog_digest: image.account_catalog_digest,
+                    after_account: account.as_uuid(),
+                })
+                .map_err(|_| PortfolioApplicationServiceError::Publication)?,
+            )
+        } else {
+            None
+        };
+        let accounts = rows[..count]
+            .iter()
+            .map(|(_, row)| row.clone())
+            .collect::<Vec<_>>();
+        match TypedToolResult::try_new(
+            json!({"accounts":accounts,"nextCursor":next_cursor}),
+            count,
+            metadata.clone(),
+            limits,
+        ) {
+            Ok(result) => return Ok(result),
+            Err(_) if count > 1 => count -= 1,
+            Err(_) => return Err(PortfolioApplicationServiceError::ResourceExhausted),
+        }
+    }
+}
+
+fn account_summary(
+    binding: &super::product::ProductAccountBinding,
+    revision: &PublishedRevision,
+) -> Result<Value, PortfolioApplicationServiceError> {
+    if binding.account_id() != revision.account.account_id() {
+        return Err(PortfolioApplicationServiceError::CorruptPublication);
+    }
+    Ok(json!({
+        "accountToken": binding.token(),
+        "displayName": binding.display_name(),
+        "currency": revision.account.currency().as_str(),
+        "holdings": revision.holdings.len(),
+        "dataIssues": revision.discrepancies.len(),
+    }))
+}
+
+pub(super) fn revision_summary(revision: &PublishedRevision) -> Value {
+    json!({
+        "snapshotToken": snapshot_token(revision),
+        "effectiveAtUnixNanos": revision.effective_at.unix_nanos().to_string(),
+        "availableAtUnixNanos": revision
+            .available_at
+            .map(|value| value.unix_nanos().to_string()),
+        "holdingCount": revision.holdings.len(),
+        "transactionCount": revision.transactions.len(),
+        "dataIssueCount": revision.discrepancies.len(),
+        "dataState": if revision.discrepancies.is_empty() { "ready" } else { "needs_review" },
+    })
+}
+
+fn read_result_limits(
+    request: &TypedToolRequest,
+    application_limits: PortfolioApplicationLimits,
+) -> Result<(usize, usize), PortfolioApplicationServiceError> {
+    let limits = request
+        .arguments()
+        .get("resultLimits")
+        .and_then(Value::as_object)
+        .ok_or(PortfolioApplicationServiceError::InvalidRequest)?;
+    let maximum_items = limits
+        .get("maximumItems")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or(PortfolioApplicationServiceError::InvalidRequest)?
+        .min(application_limits.max_result_items);
+    let maximum_bytes = limits
+        .get("maximumBytes")
+        .and_then(Value::as_u64)
+        .and_then(|value| usize::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .ok_or(PortfolioApplicationServiceError::InvalidRequest)?
+        .min(application_limits.max_retained_bytes);
+    Ok((maximum_items, maximum_bytes))
+}
+
+pub(super) fn select_revision<'image>(
     image: &'image PortfolioReadImage,
     scope: &ReadScope,
 ) -> Result<&'image PublishedRevision, PortfolioApplicationServiceError> {
@@ -152,13 +392,7 @@ fn select_revision<'image>(
                     && revision
                         .available_at
                         .is_some_and(|available| available <= end)
-            }) && (scope.sources.is_empty()
-                || scope.sources.iter().all(|requested| {
-                    revision
-                        .source_coverage
-                        .iter()
-                        .any(|source| source.as_str() == requested)
-                }))
+            })
         })
         .ok_or(PortfolioApplicationServiceError::NotFound)?;
     if history
@@ -176,131 +410,23 @@ fn select_revision<'image>(
     Ok(revision)
 }
 
-fn holdings(
-    revision: &PublishedRevision,
-    scope: &ReadScope,
-    context: &RequestContext,
-) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
-    let rows = revision
-        .holdings
-        .iter()
-        .filter(|holding| scope.admits_instrument(holding.instrument_id()))
-        .map(|holding| {
-            let mut value = serde_json::to_value(holding)
-                .map_err(|_| PortfolioApplicationServiceError::Publication)?;
-            enrich_row(&mut value, revision)?;
-            Ok(value)
-        })
-        .collect::<Result<Vec<_>, PortfolioApplicationServiceError>>()?;
-    bounded_rows(rows, revision, scope, context)
-}
-
-fn transactions(
-    revision: &PublishedRevision,
-    scope: &ReadScope,
-    context: &RequestContext,
-) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
-    let rows = revision
-        .transactions
-        .iter()
-        .filter(|transaction| {
-            transaction
-                .instrument_id()
-                .is_none_or(|instrument| scope.admits_instrument(instrument))
-                && scope.admits_time(transaction.occurred_at())
-        })
-        .map(|transaction| {
-            let mut value = serde_json::to_value(transaction)
-                .map_err(|_| PortfolioApplicationServiceError::Publication)?;
-            enrich_row(&mut value, revision)?;
-            Ok(value)
-        })
-        .collect::<Result<Vec<_>, PortfolioApplicationServiceError>>()?;
-    bounded_rows(rows, revision, scope, context)
-}
-
-fn enrich_row(
-    value: &mut Value,
-    revision: &PublishedRevision,
-) -> Result<(), PortfolioApplicationServiceError> {
-    let object = value
-        .as_object_mut()
-        .ok_or(PortfolioApplicationServiceError::Publication)?;
-    object.insert(
-        "revisionId".to_owned(),
-        Value::String(hex(&revision.token().bytes())),
-    );
-    object.insert(
-        "effectiveAtUnixNanos".to_owned(),
-        Value::String(revision.effective_at.unix_nanos().to_string()),
-    );
-    object.insert(
-        "availableAtUnixNanos".to_owned(),
-        revision.available_at.map_or(Value::Null, |timestamp| {
-            Value::String(timestamp.unix_nanos().to_string())
-        }),
-    );
-    object.insert(
-        "sourceId".to_owned(),
-        Value::String(revision.source_id.as_str().to_owned()),
-    );
-    object.insert(
-        "artifactSha256".to_owned(),
-        Value::String(hex(&revision.artifact_sha256)),
-    );
-    Ok(())
-}
-
-pub(super) fn bounded_rows(
-    rows: Vec<Value>,
-    revision: &PublishedRevision,
-    scope: &ReadScope,
-    context: &RequestContext,
-) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
-    let available = rows.len();
-    if available == 0 {
-        return data_result(Value::Array(Vec::new()), 0, 0, revision, scope, context);
-    }
-    let upper = available
-        .min(scope.maximum_items)
-        .min(context.limits().maximum_result_items());
-    if upper == 0 {
-        return Err(PortfolioApplicationServiceError::ResourceExhausted);
-    }
-    let mut low = 0_usize;
-    let mut high = upper;
-    let mut selected = None;
-    while low <= high {
-        let count = low.saturating_add(high.saturating_sub(low) / 2);
-        if count == 0 {
-            low = 1;
-            continue;
-        }
-        match data_result(
-            Value::Array(rows[..count].to_vec()),
-            count,
-            available,
-            revision,
-            scope,
-            context,
-        ) {
-            Ok(result) => {
-                selected = Some(result);
-                low = count.saturating_add(1);
-            }
-            Err(PortfolioApplicationServiceError::ResourceExhausted) => {
-                if count == 0 {
-                    break;
-                }
-                high = count - 1;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    selected.ok_or(PortfolioApplicationServiceError::ResourceExhausted)
-}
-
 pub(super) fn report_result(
+    mut value: Value,
+    revision: &PublishedRevision,
+    scope: &ReadScope,
+    context: &RequestContext,
+) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
+    project_report(&mut value);
+    if let Some(object) = value.as_object_mut() {
+        object.insert(
+            "snapshotToken".to_owned(),
+            Value::String(snapshot_token(revision)),
+        );
+    }
+    data_result(value, 1, 1, revision, scope, context)
+}
+
+pub(super) fn product_report_result(
     value: Value,
     revision: &PublishedRevision,
     scope: &ReadScope,
@@ -332,12 +458,11 @@ fn data_result(
     scope: &ReadScope,
     context: &RequestContext,
 ) -> Result<TypedToolResult, PortfolioApplicationServiceError> {
-    let coverage = source_coverage(revision);
+    let coverage = json!({"scope": "portfolio"});
     let quality = json!({
-        "class": "direct_unverified",
-        "executionEligible": false,
-        "reconciliationDiscrepancies": revision.discrepancies.len(),
-        "rawEvidenceRetained": true
+        "state": if revision.discrepancies.is_empty() { "available" } else { "needs_review" },
+        "confidence": "limited",
+        "dataIssueCount": revision.discrepancies.len(),
     });
     let metadata = if returned < available {
         ToolResultMetadata::try_truncated(available, coverage, quality)
@@ -350,24 +475,7 @@ fn data_result(
         .map_err(|_| PortfolioApplicationServiceError::ResourceExhausted)
 }
 
-fn source_coverage(revision: &PublishedRevision) -> Value {
-    json!({
-        "accountId": revision.account.account_id().to_string(),
-        "revisionId": hex(&revision.token().bytes()),
-        "sources": revision
-            .source_coverage
-            .iter()
-            .map(|source| source.as_str())
-            .collect::<Vec<_>>(),
-        "effectiveAtUnixNanos": revision.effective_at.unix_nanos().to_string(),
-        "availableAtUnixNanos": revision
-            .available_at
-            .map(|timestamp| timestamp.unix_nanos().to_string()),
-        "artifactSha256": hex(&revision.artifact_sha256)
-    })
-}
-
-fn narrowed_limits(
+pub(super) fn narrowed_limits(
     context: &RequestContext,
     maximum_items: usize,
     maximum_bytes: usize,
@@ -414,4 +522,163 @@ fn parse_timestamp(value: &str) -> Result<Timestamp, PortfolioApplicationService
         .timestamp_nanos_opt()
         .ok_or(PortfolioApplicationServiceError::InvalidRequest)?;
     Ok(Timestamp::from_unix_nanos(timestamp))
+}
+
+/// Makes the limits of a portfolio-import holding mark explicit.
+///
+/// A holding value is an exact source observation. The portfolio importer has no authority to
+/// promote it to a live, delayed, stale, modeled, or venue-qualified market mark, and it has no
+/// alternate mark authority to select as a fallback. Keeping those facts adjacent to every value
+/// prevents presentation code from inferring a stronger mark state from the source record alone.
+pub(super) fn source_mark_details(observed_at_unix_nanos: String) -> Value {
+    json!({
+        "asOfUnixNanos": observed_at_unix_nanos,
+        "state": "reported",
+        "confidence": "limited",
+        "explanation": "This value came from the imported portfolio and has not been refreshed against the current market.",
+    })
+}
+
+pub(super) fn snapshot_token(revision: &PublishedRevision) -> String {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!(
+            "market-squawk/portfolio-snapshot/v1/{}",
+            hex(&revision.token().bytes())
+        )
+        .as_bytes(),
+    )
+    .to_string()
+}
+
+pub(super) fn transaction_token(transaction: &PortfolioTransaction) -> String {
+    Uuid::new_v5(
+        &Uuid::NAMESPACE_URL,
+        format!(
+            "market-squawk/portfolio-transaction/v1/{}/{}",
+            transaction.account_id(),
+            transaction.broker_transaction_id().as_str()
+        )
+        .as_bytes(),
+    )
+    .to_string()
+}
+
+pub(super) fn basis_value(basis: &BasisResolution) -> Value {
+    match basis {
+        BasisResolution::Resolved { observation } => json!({
+            "state": "available",
+            "amount": money_value(observation.amount()),
+            "method": lot_method(observation.lot_method()),
+        }),
+        BasisResolution::Missing => json!({"state": "not_available"}),
+        BasisResolution::Ambiguous {
+            candidates,
+            lot_method: method,
+        } => json!({
+            "state": "needs_review",
+            "choices": candidates.iter().copied().map(money_value).collect::<Vec<_>>(),
+            "method": lot_method(*method),
+        }),
+    }
+}
+
+pub(super) const fn lot_method(method: LotMethod) -> &'static str {
+    match method {
+        LotMethod::Fifo => "First in, first out",
+        LotMethod::Lifo => "Last in, first out",
+        LotMethod::SpecificIdentification => "Specific lots",
+        LotMethod::AverageCost => "Average cost",
+    }
+}
+
+pub(super) const fn transaction_kind(kind: TransactionKind) -> &'static str {
+    match kind {
+        TransactionKind::Trade => "trade",
+        TransactionKind::CashTransfer => "cash_transfer",
+        TransactionKind::Income => "income",
+        TransactionKind::Fee => "fee",
+        TransactionKind::CorporateAction => "corporate_action",
+    }
+}
+
+pub(super) fn money_value(value: Money) -> Value {
+    json!({
+        "amount": value.amount().to_string(),
+        "currency": value.currency().as_str(),
+    })
+}
+
+fn project_report(value: &mut Value) {
+    match value {
+        Value::Array(values) => values.iter_mut().for_each(project_report),
+        Value::Object(object) => {
+            for forbidden in [
+                "revisionId",
+                "policy",
+                "sourceId",
+                "sourceCoverage",
+                "sourceReference",
+                "source_reference",
+                "artifactSha256",
+                "analyticsEvidenceDigest",
+                "markEvidence",
+                "authority",
+                "reason",
+            ] {
+                object.remove(forbidden);
+            }
+            for child in object.values_mut() {
+                project_report(child);
+            }
+            if object.contains_key("accountId") && object.contains_key("effectiveAtUnixNanos") {
+                object.insert(
+                    "dataConfidence".to_owned(),
+                    Value::String("limited".to_owned()),
+                );
+            }
+        }
+        Value::String(state) => {
+            let product = match state.as_str() {
+                "source_reported_snapshot" => Some("available"),
+                "calculated_from_source_reported_mark_and_resolved_basis" => Some("available"),
+                "not_calculable_incomplete_source_basis"
+                | "requires_committed_trade_lifecycle_interpretation"
+                | "benchmark_not_supplied" => Some("not_available"),
+                "source_classified_pending_explicit_subtype" => Some("partial"),
+                "source_classified" => Some("available"),
+                "no_retained_discrepancies" => Some("clear"),
+                "discrepancies_require_review" => Some("needs_review"),
+                "not_supplied_by_portfolio_source" => Some("not_available"),
+                "task12_exact_exposure_v1" | "task12_historical_risk_v1" | "modified_dietz_v1" => {
+                    None
+                }
+                _ => None,
+            };
+            if let Some(product) = product {
+                *state = product.to_owned();
+            }
+        }
+        _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_mark_details;
+
+    #[test]
+    fn ordinary_mark_is_plain_and_contains_no_source_authority() {
+        let mark = source_mark_details("1700000000000000000".to_owned());
+        let encoded = serde_json::to_string(&mark).expect("serialize product mark");
+
+        assert_eq!(mark["asOfUnixNanos"], "1700000000000000000");
+        assert_eq!(mark["state"], "reported");
+        assert_eq!(mark["confidence"], "limited");
+        for forbidden in [
+            "source", "provider", "artifact", "revision", "policy", "venue",
+        ] {
+            assert!(!encoded.to_ascii_lowercase().contains(forbidden));
+        }
+    }
 }

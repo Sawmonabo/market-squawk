@@ -726,13 +726,18 @@ impl AccountState {
                 AccountRiskViolation::PortfolioStateMismatch,
             ));
         };
+        let Some(realized_loss) = projection.realized_loss().complete() else {
+            return Err(AccountReservationError::from_reason(
+                AccountRiskViolation::PortfolioStateMismatch,
+            ));
+        };
         let financial_values = [
             projection.settlement_available_cash(),
             projection.gross_exposure(),
             projection.marked_equity(),
             projection.peak_marked_equity(),
             unrealized_pnl,
-            projection.realized_loss(),
+            realized_loss,
             projection.drawdown(),
         ];
         let expected_drawdown = projection
@@ -749,7 +754,7 @@ impl AccountState {
             || !basis_matches
             || !holdings_match
             || projection.gross_exposure().amount().is_sign_negative()
-            || projection.realized_loss().amount().is_sign_negative()
+            || realized_loss.amount().is_sign_negative()
             || projection.drawdown().amount().is_sign_negative()
             || projection.peak_marked_equity().amount() < projection.marked_equity().amount()
             || expected_drawdown.ok() != Some(projection.drawdown())
@@ -763,7 +768,7 @@ impl AccountState {
             capital: projection.marked_equity(),
             gross_exposure: projection.gross_exposure(),
             unrealized_pnl,
-            realized_loss: projection.realized_loss(),
+            realized_loss,
             drawdown: projection.drawdown(),
             current_position: self.positions.get(&instrument_id).copied().unwrap_or(0),
         })

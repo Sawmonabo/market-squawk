@@ -259,6 +259,21 @@ fn ensure_live(
 
 fn map_analytical_error(error: AnalyticalReadError) -> FairValueProducerSelectionError {
     match error {
+        AnalyticalReadError::NativeSessionControl(error) => match error {
+            market_squawk_platform::ResearchObjectControlError::Cancelled => {
+                FairValueProducerSelectionError::Cancelled
+            }
+            market_squawk_platform::ResearchObjectControlError::DeadlineExceeded => {
+                FairValueProducerSelectionError::DeadlineExceeded
+            }
+            market_squawk_platform::ResearchObjectControlError::Unavailable => {
+                FairValueProducerSelectionError::Unavailable
+            }
+        },
+        AnalyticalReadError::InputEpochResultRequiresInline => {
+            FairValueProducerSelectionError::ResourceExhausted
+        }
+        AnalyticalReadError::InvalidInputEpoch => FairValueProducerSelectionError::InvalidSelection,
         AnalyticalReadError::Query(QueryError::Cancelled) => {
             FairValueProducerSelectionError::Cancelled
         }
@@ -284,13 +299,34 @@ fn map_analytical_error(error: AnalyticalReadError) -> FairValueProducerSelectio
             | QueryError::InvalidSource
             | QueryError::ManifestPinMismatch,
         )
+        | AnalyticalReadError::InvalidMarketBarLimit
+        | AnalyticalReadError::InvalidMarketBarEffectiveRange
+        | AnalyticalReadError::InvalidFundNavLimit
+        | AnalyticalReadError::InvalidFundNavDateRange
+        | AnalyticalReadError::InvalidMacroSeriesAllowlist
+        | AnalyticalReadError::MacroSnapshotSourceOwnerMismatch
+        | AnalyticalReadError::InvalidOutcomeMarketBarWindow
+        | AnalyticalReadError::UniverseMembershipReadMustBeExhaustive
         | AnalyticalReadError::InvalidObservationSchema => {
             FairValueProducerSelectionError::InvalidSelection
         }
         AnalyticalReadError::Manifest(_)
+        | AnalyticalReadError::ForecastDatasetUnavailable
+        | AnalyticalReadError::Parquet(_)
+        | AnalyticalReadError::PythonDataset(_)
         | AnalyticalReadError::InvalidLimit
         | AnalyticalReadError::InstrumentLimitExceeded
         | AnalyticalReadError::InvalidKnowledgeRange
+        | AnalyticalReadError::MarketBarResultRequiresInline
+        | AnalyticalReadError::InvalidMarketBarResult
+        | AnalyticalReadError::FundNavResultRequiresInline
+        | AnalyticalReadError::InvalidFundNavResult
+        | AnalyticalReadError::MacroSnapshotResultRequiresInline
+        | AnalyticalReadError::MacroSnapshotCandidateSetSaturated
+        | AnalyticalReadError::MacroSnapshotRevisionConflict
+        | AnalyticalReadError::MacroSnapshotIncomplete
+        | AnalyticalReadError::InvalidMacroSnapshotResult
+        | AnalyticalReadError::InvalidMacroHistoryRequest
         | AnalyticalReadError::Query(_) => FairValueProducerSelectionError::Internal,
     }
 }
@@ -307,7 +343,11 @@ fn map_portfolio_error(
         Error::ResourceExhausted => FairValueProducerSelectionError::ResourceExhausted,
         Error::Cancelled => FairValueProducerSelectionError::Cancelled,
         Error::DeadlineExceeded => FairValueProducerSelectionError::DeadlineExceeded,
-        Error::Path | Error::Authority => FairValueProducerSelectionError::Unavailable,
+        Error::Path
+        | Error::Authority
+        | Error::SnapshotUnavailable
+        | Error::StateChanged
+        | Error::RestoreTargetNotFresh => FairValueProducerSelectionError::Unavailable,
         Error::CorruptPublication | Error::Publication | Error::Analytics => {
             FairValueProducerSelectionError::Internal
         }
@@ -341,6 +381,9 @@ fn map_live_buffer_error(
 ) -> FairValueProducerSelectionError {
     match error {
         LiveFairValueObservationBufferError::NotFound => FairValueProducerSelectionError::NotFound,
+        LiveFairValueObservationBufferError::AmbiguousSource => {
+            FairValueProducerSelectionError::InvalidSelection
+        }
         LiveFairValueObservationBufferError::ResourceExhausted
         | LiveFairValueObservationBufferError::Allocation => {
             FairValueProducerSelectionError::ResourceExhausted

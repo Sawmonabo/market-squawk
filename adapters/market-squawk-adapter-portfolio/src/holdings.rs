@@ -60,6 +60,7 @@ pub struct AccountObservation {
     account_id: AccountId,
     currency: Currency,
     cash_balance: Money,
+    settlement_available_cash: Option<Money>,
     as_of: Timestamp,
     source_reference: SourceIdentifier,
 }
@@ -69,6 +70,7 @@ impl AccountObservation {
         account_id: AccountId,
         currency: Currency,
         cash_balance: Money,
+        settlement_available_cash: Option<Money>,
         as_of: Timestamp,
         source_reference: SourceIdentifier,
     ) -> Self {
@@ -76,6 +78,7 @@ impl AccountObservation {
             account_id,
             currency,
             cash_balance,
+            settlement_available_cash,
             as_of,
             source_reference,
         }
@@ -94,6 +97,14 @@ impl AccountObservation {
     /// Returns the exact source cash balance.
     pub const fn cash_balance(&self) -> Money {
         self.cash_balance
+    }
+
+    /// Returns source-supplied settled cash available to trade after encumbrances.
+    ///
+    /// The signed amount belongs to this account, currency, and as-of timestamp. Missing source
+    /// evidence remains `None`; generic cash balance and buying power never supply this value.
+    pub const fn settlement_available_cash(&self) -> Option<Money> {
+        self.settlement_available_cash
     }
 
     /// Returns the checked source as-of timestamp.

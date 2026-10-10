@@ -26,7 +26,7 @@ pub(crate) struct LiveFeatureCapacity {
     pub(crate) maximum_cross_venue_instruments: NonZeroUsize,
     pub(crate) maximum_venues_per_cross_venue_instrument: NonZeroUsize,
     pub(crate) maximum_feature_snapshot_bytes: NonZeroU32,
-    pub(crate) maximum_action_hook_bytes_per_route: NonZeroUsize,
+    pub(crate) maximum_action_hook_bytes_per_route: usize,
 }
 
 impl LiveFeatureCapacity {
@@ -103,7 +103,7 @@ impl LiveFeatureCapacity {
                 input.maximum_feature_snapshot_bytes,
                 MAX_FEATURE_SNAPSHOT_BYTES,
             )?,
-            maximum_action_hook_bytes_per_route: checked_usize(
+            maximum_action_hook_bytes_per_route: checked_optional_usize(
                 "maximum_action_hook_bytes_per_route",
                 input.maximum_action_hook_bytes_per_route,
                 MAX_ACTION_HOOK_BYTES_PER_ROUTE,
@@ -118,6 +118,21 @@ impl LiveFeatureCapacity {
             depth,
         )
     }
+}
+
+fn checked_optional_usize(
+    field: &'static str,
+    value: usize,
+    maximum: usize,
+) -> Result<usize, LiveRuntimeConfigError> {
+    if value > maximum {
+        return Err(LiveRuntimeConfigError::CapacityExceedsHardLimit {
+            field,
+            value: value as u64,
+            maximum: maximum as u64,
+        });
+    }
+    Ok(value)
 }
 
 fn minimum_window_bytes(observations: usize, sets: usize, depth: usize) -> Option<usize> {

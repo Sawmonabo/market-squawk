@@ -30,6 +30,9 @@ pub enum PointInTimeExclusionReason {
 pub struct PointInTimeExclusionReasons(u16);
 
 impl PointInTimeExclusionReasons {
+    pub(super) const fn from_bits(bits: u16) -> Self {
+        Self(bits)
+    }
     /// Returns whether the complete set contains `reason`.
     pub const fn contains(self, reason: PointInTimeExclusionReason) -> bool {
         self.0 & reason_bit(reason) != 0
@@ -410,6 +413,15 @@ pub enum PointInTimeError<'a> {
     AccountingOverflow,
     #[error("point-in-time canonical identity encoding failed")]
     CanonicalEncoding,
+    #[error("point-in-time scratch storage failed")]
+    ScratchStorage,
+    #[error("point-in-time temporary disk quota or available disk space was exhausted")]
+    ScratchDiskExhausted,
+    #[error("point-in-time disk selection rejected divergent same-revision payloads")]
+    DiskRevisionConflicts {
+        counts: PointInTimeConflictCounts,
+        audit_identity: Sha256Digest,
+    },
     #[error("point-in-time selection cancelled")]
     Cancelled,
     #[error("point-in-time selection deadline exceeded")]

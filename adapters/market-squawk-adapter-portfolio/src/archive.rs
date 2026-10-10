@@ -301,6 +301,74 @@ impl PortfolioExtractionSource {
         Ok(source)
     }
 
+    /// Normalizes and validates one exact batch without changing the durable raw/archive state.
+    ///
+    /// A caller may use this preparation result to display the source records, reconciliation
+    /// evidence, and economic ambiguities that require an explicit interpretation. It does not
+    /// promote the raw records, correction lineage, or active account state; only
+    /// [`Self::import_batch`] performs that durable transition after the caller's governed commit
+    /// boundary has admitted it.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on the same source binding, raw-evidence, capacity, normalization, and
+    /// active-lineage failures as an import.
+    pub fn preview_batch(
+        &self,
+        batch: &ExtractionBatch,
+    ) -> Result<PortfolioImport, PortfolioImportError> {
+        if self.durability_failed {
+            return Err(PortfolioImportError::ArchiveUnavailable);
+        }
+        self.validate_batch_binding(batch)?;
+
+        let mut candidate_raw = self.raw_records.clone();
+        let mut candidate_index = self.raw_by_reference.clone();
+        let mut batch_raw = Vec::new();
+        for record in batch.records() {
+            validate_raw_record(record)?;
+            let source_reference = raw_source_reference(record)?;
+            if let Some(index) = candidate_index.get(&source_reference).copied() {
+                batch_raw.push(candidate_raw[index].clone());
+                continue;
+            }
+            if candidate_raw.len() >= self.limits.max_archive_records {
+                return Err(PortfolioImportError::ArchiveRecordLimitExceeded {
+                    max: self.limits.max_archive_records,
+                });
+            }
+            let raw = RawPortfolioRecord {
+                source_reference: source_reference.clone(),
+                record: record.clone(),
+            };
+            let index = candidate_raw.len();
+            candidate_raw.push(raw.clone());
+            candidate_index.insert(source_reference, index);
+            batch_raw.push(raw);
+        }
+        validate_raw_capacity(&candidate_raw, self.limits)?;
+
+        let mut normalized = normalize_batch(
+            batch,
+            &batch_raw,
+            self.source_id.clone(),
+            self.quality,
+            self.limits,
+        )?;
+        let (disposition, _active, accounts, _brokers, _supersessions) =
+            self.propose_active_state(&normalized.states)?;
+        let discrepancies = reconcile_import(&normalized, &accounts, self.limits)?;
+        let canonical = std::mem::take(&mut normalized.canonical);
+        let canonical_batch = build_canonical_batch(batch, canonical, self.limits)?;
+        Ok(portfolio_import(
+            disposition,
+            batch_raw,
+            normalized,
+            discrepancies,
+            canonical_batch,
+        ))
+    }
+
     /// Imports a generic extraction batch after durably committing exact raw evidence.
     ///
     /// # Errors
@@ -379,6 +447,99 @@ impl PortfolioExtractionSource {
 
         Ok(portfolio_import(
             disposition,
+            batch_raw,
+            normalized,
+            discrepancies,
+            canonical_batch,
+        ))
+    }
+
+    /// Reconstructs one retained application publication without reactivating superseded records.
+    ///
+    /// Exact records already admitted by this archive are reconciled using their historical
+    /// account bindings. Records not yet admitted use the ordinary import transition, allowing
+    /// a fresh or interrupted backup restoration to rebuild the archive in publication order.
+    /// Callers must supply an immutable, verified publication, not a new import request.
+    ///
+    /// # Errors
+    ///
+    /// Fails closed on source, raw-evidence, normalization, account-binding, or import-transition
+    /// errors. Merely retaining raw bytes does not establish a previously admitted publication.
+    pub fn restore_published_batch(
+        &mut self,
+        batch: &ExtractionBatch,
+    ) -> Result<PortfolioImport, PortfolioImportError> {
+        if self.durability_failed {
+            return Err(PortfolioImportError::ArchiveUnavailable);
+        }
+        self.validate_batch_binding(batch)?;
+
+        let mut batch_raw = Vec::new();
+        for record in batch.records() {
+            validate_raw_record(record)?;
+            let source_reference = raw_source_reference(record)?;
+            let Some(index) = self.raw_by_reference.get(&source_reference).copied() else {
+                return self.import_batch(batch);
+            };
+            let raw = &self.raw_records[index];
+            if raw.extraction_record() != record {
+                return Err(PortfolioImportError::RawEvidenceMismatch);
+            }
+            batch_raw.push(raw.clone());
+        }
+
+        let mut normalized = normalize_batch(
+            batch,
+            &batch_raw,
+            self.source_id.clone(),
+            self.quality,
+            self.limits,
+        )?;
+        let previously_applied = normalized.states.iter().all(|state| {
+            self.active_records
+                .get(&state.record_id)
+                .is_some_and(|active| {
+                    active.source_reference == state.source_reference
+                        && active.revision == state.revision
+                        && active.revision_number == state.revision_number
+                })
+                || self.superseded_by.contains_key(&state.source_reference)
+        });
+        if !previously_applied {
+            return self.import_batch(batch);
+        }
+
+        // Admission already checked each exact record's account binding. Reconciliation reads
+        // only account currencies from this map; never install it as current account authority.
+        let mut accounts = BTreeMap::<AccountId, ActiveAccountAuthority>::new();
+        let mut seen = BTreeSet::new();
+        for state in &normalized.states {
+            if !seen.insert(&state.record_id) {
+                return Err(PortfolioImportError::DuplicateSourceRecordId);
+            }
+            for binding in [state.account_binding, state.dependent_account_binding]
+                .into_iter()
+                .flatten()
+            {
+                if accounts
+                    .get(&binding.account_id)
+                    .is_some_and(|account| account.currency != binding.currency)
+                {
+                    return Err(PortfolioImportError::CurrencyMismatch);
+                }
+                accounts
+                    .entry(binding.account_id)
+                    .or_insert_with(|| ActiveAccountAuthority {
+                        currency: binding.currency,
+                        record_id: state.record_id.clone(),
+                    });
+            }
+        }
+        let discrepancies = reconcile_import(&normalized, &accounts, self.limits)?;
+        let canonical = std::mem::take(&mut normalized.canonical);
+        let canonical_batch = build_canonical_batch(batch, canonical, self.limits)?;
+        Ok(portfolio_import(
+            ImportDisposition::Replay,
             batch_raw,
             normalized,
             discrepancies,

@@ -8,6 +8,7 @@ pub struct AuthoritativeSourceRegistry {
     clock: Arc<SealedRegistryClock>,
     authorization_subject_resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
     composition: AuthorityComposition,
+    provider_identity_authority: Option<Arc<dyn CatalogProviderIdentityAuthority>>,
 }
 
 #[derive(Debug)]
@@ -36,6 +37,131 @@ impl Drop for AuthoritativeSourceRegistry {
 }
 
 impl AuthoritativeSourceRegistry {
+    /// Installs the real catalog read authority once, before any source is registered.
+    /// A restored registry must install a newly opened catalog capability; no live selections
+    /// are restored from serialized registry state.
+    pub fn with_provider_identity_authority(
+        mut self,
+        authority: Arc<dyn CatalogProviderIdentityAuthority>,
+    ) -> Result<Self, RegistryError> {
+        if !self.entries.is_empty() || self.provider_identity_authority.is_some() {
+            return Err(RegistryError::SourceAlreadyRegistered);
+        }
+        self.provider_identity_authority = Some(authority);
+        Ok(self)
+    }
+
+    /// Selects a complete bounded native route set through the composition-owned catalog.
+    /// Replacement ends the previous session; callers must start a fresh connection generation.
+    /// A failed selection leaves the prior route set untouched, but catalog changes independently
+    /// revoke its selections before becoming visible.
+    pub fn record_provider_identities(
+        &mut self,
+        registered: &RegisteredSource,
+        requests: &[ProviderNativeIdentityRequest],
+        deadline: std::time::Instant,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<(), RegistryError> {
+        const MAX_MAPPINGS: usize = 4_096;
+        const MAX_RETAINED_BYTES: usize = 16 * 1024 * 1024;
+        let entry = self.validate_registered_structure(registered)?;
+        let authority = self
+            .provider_identity_authority
+            .as_ref()
+            .ok_or(RegistryError::LiveScopeNotCovered)?;
+        if requests.is_empty() || requests.len() > MAX_MAPPINGS {
+            return Err(RegistryError::LiveScopeNotCovered);
+        }
+        let at = self.clock.observe()?.wall();
+        if !entry.metadata.is_effective_at(at) {
+            return Err(RegistryError::MetadataNotEffective);
+        }
+        let mut mappings = Vec::new();
+        mappings
+            .try_reserve_exact(requests.len())
+            .map_err(|_| RegistryError::RetainedSizeOverflow)?;
+        let mut retained = mappings
+            .capacity()
+            .checked_mul(std::mem::size_of::<CurrentProviderIdentity>())
+            .ok_or(RegistryError::RetainedSizeOverflow)?;
+        for request in requests {
+            if cancellation.is_cancelled() {
+                return Err(RegistryError::ProviderIdentitySelectionCancelled);
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(RegistryError::ProviderIdentitySelectionDeadlineExceeded);
+            }
+            let membership = entry
+                .metadata
+                .coverage()
+                .instruments()
+                .membership(request.instrument);
+            let covered = membership == crate::InstrumentCoverageMembership::Enumerated
+                || (membership == crate::InstrumentCoverageMembership::EvidenceBackedUniverse
+                    && entry.universe_attestation.as_ref().is_some_and(|universe| {
+                        universe.is_effective_at(at) && universe.contains(request.instrument)
+                    }));
+            if !entry
+                .metadata
+                .coverage()
+                .topology()
+                .contains_venue(&request.venue)
+                || !covered
+            {
+                return Err(RegistryError::LiveScopeNotCovered);
+            }
+            let selected = authority.select_current(request, deadline, cancellation)?;
+            if selected.evidence().native != *request {
+                return Err(RegistryError::LiveScopeNotCovered);
+            }
+            selected.validate_at(self.clock.observe()?.wall())?;
+            let mapping = CurrentProviderIdentity {
+                source_id: registered.source_id.clone(),
+                source_revision: entry.metadata.revision_evidence().clone(),
+                registration: Arc::clone(&entry.registration_lease),
+                selected,
+            };
+            retained = retained
+                .checked_add(mapping.retained_bytes()?)
+                .filter(|size| *size <= MAX_RETAINED_BYTES)
+                .ok_or(RegistryError::RetainedSizeOverflow)?;
+            mappings.push(mapping);
+        }
+        mappings.sort_unstable_by(|left, right| {
+            let left = &left.evidence().native;
+            let right = &right.evidence().native;
+            (&left.venue, left.instrument).cmp(&(&right.venue, right.instrument))
+        });
+        if mappings.windows(2).any(|pair| {
+            let left = &pair[0].evidence().native;
+            let right = &pair[1].evidence().native;
+            left.venue == right.venue && left.instrument == right.instrument
+        }) {
+            return Err(RegistryError::LiveScopeNotCovered);
+        }
+        if cancellation.is_cancelled() {
+            return Err(RegistryError::ProviderIdentitySelectionCancelled);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(RegistryError::ProviderIdentitySelectionDeadlineExceeded);
+        }
+        let commit_at = self.clock.observe()?.wall();
+        for mapping in &mappings {
+            mapping.validate_at(commit_at)?;
+        }
+        let entry = self
+            .entries
+            .get_mut(&registered.source_id)
+            .ok_or(RegistryError::UnknownSource)?;
+        if let Some(active) = entry.active.take() {
+            active.lease.invalidate();
+            active.capture.mark_incomplete();
+        }
+        entry.health_authority = None;
+        entry.provider_identities = mappings;
+        Ok(())
+    }
+
     /// Registers new metadata or resumes the exact latest revision after a clean restart.
     ///
     /// Resume is deliberately narrower than ordinary registration: the source must not already be
@@ -115,7 +241,7 @@ impl AuthoritativeSourceRegistry {
             .last_epoch = epoch;
         let policies = resolved_budget.as_ref().map_or_else(
             || self.budgets.policies(),
-            |policy| self.budgets.policies_with(policy.persisted()),
+            |policy| self.budgets.policies_with(policy),
         );
         let candidate_state = authority_state_from_history(&candidate_history, policies)?;
         let budget = match resolved_budget {
@@ -149,6 +275,7 @@ impl AuthoritativeSourceRegistry {
                 active: None,
                 health_authority: None,
                 universe_attestation: None,
+                provider_identities: Vec::new(),
                 generation_high_water,
                 used_revisions,
             },
@@ -234,7 +361,7 @@ impl AuthoritativeSourceRegistry {
         );
         let policies = resolved_budget.as_ref().map_or_else(
             || self.budgets.policies(),
-            |policy| self.budgets.policies_with(policy.persisted()),
+            |policy| self.budgets.policies_with(policy),
         );
         let candidate_state = authority_state_from_history(&candidate_history, policies)?;
         let budget = match resolved_budget {
@@ -266,6 +393,7 @@ impl AuthoritativeSourceRegistry {
                 active: None,
                 health_authority: None,
                 universe_attestation: None,
+                provider_identities: Vec::new(),
                 generation_high_water,
                 used_revisions,
             },
@@ -328,7 +456,7 @@ impl AuthoritativeSourceRegistry {
         history.last_epoch = epoch;
         let policies = resolved_budget.as_ref().map_or_else(
             || self.budgets.policies(),
-            |policy| self.budgets.policies_with(policy.persisted()),
+            |policy| self.budgets.policies_with(policy),
         );
         let candidate_state = authority_state_from_history(&candidate_history, policies)?;
         let budget = match resolved_budget {
@@ -357,6 +485,7 @@ impl AuthoritativeSourceRegistry {
         entry.metadata = metadata;
         entry.health_authority = None;
         entry.universe_attestation = None;
+        entry.provider_identities.clear();
         entry.used_revisions.push(revision.clone());
         entry.epoch = epoch;
         entry.registration_lease = Arc::clone(&registration_lease);
@@ -419,7 +548,7 @@ impl AuthoritativeSourceRegistry {
         if let (Some(active), Some(epoch)) = (&entry.active, next_health_epoch) {
             active
                 .lease
-                .commit_live_qualification(epoch, false, None, None);
+                .commit_live_qualification(epoch, false, false, None, None);
         }
         Ok(())
     }
@@ -456,6 +585,39 @@ impl AuthoritativeSourceRegistry {
             .entries
             .get(&registered.source_id)
             .ok_or(RegistryError::UnknownSource)?;
+        let needs_identity = entry
+            .metadata
+            .coverage()
+            .live_channels()
+            .iter()
+            .any(|channel| {
+                channel.rules().iter().any(|rule| {
+                    !matches!(
+                        rule.event_class(),
+                        LiveEventClass::Chart | LiveEventClass::Screener
+                    )
+                })
+            });
+        if needs_identity
+            && (entry.provider_identities.is_empty()
+                || entry
+                    .metadata
+                    .coverage()
+                    .instruments()
+                    .instruments()
+                    .iter()
+                    .any(|instrument| {
+                        !entry
+                            .provider_identities
+                            .iter()
+                            .any(|selected| selected.evidence().native.instrument == *instrument)
+                    }))
+        {
+            return Err(RegistryError::LiveScopeNotCovered);
+        }
+        for mapping in &entry.provider_identities {
+            mapping.validate_at(started_at.wall())?;
+        }
         if entry
             .active
             .as_ref()
@@ -488,10 +650,7 @@ impl AuthoritativeSourceRegistry {
         let lease = Arc::new(SessionLeaseState {
             current: AtomicBool::new(true),
             terminal: AtomicBool::new(false),
-            live_qualified: AtomicBool::new(false),
-            health_epoch: AtomicU64::new(0),
-            valid_from_nanos: AtomicI64::new(i64::MAX),
-            valid_until_nanos: AtomicI64::new(i64::MIN),
+            health: ArcSwap::from_pointee(SessionHealthQualification::default()),
             last_health_observed_nanos: AtomicI64::new(i64::MIN),
             frame_ordinal: AtomicU64::new(0),
             continuity: self.clock.continuity().clone(),
@@ -767,6 +926,46 @@ impl AuthoritativeSourceRegistry {
         }
         entry.health_authority = None;
         persistence
+    }
+
+    /// Releases one exact process-owned registration without revoking its durable source history.
+    ///
+    /// This is a composition rollback/teardown primitive, not provider unlink or rights
+    /// revocation. It invalidates the exact current handle and any process-local session, removes
+    /// only that registry instance's active entry, and deliberately preserves the non-revoked
+    /// latest revision evidence so [`Self::register_or_resume_exact`] can rejoin it under the same
+    /// clean-restart rules.
+    ///
+    /// # Errors
+    ///
+    /// Rejects a stale, transplanted, superseded, or durably revoked registration. No successor
+    /// registration can be removed because current handle pointer identity is required.
+    #[doc(hidden)]
+    pub fn release_process_registration_exact(
+        &mut self,
+        registered: &RegisteredSource,
+    ) -> Result<(), RegistryError> {
+        let entry = self.validate_registered_structure(registered)?;
+        let history = self
+            .history
+            .get(&registered.source_id)
+            .ok_or(RegistryError::InvalidAuthorityState)?;
+        if history.revoked
+            || history.latest_revision_evidence.as_ref() != Some(entry.metadata.revision_evidence())
+        {
+            return Err(RegistryError::InvalidAuthorityState);
+        }
+        let mut released = self
+            .entries
+            .remove(&registered.source_id)
+            .ok_or(RegistryError::UnknownSource)?;
+        released.registration_lease.invalidate();
+        if let Some(active) = released.active.take() {
+            active.lease.invalidate();
+            active.capture.mark_incomplete();
+        }
+        released.health_authority = None;
+        Ok(())
     }
 
     /// Revalidates a registration handle against registry-owned current state.

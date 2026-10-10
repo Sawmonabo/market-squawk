@@ -1,0 +1,485 @@
+//! Retained custody of one synchronous research I/O lane.
+
+use std::{
+    future::Future,
+    pin::Pin,
+    sync::Arc,
+    task::{Context, Poll, Wake, Waker},
+    thread::{self, Thread},
+    time::Instant,
+};
+
+use market_squawk_data::IngestError;
+use tokio::{
+    sync::{Mutex, Semaphore, oneshot},
+    task::{JoinError, JoinHandle},
+};
+use tokio_util::sync::CancellationToken;
+
+use super::ResearchServiceError;
+
+/// Each lane owns one blocking operation; capture, compact reads, bulk reopens and preparation
+/// have separate owners.
+#[derive(Debug)]
+pub(super) struct ResearchIoWorker {
+    gate: Arc<Semaphore>,
+    state: Mutex<State>,
+    shutdown: CancellationToken,
+}
+
+#[derive(Debug, Default)]
+struct State {
+    worker: Option<JoinHandle<()>>,
+    first_join_error: Option<JoinError>,
+}
+
+// The operation label is its compile-time closure type, never captured provider/request data.
+// Drop covers a caller destroying its future while the owned worker remains in State.
+struct WaitDiagnostic {
+    operation: &'static str,
+    stage: &'static str,
+    completed: bool,
+}
+
+impl Drop for WaitDiagnostic {
+    fn drop(&mut self) {
+        if !self.completed {
+            tracing::warn!(
+                operation = self.operation,
+                stage = self.stage,
+                "owned research I/O wait interrupted"
+            );
+        }
+    }
+}
+
+impl ResearchIoWorker {
+    pub(super) fn new() -> Self {
+        Self {
+            gate: Arc::new(Semaphore::new(1)),
+            state: Mutex::new(State::default()),
+            shutdown: CancellationToken::new(),
+        }
+    }
+
+    pub(super) async fn run<T, F>(
+        &self,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        operation: F,
+    ) -> Result<T, ResearchServiceError>
+    where
+        T: Send + 'static,
+        F: FnOnce(CancellationToken) -> T + Send + 'static,
+    {
+        self.run_with_job_context(None, deadline, cancellation, operation)
+            .await
+    }
+
+    /// An admitted job wrapper returns cancellation only after its original worker joins.
+    /// Runner abort can drop that wrapper; the original handle remains in this owned slot.
+    /// The same state guard owns cooperative cancellation joins; later work cannot replace it.
+    pub(super) async fn run_with_job_context<T, F>(
+        &self,
+        job_cancellation: Option<&CancellationToken>,
+        deadline: Instant,
+        cancellation: &CancellationToken,
+        operation: F,
+    ) -> Result<T, ResearchServiceError>
+    where
+        T: Send + 'static,
+        F: FnOnce(CancellationToken) -> T + Send + 'static,
+    {
+        let mut diagnostic = WaitDiagnostic {
+            operation: std::any::type_name::<F>(),
+            stage: "gate_admission",
+            completed: false,
+        };
+        let operation_cancellation = self.shutdown.child_token();
+        let _cancel_on_drop = operation_cancellation.clone().drop_guard();
+        let deadline = tokio::time::Instant::from_std(deadline);
+        let permit = wait(
+            deadline,
+            cancellation,
+            job_cancellation,
+            &operation_cancellation,
+            Arc::clone(&self.gate).acquire_owned(),
+        )
+        .await?
+        .map_err(|_| ResearchServiceError::ProviderCaptureSealWorkerUnavailable)?;
+        diagnostic.stage = "state_lock";
+        let mut state = wait(
+            deadline,
+            cancellation,
+            job_cancellation,
+            &operation_cancellation,
+            self.state.lock(),
+        )
+        .await?;
+        diagnostic.stage = "prior_join";
+        // An abandoned request can leave a finished handle in this slot. Join that exact worker
+        // before starting the next operation; never overwrite its result or failure.
+        wait(
+            deadline,
+            cancellation,
+            job_cancellation,
+            &operation_cancellation,
+            state.join(),
+        )
+        .await??;
+        let (sender, mut result) = oneshot::channel();
+        let worker_cancellation = operation_cancellation.clone();
+        state.worker = Some(tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let output = operation(worker_cancellation);
+            // A cancelled read no longer needs its typed output. A late sealed capture remains
+            // durable and unreferenced for the existing startup quarantine pass.
+            let _unclaimed_output = sender.send(output);
+        }));
+        diagnostic.stage = "current_join";
+        match wait(
+            deadline,
+            cancellation,
+            job_cancellation,
+            &operation_cancellation,
+            state.join(),
+        )
+        .await
+        {
+            Ok(joined) => joined?,
+            Err(interrupted) => {
+                operation_cancellation.cancel();
+                if job_cancellation.is_some() {
+                    // This drains already admitted work; it does not extend its operation
+                    // deadline or permit more publication. Native filesystem completion may
+                    // outlive that deadline. A dropped waiter still leaves this exact slot owned.
+                    state.join().await?;
+                }
+                return Err(interrupted);
+            }
+        }
+        if cancellation.is_cancelled()
+            || job_cancellation.is_some_and(CancellationToken::is_cancelled)
+            || operation_cancellation.is_cancelled()
+        {
+            return Err(IngestError::Cancelled.into());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(IngestError::DeadlineExceeded.into());
+        }
+        // Receiving a result alone cannot attest that the original thread joined. This read is
+        // synchronous and occurs only after the actual JoinHandle returned successfully.
+        let output = result
+            .try_recv()
+            .map_err(|_| ResearchServiceError::ProviderCaptureSealWorkerUnavailable);
+        diagnostic.completed = output.is_ok();
+        output
+    }
+
+    pub(super) fn begin_shutdown(&self) {
+        self.shutdown.cancel();
+        self.gate.close();
+    }
+
+    pub(super) async fn finish_shutdown(
+        &self,
+        deadline: Instant,
+    ) -> Result<(), ResearchServiceError> {
+        self.begin_shutdown();
+        let deadline = tokio::time::Instant::from_std(deadline);
+        let mut state = tokio::time::timeout_at(deadline, self.state.lock())
+            .await
+            .map_err(|_| IngestError::DeadlineExceeded)?;
+        // Timeout drops only a borrow of the slot. A later shutdown resumes this same handle.
+        tokio::time::timeout_at(deadline, state.join())
+            .await
+            .map_err(|_| IngestError::DeadlineExceeded)?
+    }
+}
+
+impl State {
+    async fn join(&mut self) -> Result<(), ResearchServiceError> {
+        if let Some(worker) = self.worker.as_mut() {
+            let joined = worker.await;
+            self.record_join(joined);
+        }
+        if self.first_join_error.is_some() {
+            Err(ResearchServiceError::ProviderCaptureSealWorkerUnavailable)
+        } else {
+            Ok(())
+        }
+    }
+
+    fn record_join(&mut self, joined: Result<(), JoinError>) {
+        self.worker = None;
+        if let Err(error) = joined {
+            self.first_join_error.get_or_insert(error);
+        }
+    }
+}
+
+async fn wait<T>(
+    deadline: tokio::time::Instant,
+    caller: &CancellationToken,
+    job: Option<&CancellationToken>,
+    operation: &CancellationToken,
+    future: impl Future<Output = T>,
+) -> Result<T, ResearchServiceError> {
+    tokio::select! {
+        biased;
+        () = caller.cancelled() => Err(IngestError::Cancelled.into()),
+        () = async {
+            match job {
+                Some(job) => job.cancelled().await,
+                None => std::future::pending::<()>().await,
+            }
+        } => Err(IngestError::Cancelled.into()),
+        () = operation.cancelled() => Err(IngestError::Cancelled.into()),
+        () = tokio::time::sleep_until(deadline) => Err(IngestError::DeadlineExceeded.into()),
+        result = future => Ok(result),
+    }
+}
+
+struct CompletionWake(Thread);
+
+impl Wake for CompletionWake {
+    fn wake(self: Arc<Self>) {
+        self.0.unpark();
+    }
+
+    fn wake_by_ref(self: &Arc<Self>) {
+        self.0.unpark();
+    }
+}
+
+impl Drop for ResearchIoWorker {
+    fn drop(&mut self) {
+        self.begin_shutdown();
+        let state = self.state.get_mut();
+        let waker = Waker::from(Arc::new(CompletionWake(thread::current())));
+        let mut context = Context::from_waker(&waker);
+        while let Some(worker) = state.worker.as_mut() {
+            match Pin::new(worker).poll(&mut context) {
+                Poll::Ready(joined) => state.record_join(joined),
+                // The worker is synchronous native work and owns no ResearchService Arc. Its
+                // completion wakes this parked thread; no runtime, detached reaper or busy poll
+                // is needed. Final Drop may wait on unavoidable filesystem completion. Bounded
+                // product shutdown must retain this owner and retry finish_shutdown instead.
+                Poll::Pending => thread::park(),
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ResearchService;
+    use market_squawk_data::{CatalogConfig, CatalogLimit, CatalogResultLimits, ObjectStoreConfig};
+    use market_squawk_platform::LocalPaths;
+    use std::{
+        sync::atomic::{AtomicBool, Ordering},
+        time::Duration,
+    };
+
+    // The data-layer history fixture does not exercise application worker admission or custody.
+    #[tokio::test]
+    async fn retained_read_progresses_during_capture_and_generation_and_all_workers_drain()
+    -> Result<(), Box<dyn std::error::Error>> {
+        let directory = tempfile::tempdir()?;
+        let paths = LocalPaths::prepare(directory.path().join("research"))?;
+        let catalog = CatalogConfig::try_new(
+            paths.catalog()?.clone(),
+            Duration::from_millis(750),
+            CatalogLimit::new(64)?,
+            CatalogResultLimits::try_new(1024 * 1024, 8 * 1024 * 1024)?,
+        )?;
+        let service = Arc::new(ResearchService::initialize(
+            &paths,
+            catalog,
+            8,
+            ObjectStoreConfig::try_new(8 * 1024 * 1024, 128, Duration::from_secs(60))?,
+        )?);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let capture_cancel = CancellationToken::new();
+        let (capture_entered, entered) = oneshot::channel();
+        let (release_capture, capture_release) = std::sync::mpsc::channel();
+        let capture_finished = Arc::new(AtomicBool::new(false));
+        let capture = {
+            let service = Arc::clone(&service);
+            let token = capture_cancel.clone();
+            let finished = Arc::clone(&capture_finished);
+            tokio::spawn(async move {
+                service
+                    .run_owned_research_io(deadline, &token, move |_| {
+                        let _ = capture_entered.send(());
+                        let _ = capture_release.recv_timeout(Duration::from_secs(10));
+                        finished.store(true, Ordering::Release);
+                    })
+                    .await
+            })
+        };
+        entered.await?;
+        let preparation_cancel = CancellationToken::new();
+        let (preparation_entered, entered) = oneshot::channel();
+        let (release_preparation, preparation_release) = std::sync::mpsc::channel();
+        let preparation_finished = Arc::new(AtomicBool::new(false));
+        let preparation = {
+            let service = Arc::clone(&service);
+            let token = preparation_cancel.clone();
+            let finished = Arc::clone(&preparation_finished);
+            tokio::spawn(async move {
+                service
+                    .run_owned_research_preparation(deadline, &token, move |_| {
+                        let _ = preparation_entered.send(());
+                        let _ = preparation_release.recv_timeout(Duration::from_secs(10));
+                        finished.store(true, Ordering::Release);
+                    })
+                    .await
+            })
+        };
+        entered.await?;
+        let generation_read = service
+            .run_owned_research_generation_read(deadline, &CancellationToken::new(), |_| 84)
+            .await?;
+        assert_eq!(generation_read, 84);
+        assert!(!capture_finished.load(Ordering::Acquire));
+        assert!(!preparation_finished.load(Ordering::Acquire));
+        let generation_cancel = CancellationToken::new();
+        let (generation_entered, entered) = oneshot::channel();
+        let (release_generation, generation_release) = std::sync::mpsc::channel();
+        let generation_finished = Arc::new(AtomicBool::new(false));
+        let generation = {
+            let service = Arc::clone(&service);
+            let token = generation_cancel.clone();
+            let finished = Arc::clone(&generation_finished);
+            tokio::spawn(async move {
+                service
+                    .run_owned_research_generation_read(deadline, &token, move |_| {
+                        let _ = generation_entered.send(());
+                        let _ = generation_release.recv_timeout(Duration::from_secs(10));
+                        finished.store(true, Ordering::Release);
+                    })
+                    .await
+            })
+        };
+        entered.await?;
+        let financial_read = service
+            .run_owned_financial_read(deadline, &CancellationToken::new(), |_| 126)
+            .await?;
+        assert_eq!(financial_read, 126);
+        assert!(!capture_finished.load(Ordering::Acquire));
+        assert!(!generation_finished.load(Ordering::Acquire));
+        assert!(!preparation_finished.load(Ordering::Acquire));
+        let financial_cancel = CancellationToken::new();
+        let (financial_entered, entered) = oneshot::channel();
+        let (release_financial, financial_release) = std::sync::mpsc::channel();
+        let financial_finished = Arc::new(AtomicBool::new(false));
+        let financial = {
+            let service = Arc::clone(&service);
+            let token = financial_cancel.clone();
+            let finished = Arc::clone(&financial_finished);
+            tokio::spawn(async move {
+                service
+                    .run_owned_financial_read(deadline, &token, move |owned| {
+                        let _ = financial_entered.send(());
+                        let _ = financial_release.recv_timeout(Duration::from_secs(10));
+                        assert!(owned.is_cancelled());
+                        finished.store(true, Ordering::Release);
+                    })
+                    .await
+            })
+        };
+        entered.await?;
+        let read = service
+            .run_owned_research_read(deadline, &CancellationToken::new(), |_| 42)
+            .await?;
+        assert_eq!(read, 42);
+        assert!(!capture_finished.load(Ordering::Acquire));
+        assert!(!generation_finished.load(Ordering::Acquire));
+        assert!(!preparation_finished.load(Ordering::Acquire));
+        assert!(!financial_finished.load(Ordering::Acquire));
+
+        let read_cancel = CancellationToken::new();
+        let (read_entered, entered) = oneshot::channel();
+        let (release_read, read_release) = std::sync::mpsc::channel();
+        let read_finished = Arc::new(AtomicBool::new(false));
+        let read = {
+            let service = Arc::clone(&service);
+            let token = read_cancel.clone();
+            let finished = Arc::clone(&read_finished);
+            tokio::spawn(async move {
+                service
+                    .run_owned_research_read(deadline, &token, move |_| {
+                        let _ = read_entered.send(());
+                        let _ = read_release.recv_timeout(Duration::from_secs(10));
+                        finished.store(true, Ordering::Release);
+                    })
+                    .await
+            })
+        };
+        entered.await?;
+        capture_cancel.cancel();
+        generation_cancel.cancel();
+        preparation_cancel.cancel();
+        financial_cancel.cancel();
+        read_cancel.cancel();
+        assert!(matches!(
+            capture.await?,
+            Err(ResearchServiceError::Ingest(IngestError::Cancelled))
+        ));
+        assert!(matches!(
+            generation.await?,
+            Err(ResearchServiceError::Ingest(IngestError::Cancelled))
+        ));
+        assert!(matches!(
+            preparation.await?,
+            Err(ResearchServiceError::Ingest(IngestError::Cancelled))
+        ));
+        assert!(matches!(
+            read.await?,
+            Err(ResearchServiceError::Ingest(IngestError::Cancelled))
+        ));
+        assert!(matches!(
+            financial.await?,
+            Err(ResearchServiceError::Ingest(IngestError::Cancelled))
+        ));
+        assert!(!capture_finished.load(Ordering::Acquire));
+        assert!(!generation_finished.load(Ordering::Acquire));
+        assert!(!preparation_finished.load(Ordering::Acquire));
+        assert!(!read_finished.load(Ordering::Acquire));
+        assert!(!financial_finished.load(Ordering::Acquire));
+        // Returning cancellation does not free admission or discard the original handle.
+        assert_eq!(service.financial_read_worker.gate.available_permits(), 0);
+        assert!(
+            service
+                .financial_read_worker
+                .state
+                .lock()
+                .await
+                .worker
+                .is_some()
+        );
+        release_capture.send(())?;
+        release_generation.send(())?;
+        release_preparation.send(())?;
+        release_read.send(())?;
+        release_financial.send(())?;
+        service.finish_owned_io_shutdown(deadline).await?;
+        assert!(capture_finished.load(Ordering::Acquire));
+        assert!(generation_finished.load(Ordering::Acquire));
+        assert!(preparation_finished.load(Ordering::Acquire));
+        assert!(read_finished.load(Ordering::Acquire));
+        assert!(financial_finished.load(Ordering::Acquire));
+        assert!(
+            service
+                .financial_read_worker
+                .state
+                .lock()
+                .await
+                .worker
+                .is_none()
+        );
+        Ok(())
+    }
+}

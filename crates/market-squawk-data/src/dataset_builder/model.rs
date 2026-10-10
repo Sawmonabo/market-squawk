@@ -2,14 +2,20 @@
 
 use std::cmp::Ordering;
 use std::mem::size_of;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, NonZeroU64};
 use std::time::Duration;
 
+use crate::{
+    CurrentListedPopulation, CurrentListedPopulationPartition, CurrentListedPopulationSourceScope,
+    DatasetPopulationPartition,
+};
 use market_squawk_domain::{
-    AvailabilityEvidence, Currency, DigestAlgorithm, EvidenceDigest, InstrumentId,
-    ResearchTemporalCoordinate, SourceId, SourceIdentifier, Timestamp,
+    AvailabilityEvidence, CalendarDate, Currency, DigestAlgorithm, EvidenceDigest,
+    HistoricalStudyBasis, InstrumentId, ResearchTemporalCoordinate, SourceId, SourceIdentifier,
+    Timestamp,
 };
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 
 use super::DatasetBuildError;
 use crate::{
@@ -24,10 +30,8 @@ const MAX_COMPONENT_SELECTORS: usize = 64;
 const MAX_COMPONENT_NAME_BYTES: usize = 256;
 const MAX_EXAMPLE_ID_BYTES: usize = 256;
 const MAX_BUILD_DURATION: Duration = Duration::from_secs(300);
-const MAX_BUILD_INPUT_ROWS: usize = 1_000_000;
 const MAX_BUILD_EXAMPLES: usize = 1_000_000;
 const MAX_COMPONENTS_PER_EXAMPLE: usize = 1_024;
-const MAX_BUILD_OUTPUT_ROWS: usize = 10_000_000;
 const MAX_BUILD_RETAINED_BYTES: usize = 1024 * 1024 * 1024;
 
 /// Closed semantic role of one versioned output component.
@@ -57,6 +61,238 @@ pub enum CorporateActionSensitivity {
     NotApplicable,
     /// Non-raw policies require exact producer evidence for the selected action plan.
     RequiresAdjustment,
+}
+
+/// Code-owned unit tag for a dimensionless return label.
+pub const FEATURE_LABEL_RETURN_UNIT: &str = "market-squawk.return";
+/// Code-owned unit tag for a probability label.
+pub const FEATURE_LABEL_PROBABILITY_UNIT: &str = "market-squawk.probability";
+
+/// Closed measurement derived from the admitted rows of one numeric label.
+///
+/// This contract is produced from the row-level unit and currency columns. It is not inferred from
+/// a label name and cannot be supplied by a model-training caller.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum FeatureLabelMeasurement {
+    /// A monetary price in one exact quote currency.
+    Price { currency: Currency },
+    /// Signed source-reported financial amount with exact ownership and share meaning.
+    FinancialAmount {
+        currency: Currency,
+        role: super::FinancialAmountRole,
+        basis: super::FinancialAmountBasis,
+        share_convention: Option<super::FinancialShareConvention>,
+    },
+    /// A dimensionless return using [`FEATURE_LABEL_RETURN_UNIT`].
+    Return,
+    /// A probability using [`FEATURE_LABEL_PROBABILITY_UNIT`].
+    Probability,
+    /// A numeric regression measurement that is explicitly none of the above.
+    OtherRegression,
+}
+
+impl FeatureLabelMeasurement {
+    pub(crate) fn try_from_parts(
+        unit: Option<&str>,
+        currency: Option<&str>,
+    ) -> Result<Self, DatasetBuildError> {
+        let currency = currency
+            .map(Currency::try_from)
+            .transpose()
+            .map_err(|_| DatasetBuildError::InvalidRequest)?;
+        if let (Some(unit), Some(currency)) = (unit, currency) {
+            return super::FinancialAmountSelection::from_unit(unit)
+                .map(|selection| selection.measurement(currency))
+                .ok_or(DatasetBuildError::InvalidRequest);
+        }
+        match (unit, currency) {
+            (None, Some(currency)) => Ok(Self::Price { currency }),
+            (Some(FEATURE_LABEL_RETURN_UNIT), None) => Ok(Self::Return),
+            (Some(FEATURE_LABEL_PROBABILITY_UNIT), None) => Ok(Self::Probability),
+            (None | Some(_), None) => Ok(Self::OtherRegression),
+            (Some(_), Some(_)) => Err(DatasetBuildError::InvalidRequest),
+        }
+    }
+
+    pub(super) fn try_from_value(
+        value: &ComponentValue,
+    ) -> Result<Option<Self>, DatasetBuildError> {
+        match value {
+            ComponentValue::Float {
+                value,
+                unit,
+                currency,
+            } => {
+                let measurement = Self::try_from_parts(
+                    unit.as_ref().map(SourceIdentifier::as_str),
+                    currency.as_ref().map(Currency::as_str),
+                )?;
+                if matches!(measurement, Self::Price { .. }) && *value <= 0.0 {
+                    return Err(DatasetBuildError::InvalidRequest);
+                }
+                Ok(Some(measurement))
+            }
+            ComponentValue::Decimal {
+                value,
+                unit,
+                currency,
+            } => {
+                let measurement = Self::try_from_parts(
+                    unit.as_ref().map(SourceIdentifier::as_str),
+                    currency.as_ref().map(Currency::as_str),
+                )?;
+                if matches!(measurement, Self::Price { .. }) && *value <= Decimal::ZERO {
+                    return Err(DatasetBuildError::InvalidRequest);
+                }
+                Ok(Some(measurement))
+            }
+            ComponentValue::Missing { .. } => Ok(None),
+        }
+    }
+}
+
+/// Financial origin used to measure an exact terminal horizon.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FixedHorizonOriginBasis {
+    /// Exact source-effective timestamps for a generic numeric target.
+    ExactEffectiveTimestamp,
+    /// Actual completed-bar closes, independently verified against the selected source bars.
+    CompletedBarClose,
+    /// A genuine named-session close associated with an original date-only daily bar.
+    NamedSessionCloseForNominalDailyBar,
+}
+
+/// Complete price-source composition of a dataset; each row retains its concrete epoch.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DatasetPriceInputOrigin {
+    CompletedBarClose,
+    NamedSessionCloseForNominalDailyBar,
+    MixedCompletedAndNamedSessionCloses,
+}
+impl DatasetPriceInputOrigin {
+    pub(crate) const fn mask(self) -> u8 {
+        match self {
+            Self::CompletedBarClose => 1,
+            Self::NamedSessionCloseForNominalDailyBar => 2,
+            Self::MixedCompletedAndNamedSessionCloses => 3,
+        }
+    }
+    pub(crate) const fn from_mask(mask: u8) -> Option<Self> {
+        match mask {
+            1 => Some(Self::CompletedBarClose),
+            2 => Some(Self::NamedSessionCloseForNominalDailyBar),
+            3 => Some(Self::MixedCompletedAndNamedSessionCloses),
+            _ => None,
+        }
+    }
+}
+
+/// One exact label contract and the measurement consistently derived from all retained rows.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct FeatureLabelMeasurementBinding {
+    label: FeatureLabelComponentSpec,
+    measurement: FeatureLabelMeasurement,
+    target_horizon: Option<super::DatasetTargetHorizon>,
+    fixed_horizon_origin_basis: Option<FixedHorizonOriginBasis>,
+    probability_event_target: Option<super::ProbabilityEventTarget>,
+}
+
+impl FeatureLabelMeasurementBinding {
+    pub(crate) fn try_new(
+        label: FeatureLabelComponentSpec,
+        measurement: FeatureLabelMeasurement,
+        target_horizon: Option<super::DatasetTargetHorizon>,
+        fixed_horizon_origin_basis: Option<FixedHorizonOriginBasis>,
+    ) -> Result<Self, DatasetBuildError> {
+        if let Some(horizon) = target_horizon {
+            horizon.validate()?;
+        }
+        if matches!(
+            target_horizon,
+            Some(super::DatasetTargetHorizon::FiscalPeriods { .. })
+        ) != matches!(measurement, FeatureLabelMeasurement::FinancialAmount { .. })
+        {
+            return Err(DatasetBuildError::InvalidRequest);
+        }
+        if label.kind() != ComponentKind::Label
+            || target_horizon
+                .and_then(super::DatasetTargetHorizon::exact_elapsed)
+                .is_some()
+                != fixed_horizon_origin_basis.is_some()
+        {
+            return Err(DatasetBuildError::InvalidRequest);
+        }
+        Ok(Self {
+            label,
+            measurement,
+            target_horizon,
+            fixed_horizon_origin_basis,
+            probability_event_target: None,
+        })
+    }
+
+    /// Attaches only a closed binary economic event to an exact original price horizon.
+    pub(crate) fn try_with_probability_event(
+        mut self,
+        event: super::ProbabilityEventTarget,
+    ) -> Result<Self, DatasetBuildError> {
+        event.validate()?;
+        if self.measurement != FeatureLabelMeasurement::Probability
+            || self.label.name() != event.label_component_name()
+            || self.label.version() != NonZeroU32::MIN
+            || self.label.corporate_actions() != CorporateActionSensitivity::RequiresAdjustment
+            || self.fixed_horizon_nanos().is_none()
+            || !matches!(
+                self.fixed_horizon_origin_basis,
+                Some(
+                    FixedHorizonOriginBasis::CompletedBarClose
+                        | FixedHorizonOriginBasis::NamedSessionCloseForNominalDailyBar
+                )
+            )
+            || self.probability_event_target.is_some()
+        {
+            return Err(DatasetBuildError::InvalidRequest);
+        }
+        self.probability_event_target = Some(event);
+        Ok(self)
+    }
+
+    /// Exact producer-bound event meaning; never inferred from a fitted score or caller label.
+    pub const fn probability_event_target(&self) -> Option<super::ProbabilityEventTarget> {
+        self.probability_event_target
+    }
+
+    /// Returns the exact label component contract.
+    #[must_use]
+    pub const fn label(&self) -> &FeatureLabelComponentSpec {
+        &self.label
+    }
+
+    /// Returns the closed row-derived measurement.
+    #[must_use]
+    pub const fn measurement(&self) -> FeatureLabelMeasurement {
+        self.measurement
+    }
+
+    /// Returns the row-proven financial origin of an exact terminal horizon.
+    pub const fn fixed_horizon_origin_basis(&self) -> Option<FixedHorizonOriginBasis> {
+        self.fixed_horizon_origin_basis
+    }
+
+    /// Returns the exact label-effective offset from the feature-effective coordinate only when
+    /// every retained numeric label row proved the same positive nanosecond horizon.
+    #[must_use]
+    pub fn fixed_horizon_nanos(&self) -> Option<NonZeroU64> {
+        self.target_horizon
+            .and_then(super::DatasetTargetHorizon::exact_elapsed)
+            .and_then(|value| u64::try_from(value.as_nanos()).ok())
+            .and_then(NonZeroU64::new)
+    }
+    pub const fn target_horizon(&self) -> Option<super::DatasetTargetHorizon> {
+        self.target_horizon
+    }
 }
 
 impl CorporateActionSensitivity {
@@ -321,18 +557,45 @@ pub struct FeatureLabelComponentInput {
     spec: FeatureLabelComponentSpec,
     value: ComponentValue,
     selectors: Box<[ComponentSelector]>,
+    selection_effective_cutoff: ResearchTemporalCoordinate,
+    label_selection_effective_cutoff: Option<ResearchTemporalCoordinate>,
     adjustment: ComponentAdjustmentEvidence,
 }
 
 impl FeatureLabelComponentInput {
-    /// Constructs one selector-bound component value.
+    /// Computes the same owned-byte charge used by final request admission.
+    pub fn retained_bytes(&self) -> Result<usize, DatasetBuildError> {
+        size_of::<Self>()
+            .checked_add(component_dynamic_bytes(self)?)
+            .ok_or(DatasetBuildError::LimitExceeded)
+    }
+
+    /// Constructs one selector-bound component value with its native-precision PIT window.
+    ///
+    /// Feature components select through `selection_effective_cutoff` and must not supply a label
+    /// boundary. Label components select the open-closed interval from
+    /// `selection_effective_cutoff` through `label_selection_effective_cutoff`. Cross-precision
+    /// bounds are rejected rather than coerced to a fabricated timestamp.
     pub fn try_new(
         spec: FeatureLabelComponentSpec,
         value: ComponentValue,
         mut selectors: Vec<ComponentSelector>,
+        selection_effective_cutoff: ResearchTemporalCoordinate,
+        label_selection_effective_cutoff: Option<ResearchTemporalCoordinate>,
         adjustment: ComponentAdjustmentEvidence,
     ) -> Result<Self, DatasetBuildError> {
-        if selectors.is_empty() || selectors.len() > MAX_COMPONENT_SELECTORS {
+        let temporal_window_valid = match (spec.kind, &label_selection_effective_cutoff) {
+            (ComponentKind::Feature, None) => true,
+            (ComponentKind::Label, Some(label)) => matches!(
+                label.partial_cmp(&selection_effective_cutoff),
+                Some(Ordering::Greater)
+            ),
+            (ComponentKind::Feature, Some(_)) | (ComponentKind::Label, None) => false,
+        };
+        if !temporal_window_valid
+            || selectors.is_empty()
+            || selectors.len() > MAX_COMPONENT_SELECTORS
+        {
             return Err(DatasetBuildError::InvalidRequest);
         }
         selectors.sort_unstable_by_key(ComponentSelector::identity);
@@ -346,6 +609,8 @@ impl FeatureLabelComponentInput {
             spec,
             value,
             selectors: selectors.into_boxed_slice(),
+            selection_effective_cutoff,
+            label_selection_effective_cutoff,
             adjustment,
         })
     }
@@ -365,6 +630,16 @@ impl FeatureLabelComponentInput {
         &self.selectors
     }
 
+    /// Returns the inclusive native-precision feature boundary or label-window lower boundary.
+    pub const fn selection_effective_cutoff(&self) -> &ResearchTemporalCoordinate {
+        &self.selection_effective_cutoff
+    }
+
+    /// Returns the inclusive native-precision label-window upper boundary only for labels.
+    pub const fn label_selection_effective_cutoff(&self) -> Option<&ResearchTemporalCoordinate> {
+        self.label_selection_effective_cutoff.as_ref()
+    }
+
     /// Returns exact producer evidence for this value's corporate-action treatment.
     pub const fn adjustment(&self) -> &ComponentAdjustmentEvidence {
         &self.adjustment
@@ -376,8 +651,20 @@ impl FeatureLabelComponentInput {
 pub struct DatasetExample {
     example_id: Box<str>,
     instrument_id: InstrumentId,
-    cutoff_at: Timestamp,
-    label_cutoff_at: Timestamp,
+    /// Exact knowledge-time boundary used for availability and split admission.
+    source_selection_as_of: Timestamp,
+    /// Exact knowledge-time boundary used for label availability and split admission.
+    label_selection_as_of: Option<Timestamp>,
+    decision_coordinate: ResearchTemporalCoordinate,
+    financial_source: Option<super::financial::FinancialExampleSource>,
+    nominal_daily_source: Option<super::nominal_daily::NominalDailyExampleSource>,
+    timestamp_history_source: Option<super::timestamp_history::TimestampHistoryExampleSource>,
+    source_price_plan: Option<std::sync::Arc<crate::CorporateActionPlan>>,
+    probability_derivation: Option<Box<super::probability::ProbabilityExampleDerivation>>,
+    /// Source-precision feature/effective boundary; never inferred from knowledge time.
+    effective_cutoff: ResearchTemporalCoordinate,
+    /// Source-precision label/effective boundary; never inferred from knowledge time.
+    label_effective_cutoff: Option<ResearchTemporalCoordinate>,
     components: Box<[FeatureLabelComponentInput]>,
 }
 
@@ -386,13 +673,44 @@ impl DatasetExample {
     pub fn try_new(
         example_id: impl AsRef<str>,
         instrument_id: InstrumentId,
-        cutoff_at: Timestamp,
-        label_cutoff_at: Timestamp,
+        source_selection_as_of: Timestamp,
+        label_selection_as_of: Timestamp,
+        components: Vec<FeatureLabelComponentInput>,
+    ) -> Result<Self, DatasetBuildError> {
+        Self::try_new_with_temporal_cutoffs(
+            example_id,
+            instrument_id,
+            source_selection_as_of,
+            Some(label_selection_as_of),
+            source_selection_as_of,
+            ResearchTemporalCoordinate::exact(source_selection_as_of),
+            ResearchTemporalCoordinate::exact(label_selection_as_of),
+            components,
+        )
+    }
+
+    /// Constructs one leakage-bounded example while preserving source temporal precision.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "knowledge-time and source-effective boundaries are independent semantics"
+    )]
+    pub fn try_new_with_temporal_cutoffs(
+        example_id: impl AsRef<str>,
+        instrument_id: InstrumentId,
+        source_selection_as_of: Timestamp,
+        label_selection_as_of: Option<Timestamp>,
+        decision_at: Timestamp,
+        effective_cutoff: ResearchTemporalCoordinate,
+        label_effective_cutoff: ResearchTemporalCoordinate,
         mut components: Vec<FeatureLabelComponentInput>,
     ) -> Result<Self, DatasetBuildError> {
         let example_id = example_id.as_ref();
         if !canonical_identifier(example_id, MAX_EXAMPLE_ID_BYTES)
-            || label_cutoff_at <= cutoff_at
+            || label_selection_as_of.is_some_and(|label| label < source_selection_as_of)
+            || !matches!(
+                label_effective_cutoff.partial_cmp(&effective_cutoff),
+                Some(Ordering::Greater)
+            )
             || components.is_empty()
             || components.len() > MAX_COMPONENTS_PER_EXAMPLE
         {
@@ -408,10 +726,214 @@ impl DatasetExample {
         Ok(Self {
             example_id: example_id.into(),
             instrument_id,
-            cutoff_at,
-            label_cutoff_at,
+            source_selection_as_of,
+            label_selection_as_of,
+            decision_coordinate: ResearchTemporalCoordinate::exact(decision_at),
+            financial_source: None,
+            nominal_daily_source: None,
+            timestamp_history_source: None,
+            source_price_plan: None,
+            probability_derivation: None,
+            effective_cutoff,
+            label_effective_cutoff: Some(label_effective_cutoff),
             components: components.into_boxed_slice(),
         })
+    }
+
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "native clocks and private source authority remain independently bound"
+    )]
+    pub(super) fn from_financial(
+        example_id: &str,
+        instrument_id: InstrumentId,
+        source_selection_as_of: Timestamp,
+        label_selection_as_of: Option<Timestamp>,
+        decision_coordinate: ResearchTemporalCoordinate,
+        effective_cutoff: ResearchTemporalCoordinate,
+        label_effective_cutoff: Option<ResearchTemporalCoordinate>,
+        mut components: Vec<FeatureLabelComponentInput>,
+        financial_source: super::financial::FinancialExampleSource,
+    ) -> Result<Self, DatasetBuildError> {
+        if !canonical_identifier(example_id, MAX_EXAMPLE_ID_BYTES)
+            || components.is_empty()
+            || label_selection_as_of.is_some_and(|label| label < source_selection_as_of)
+            || label_effective_cutoff.as_ref().is_some_and(|target| {
+                target.partial_cmp(&effective_cutoff) != Some(Ordering::Greater)
+            })
+        {
+            return Err(DatasetBuildError::InvalidRequest);
+        }
+        components.sort_unstable_by(|left, right| left.spec.cmp(&right.spec));
+        Ok(Self {
+            example_id: example_id.into(),
+            instrument_id,
+            source_selection_as_of,
+            label_selection_as_of,
+            decision_coordinate,
+            effective_cutoff,
+            label_effective_cutoff,
+            components: components.into_boxed_slice(),
+            financial_source: Some(financial_source),
+            nominal_daily_source: None,
+            timestamp_history_source: None,
+            source_price_plan: None,
+            probability_derivation: None,
+        })
+    }
+
+    pub(super) fn from_nominal_daily(
+        example_id: &str,
+        instrument_id: InstrumentId,
+        study: super::DatasetStudyPolicy,
+        decision_at: Timestamp,
+        target_at: Timestamp,
+        mut components: Vec<FeatureLabelComponentInput>,
+        source: super::nominal_daily::NominalDailyExampleSource,
+    ) -> Result<Self, DatasetBuildError> {
+        if !canonical_identifier(example_id, MAX_EXAMPLE_ID_BYTES)
+            || components.is_empty()
+            || components.len() > MAX_COMPONENTS_PER_EXAMPLE
+        {
+            return Err(DatasetBuildError::InvalidRequest);
+        }
+        components.sort_unstable_by(|left, right| left.spec.cmp(&right.spec));
+        if components
+            .windows(2)
+            .any(|pair| pair[0].spec == pair[1].spec)
+        {
+            return Err(DatasetBuildError::InvalidRequest);
+        }
+        let value = Self {
+            example_id: example_id.into(),
+            instrument_id,
+            source_selection_as_of: study.snapshot_as_of(),
+            label_selection_as_of: (study.purpose() == super::DatasetBuildPurpose::Training)
+                .then_some(study.snapshot_as_of()),
+            decision_coordinate: ResearchTemporalCoordinate::exact(decision_at),
+            effective_cutoff: ResearchTemporalCoordinate::calendar_date(
+                source.origin.native_date(),
+            ),
+            label_effective_cutoff: Some(ResearchTemporalCoordinate::exact(target_at)),
+            components: components.into_boxed_slice(),
+            financial_source: None,
+            nominal_daily_source: Some(source),
+            timestamp_history_source: None,
+            source_price_plan: None,
+            probability_derivation: None,
+        };
+        study.validate_example(&value)?;
+        Ok(value)
+    }
+
+    /// Derives a separate binary label while retaining the original return component as evidence.
+    /// This does not admit a product; the existing publisher revalidates its closed event recipe.
+    pub fn try_derive_probability_label(
+        mut self,
+        target: super::ProbabilityEventTarget,
+        benchmark: Option<&Self>,
+        costs: Option<super::ProbabilityCostOutcomeAttestation>,
+    ) -> Result<Self, DatasetBuildError> {
+        let (derivation, label) = super::probability::ProbabilityExampleDerivation::derive(
+            &self, target, benchmark, costs,
+        )?;
+        let mut components = self.components.into_vec();
+        let original = components
+            .iter_mut()
+            .find(|v| v.spec.kind == ComponentKind::Label)
+            .ok_or(DatasetBuildError::InvalidRequest)?;
+        *original = label;
+        components.sort_unstable_by(|left, right| left.spec.cmp(&right.spec));
+        self.components = components.into_boxed_slice();
+        self.probability_derivation = Some(Box::new(derivation));
+        Ok(self)
+    }
+
+    pub(super) fn probability_derivation(
+        &self,
+    ) -> Option<&super::probability::ProbabilityExampleDerivation> {
+        self.probability_derivation.as_deref()
+    }
+
+    /// Original financial event of this derived example, if any.
+    pub fn probability_event_target(&self) -> Option<super::ProbabilityEventTarget> {
+        self.probability_derivation().map(|value| value.target())
+    }
+
+    /// Attaches an original source-admitted split pool to its genuine source-history example.
+    /// No decoded record list, empty vector or serialized coverage claim grants this authority.
+    pub fn try_with_source_price_plan(
+        mut self,
+        plan: std::sync::Arc<crate::CorporateActionPlan>,
+    ) -> Result<Self, DatasetBuildError> {
+        if self.source_price_plan.is_some() || self.financial_source.is_some() {
+            return Err(DatasetBuildError::ComponentAdjustmentMismatch);
+        }
+        if let Some(source) = self.nominal_daily_source.as_ref() {
+            source.origin.validate_price_plan(
+                &source.manifest,
+                self.instrument_id,
+                self.source_selection_as_of,
+                &plan,
+            )?;
+        } else if let Some(source) = self.timestamp_history_source.as_ref() {
+            source.validate_price_plan(self.instrument_id, self.source_selection_as_of, &plan)?;
+        } else {
+            return Err(DatasetBuildError::ComponentAdjustmentMismatch);
+        }
+        if self
+            .label_selection_as_of
+            .is_some_and(|cutoff| cutoff != self.source_selection_as_of)
+        {
+            return Err(DatasetBuildError::ComponentAdjustmentMismatch);
+        }
+        self.source_price_plan = Some(plan);
+        Ok(self)
+    }
+
+    pub(super) fn attach_timestamp_history(
+        &mut self,
+        source: super::timestamp_history::TimestampHistoryExampleSource,
+    ) -> Result<(), DatasetBuildError> {
+        if self.timestamp_history_source.is_some()
+            || self.nominal_daily_source.is_some()
+            || self.financial_source.is_some()
+            || self.source_price_plan.is_some()
+        {
+            return Err(DatasetBuildError::ComponentEvidenceMismatch);
+        }
+        self.timestamp_history_source = Some(source);
+        Ok(())
+    }
+    pub(super) fn timestamp_history_source(
+        &self,
+    ) -> Option<&super::timestamp_history::TimestampHistoryExampleSource> {
+        self.timestamp_history_source.as_ref()
+    }
+    pub(super) fn source_price_plan(&self) -> Option<&std::sync::Arc<crate::CorporateActionPlan>> {
+        self.source_price_plan.as_ref()
+    }
+
+    pub(super) fn nominal_daily_source(
+        &self,
+    ) -> Option<&super::nominal_daily::NominalDailyExampleSource> {
+        self.nominal_daily_source.as_ref()
+    }
+
+    /// Returns a source-owned native session association only for qualified date-only bars.
+    pub fn named_session_origin(&self) -> Option<&super::nominal_daily::NamedSessionDailyOrigin> {
+        self.nominal_daily_source
+            .as_ref()
+            .map(|value| &value.origin)
+    }
+
+    pub(super) fn exact_target_coordinates(&self) -> Option<(Timestamp, Timestamp)> {
+        let origin = self
+            .named_session_origin()
+            .map(|value| value.closes_at_exclusive())
+            .or_else(|| self.effective_cutoff().exact_timestamp())?;
+        let terminal = self.label_effective_cutoff()?.exact_timestamp()?;
+        (terminal > origin).then_some((origin, terminal))
     }
 
     /// Returns the stable example identity.
@@ -424,14 +946,39 @@ impl DatasetExample {
         self.instrument_id
     }
 
-    /// Returns the feature knowledge/effective cutoff.
-    pub const fn cutoff_at(&self) -> Timestamp {
-        self.cutoff_at
+    /// Returns the exact feature knowledge cutoff used for availability and split admission.
+    pub const fn source_selection_as_of(&self) -> Timestamp {
+        self.source_selection_as_of
     }
 
-    /// Returns the exclusive knowledge horizon and inclusive label-effective cutoff.
-    pub const fn label_cutoff_at(&self) -> Timestamp {
-        self.label_cutoff_at
+    /// Returns the exact label knowledge cutoff used for availability and split admission.
+    pub const fn label_selection_as_of(&self) -> Option<Timestamp> {
+        self.label_selection_as_of
+    }
+
+    pub const fn decision_coordinate(&self) -> &ResearchTemporalCoordinate {
+        &self.decision_coordinate
+    }
+    pub fn decision_at(&self) -> Option<Timestamp> {
+        self.decision_coordinate.exact_timestamp()
+    }
+    pub(super) const fn financial_source(
+        &self,
+    ) -> Option<&super::financial::FinancialExampleSource> {
+        self.financial_source.as_ref()
+    }
+    pub fn financial_period(&self) -> Option<&super::FinancialFiscalTargetBinding> {
+        self.financial_source.as_ref().map(|v| &v.binding)
+    }
+
+    /// Returns the feature-effective boundary with its source precision intact.
+    pub const fn effective_cutoff(&self) -> &ResearchTemporalCoordinate {
+        &self.effective_cutoff
+    }
+
+    /// Returns the inclusive label-effective boundary with its source precision intact.
+    pub const fn label_effective_cutoff(&self) -> Option<&ResearchTemporalCoordinate> {
+        self.label_effective_cutoff.as_ref()
     }
 
     /// Returns components in canonical contract order.
@@ -461,13 +1008,14 @@ impl DatasetSplit {
 /// Inclusive chronological split ends; later splits begin one instant after the prior end.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ChronologicalSplitPolicy {
-    train_end: Timestamp,
-    validation_end: Timestamp,
-    test_end: Timestamp,
+    boundaries: SplitBoundaries,
 }
-
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SplitBoundaries {
+    ExactTime([Timestamp; 3]),
+    FiscalDates([CalendarDate; 3]),
+}
 impl ChronologicalSplitPolicy {
-    /// Constructs strictly increasing train, validation, and test boundaries.
     pub fn try_new(
         train_end: Timestamp,
         validation_end: Timestamp,
@@ -477,34 +1025,65 @@ impl ChronologicalSplitPolicy {
             return Err(DatasetBuildError::InvalidRequest);
         }
         Ok(Self {
-            train_end,
-            validation_end,
-            test_end,
+            boundaries: SplitBoundaries::ExactTime([train_end, validation_end, test_end]),
         })
     }
-
-    pub(super) fn split_for(self, cutoff: Timestamp) -> Option<DatasetSplit> {
-        if cutoff <= self.train_end {
-            Some(DatasetSplit::Train)
-        } else if cutoff <= self.validation_end {
-            Some(DatasetSplit::Validation)
-        } else if cutoff <= self.test_end {
-            Some(DatasetSplit::Test)
-        } else {
-            None
+    pub fn try_fiscal(
+        train_end: CalendarDate,
+        validation_end: CalendarDate,
+        test_end: CalendarDate,
+    ) -> Result<Self, DatasetBuildError> {
+        if !(train_end < validation_end && validation_end < test_end) {
+            return Err(DatasetBuildError::InvalidRequest);
+        }
+        Ok(Self {
+            boundaries: SplitBoundaries::FiscalDates([train_end, validation_end, test_end]),
+        })
+    }
+    pub const fn timestamp_boundaries(self) -> Option<[Timestamp; 3]> {
+        match self.boundaries {
+            SplitBoundaries::ExactTime(values) => Some(values),
+            SplitBoundaries::FiscalDates(_) => None,
         }
     }
-
-    pub(super) const fn split_end(self, split: DatasetSplit) -> Timestamp {
-        match split {
-            DatasetSplit::Train => self.train_end,
-            DatasetSplit::Validation => self.validation_end,
-            DatasetSplit::Test => self.test_end,
+    pub const fn fiscal_boundaries(self) -> Option<[CalendarDate; 3]> {
+        match self.boundaries {
+            SplitBoundaries::FiscalDates(values) => Some(values),
+            SplitBoundaries::ExactTime(_) => None,
         }
     }
-
-    pub(super) const fn boundaries(self) -> [Timestamp; 3] {
-        [self.train_end, self.validation_end, self.test_end]
+    pub(crate) fn native_boundaries(self) -> [ResearchTemporalCoordinate; 3] {
+        match self.boundaries {
+            SplitBoundaries::ExactTime(values) => values.map(ResearchTemporalCoordinate::exact),
+            SplitBoundaries::FiscalDates(values) => {
+                values.map(ResearchTemporalCoordinate::calendar_date)
+            }
+        }
+    }
+    pub(crate) fn split_for(self, cutoff: &ResearchTemporalCoordinate) -> Option<DatasetSplit> {
+        self.native_boundaries()
+            .iter()
+            .position(|end| {
+                matches!(
+                    cutoff.partial_cmp(end),
+                    Some(Ordering::Less | Ordering::Equal)
+                )
+            })
+            .map(|index| {
+                [
+                    DatasetSplit::Train,
+                    DatasetSplit::Validation,
+                    DatasetSplit::Test,
+                ][index]
+            })
+    }
+    pub(crate) fn split_end(self, split: DatasetSplit) -> ResearchTemporalCoordinate {
+        let index = match split {
+            DatasetSplit::Train => 0,
+            DatasetSplit::Validation => 1,
+            DatasetSplit::Test => 2,
+        };
+        self.native_boundaries()[index].clone()
     }
 }
 
@@ -537,6 +1116,7 @@ pub struct DatasetBuildPolicy {
     corporate_actions: CorporateActionPolicy,
     missing_values: MissingValuePolicy,
     implementation_revision: SourceIdentifier,
+    study_policy: Option<super::DatasetStudyPolicy>,
 }
 
 impl DatasetBuildPolicy {
@@ -547,6 +1127,7 @@ impl DatasetBuildPolicy {
         corporate_actions: CorporateActionPolicy,
         missing_values: MissingValuePolicy,
         implementation_revision: SourceIdentifier,
+        study_policy: Option<super::DatasetStudyPolicy>,
     ) -> Self {
         Self {
             split,
@@ -554,6 +1135,7 @@ impl DatasetBuildPolicy {
             corporate_actions,
             missing_values,
             implementation_revision,
+            study_policy,
         }
     }
 
@@ -578,27 +1160,237 @@ impl DatasetBuildPolicy {
     }
 }
 
+impl DatasetBuildPolicy {
+    pub const fn study_policy(&self) -> Option<&super::DatasetStudyPolicy> {
+        self.study_policy.as_ref()
+    }
+    pub(super) fn chronological_at(&self, example: &DatasetExample) -> ResearchTemporalCoordinate {
+        self.study_policy.as_ref().map_or(
+            ResearchTemporalCoordinate::exact(example.source_selection_as_of()),
+            |policy| policy.chronological_at(example),
+        )
+    }
+}
+
 /// Exact immutable input generations, historical universe evidence, and requested examples.
+/// Exact source qualification of the population supplied to the existing publisher.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DatasetPopulationBasis {
+    PublishedHistoricalMembership,
+    CurrentListedSnapshot,
+    PresentDayFixedCohort,
+}
+
+impl DatasetPopulationBasis {
+    pub(crate) fn validate_study_policy(
+        self,
+        policy: Option<&super::DatasetStudyPolicy>,
+    ) -> Result<(), DatasetBuildError> {
+        use market_squawk_domain::HistoricalStudyBasis;
+        let allowed = match self {
+            Self::PublishedHistoricalMembership => true,
+            Self::CurrentListedSnapshot => policy.is_some_and(|v| {
+                v.basis() == HistoricalStudyBasis::HistoricalAsKnown
+                    && v.purpose() == super::DatasetBuildPurpose::StudyInputs
+                    && matches!(
+                        v.target_horizon(),
+                        super::DatasetTargetHorizon::ExactElapsed(_)
+                    )
+            }),
+            // Exact elapsed fixed cohorts additionally require the private nominal source branch
+            // in request and epoch admission. This policy value alone grants no authority.
+            Self::PresentDayFixedCohort => policy
+                .is_some_and(|v| v.basis() == HistoricalStudyBasis::RetrospectiveFrozenSnapshot),
+        };
+        if allowed {
+            Ok(())
+        } else {
+            Err(DatasetBuildError::InvalidRequest)
+        }
+    }
+}
+
+/// Actual missing input disposition; this is an annotation, never source or value authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CurrentPopulationInputUnavailableReason {
+    SourceHistoryUnavailable,
+    RequiredFeatureUnavailable,
+    SourceRightsUnavailable,
+    FreshnessUnavailable,
+    CalendarUnavailable,
+}
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CurrentPopulationInputUnavailable {
+    instrument_id: InstrumentId,
+    reason: CurrentPopulationInputUnavailableReason,
+}
+impl CurrentPopulationInputUnavailable {
+    pub const fn new(
+        instrument_id: InstrumentId,
+        reason: CurrentPopulationInputUnavailableReason,
+    ) -> Self {
+        Self {
+            instrument_id,
+            reason,
+        }
+    }
+    pub const fn instrument_id(&self) -> InstrumentId {
+        self.instrument_id
+    }
+    pub const fn reason(&self) -> CurrentPopulationInputUnavailableReason {
+        self.reason
+    }
+}
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum DatasetPopulationEvidence {
+    Historical(Box<[UniverseMembership]>),
+    Current {
+        population: CurrentListedPopulationPartition,
+        unavailable: Box<[CurrentPopulationInputUnavailable]>,
+    },
+}
+
+/// Composition-only purpose bound to genuine label-free price epochs; never execution authority.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) struct ProbabilitySubjectComposition {
+    pub(super) event: super::ProbabilityEventTarget,
+    pub(super) subject: InstrumentId,
+    pub(super) horizon_nanos: NonZeroU64,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DatasetBuildInputs {
+    probability_subject: Option<ProbabilitySubjectComposition>,
     parents: DerivedGenerationParents,
     universe_id: UniverseId,
-    universe_memberships: Box<[UniverseMembership]>,
+    population: DatasetPopulationEvidence,
     component_specs: Box<[FeatureLabelComponentSpec]>,
     examples: Box<[DatasetExample]>,
 }
 
 impl DatasetBuildInputs {
+    /// Retains every original subject origin before any simulated outcome or complete-case filter.
+    /// Source, membership, corporate-action and PIT authority still pass the existing publisher.
+    pub fn try_with_probability_subject(
+        mut self,
+        event: super::ProbabilityEventTarget,
+        subject: InstrumentId,
+    ) -> Result<Self, DatasetBuildError> {
+        event.validate()?;
+        if self.probability_subject.is_some() || subject.as_uuid().is_nil() {
+            return Err(DatasetBuildError::InvalidRequest);
+        }
+        let mut horizon_nanos = None;
+        for example in self.examples() {
+            let (origin, target) = example
+                .exact_target_coordinates()
+                .ok_or(DatasetBuildError::InvalidRequest)?;
+            let horizon = target
+                .unix_nanos()
+                .checked_sub(origin.unix_nanos())
+                .and_then(|value| u64::try_from(value).ok())
+                .and_then(NonZeroU64::new)
+                .ok_or(DatasetBuildError::InvalidRequest)?;
+            if example.instrument_id() != subject
+                || example.financial_source().is_some()
+                || example.probability_derivation().is_some()
+                || example.label_selection_as_of().is_some()
+                || example
+                    .components()
+                    .iter()
+                    .any(|component| component.spec().kind() != ComponentKind::Feature)
+                || horizon_nanos.is_some_and(|value| value != horizon)
+            {
+                return Err(DatasetBuildError::InvalidRequest);
+            }
+            horizon_nanos = Some(horizon);
+        }
+        self.probability_subject = Some(ProbabilitySubjectComposition {
+            event,
+            subject,
+            horizon_nanos: horizon_nanos.ok_or(DatasetBuildError::InvalidRequest)?,
+        });
+        Ok(self)
+    }
+
+    /// Exact event for this label-free subject cohort, not an observed outcome.
+    pub fn probability_subject_target(&self) -> Option<super::ProbabilityEventTarget> {
+        self.probability_subject.map(|value| value.event)
+    }
+    pub(super) fn probability_subject(&self) -> Option<ProbabilitySubjectComposition> {
+        self.probability_subject
+    }
+
     /// Canonicalizes all exact parents, component contracts, and examples.
     pub fn try_new(
         parents: Vec<DatasetManifestRef>,
         universe_id: UniverseId,
         universe_memberships: Vec<UniverseMembership>,
+        component_specs: Vec<FeatureLabelComponentSpec>,
+        examples: Vec<DatasetExample>,
+    ) -> Result<Self, DatasetBuildError> {
+        Self::try_new_with_population(
+            parents,
+            universe_id,
+            DatasetPopulationEvidence::Historical(universe_memberships.into_boxed_slice()),
+            component_specs,
+            examples,
+        )
+    }
+
+    /// Admits the same source-owned current population without inventing historical rows.
+    pub fn try_new_for_current_population(
+        parents: Vec<DatasetManifestRef>,
+        population: CurrentListedPopulationPartition,
+        component_specs: Vec<FeatureLabelComponentSpec>,
+        examples: Vec<DatasetExample>,
+        mut unavailable: Vec<CurrentPopulationInputUnavailable>,
+    ) -> Result<Self, DatasetBuildError> {
+        unavailable.sort_unstable_by_key(CurrentPopulationInputUnavailable::instrument_id);
+        let ids = examples
+            .iter()
+            .map(DatasetExample::instrument_id)
+            .collect::<std::collections::BTreeSet<_>>();
+        if population.instrument_ids().is_empty()
+            || unavailable
+                .windows(2)
+                .any(|v| v[0].instrument_id() == v[1].instrument_id())
+            || unavailable.iter().any(|v| {
+                ids.contains(&v.instrument_id()) || !population.contains(v.instrument_id())
+            })
+            || ids.iter().any(|id| !population.contains(*id))
+            || ids.len().checked_add(unavailable.len()) != Some(population.instrument_ids().len())
+        {
+            return Err(DatasetBuildError::InvalidRequest);
+        }
+        let universe_id = population.population().universe_id().clone();
+        Self::try_new_with_population(
+            parents,
+            universe_id,
+            DatasetPopulationEvidence::Current {
+                population,
+                unavailable: unavailable.into_boxed_slice(),
+            },
+            component_specs,
+            examples,
+        )
+    }
+
+    fn try_new_with_population(
+        parents: Vec<DatasetManifestRef>,
+        universe_id: UniverseId,
+        population: DatasetPopulationEvidence,
         mut component_specs: Vec<FeatureLabelComponentSpec>,
         mut examples: Vec<DatasetExample>,
     ) -> Result<Self, DatasetBuildError> {
         let parents = DerivedGenerationParents::try_new(parents)?;
-        if universe_memberships.is_empty() || component_specs.is_empty() || examples.is_empty() {
+        if matches!(&population, DatasetPopulationEvidence::Historical(rows) if rows.is_empty())
+            || component_specs.is_empty()
+            || examples.is_empty()
+        {
             return Err(DatasetBuildError::InvalidRequest);
         }
         component_specs.sort_unstable();
@@ -606,16 +1398,85 @@ impl DatasetBuildInputs {
             || !component_specs
                 .iter()
                 .any(|spec| spec.kind == ComponentKind::Feature)
-            || !component_specs
-                .iter()
-                .any(|spec| spec.kind == ComponentKind::Label)
         {
             return Err(DatasetBuildError::InvalidRequest);
         }
-        for membership in &universe_memberships {
-            if !parents.as_slice().contains(membership.source_manifest()) {
-                return Err(DatasetBuildError::InvalidRequest);
+        if let DatasetPopulationEvidence::Historical(rows) = &population {
+            for membership in rows {
+                if !parents.as_slice().contains(membership.source_manifest()) {
+                    return Err(DatasetBuildError::InvalidRequest);
+                }
             }
+        }
+        if examples.iter().any(|example| {
+            example
+                .decision_coordinate()
+                .partial_cmp(examples[0].decision_coordinate())
+                .is_none()
+        }) {
+            return Err(DatasetBuildError::InvalidRequest);
+        }
+        for example in &examples {
+            if let Some(source) = example.nominal_daily_source() {
+                let plan = example
+                    .source_price_plan()
+                    .ok_or(DatasetBuildError::ComponentAdjustmentMismatch)?;
+                source.origin.validate_price_plan(
+                    &source.manifest,
+                    example.instrument_id(),
+                    example.source_selection_as_of(),
+                    plan,
+                )?;
+                let coverage = plan
+                    .source_split_admission()
+                    .ok_or(DatasetBuildError::ComponentAdjustmentMismatch)?;
+                if coverage
+                    .source_manifests()
+                    .iter()
+                    .any(|parent| !parents.as_slice().contains(parent))
+                {
+                    return Err(DatasetBuildError::InvalidRequest);
+                }
+                if !parents.as_slice().contains(&source.manifest) {
+                    return Err(DatasetBuildError::InvalidRequest);
+                }
+            }
+            if let Some(source) = example.timestamp_history_source() {
+                let plan = example
+                    .source_price_plan()
+                    .ok_or(DatasetBuildError::ComponentAdjustmentMismatch)?;
+                source.validate_price_plan(
+                    example.instrument_id(),
+                    example.source_selection_as_of(),
+                    plan,
+                )?;
+                let coverage = plan
+                    .source_split_admission()
+                    .ok_or(DatasetBuildError::ComponentAdjustmentMismatch)?;
+                if !parents.as_slice().contains(source.manifest())
+                    || coverage
+                        .source_manifests()
+                        .iter()
+                        .any(|parent| !parents.as_slice().contains(parent))
+                {
+                    return Err(DatasetBuildError::InvalidRequest);
+                }
+            }
+            if let Some(financial) = example.financial_source() {
+                if !parents.as_slice().contains(&financial.source.manifest) {
+                    return Err(DatasetBuildError::InvalidRequest);
+                }
+            }
+        }
+        if examples
+            .iter()
+            .any(|value| value.nominal_daily_source().is_some())
+            && examples
+                .iter()
+                .any(|value| value.nominal_daily_source().is_none())
+            && !matches!(&population, DatasetPopulationEvidence::Current { .. })
+        {
+            return Err(DatasetBuildError::InvalidRequest);
         }
         examples.sort_unstable_by(compare_examples);
         if examples
@@ -628,18 +1489,21 @@ impl DatasetBuildInputs {
                         .iter()
                         .zip(&component_specs)
                         .any(|(component, spec)| component.spec != *spec)
-                    || example
-                        .components
-                        .iter()
-                        .any(|component| !component_scope_matches(component, example.instrument_id))
+                    || example.components.iter().any(|component| {
+                        !component_scope_matches(component, example.instrument_id)
+                            && !example.financial_source().is_some_and(|financial| {
+                                financial.component_scope_matches(component, example.instrument_id)
+                            })
+                    })
             })
         {
             return Err(DatasetBuildError::InvalidRequest);
         }
         Ok(Self {
+            probability_subject: None,
             parents,
             universe_id,
-            universe_memberships: universe_memberships.into_boxed_slice(),
+            population,
             component_specs: component_specs.into_boxed_slice(),
             examples: examples.into_boxed_slice(),
         })
@@ -656,8 +1520,95 @@ impl DatasetBuildInputs {
     }
 
     /// Returns historical membership evidence bound to exact parents.
-    pub fn universe_memberships(&self) -> &[UniverseMembership] {
-        &self.universe_memberships
+    pub fn universe_memberships(&self) -> Option<&[UniverseMembership]> {
+        match &self.population {
+            DatasetPopulationEvidence::Historical(rows) => Some(rows),
+            DatasetPopulationEvidence::Current { .. } => None,
+        }
+    }
+    pub fn population_basis(&self) -> DatasetPopulationBasis {
+        match &self.population {
+            DatasetPopulationEvidence::Historical(_) => {
+                DatasetPopulationBasis::PublishedHistoricalMembership
+            }
+            DatasetPopulationEvidence::Current { population, .. } => {
+                match population.population().source_scope() {
+                    CurrentListedPopulationSourceScope::CompleteQualifiedCatalog => {
+                        DatasetPopulationBasis::CurrentListedSnapshot
+                    }
+                    CurrentListedPopulationSourceScope::DeclaredFixedCohort => {
+                        DatasetPopulationBasis::PresentDayFixedCohort
+                    }
+                }
+            }
+        }
+    }
+    pub fn population_member_count(&self) -> usize {
+        match &self.population {
+            DatasetPopulationEvidence::Historical(rows) => rows.len(),
+            DatasetPopulationEvidence::Current { population, .. } => {
+                population.population().instrument_ids().len()
+            }
+        }
+    }
+    pub fn population_partition(&self) -> Option<&DatasetPopulationPartition> {
+        match &self.population {
+            DatasetPopulationEvidence::Current { population, .. } => Some(population.descriptor()),
+            _ => None,
+        }
+    }
+    pub fn population_unavailable(&self) -> &[CurrentPopulationInputUnavailable] {
+        match &self.population {
+            DatasetPopulationEvidence::Historical(_) => &[],
+            DatasetPopulationEvidence::Current { unavailable, .. } => unavailable,
+        }
+    }
+    pub(super) fn current_population(&self) -> Option<&CurrentListedPopulation> {
+        match &self.population {
+            DatasetPopulationEvidence::Current { population, .. } => Some(population.population()),
+            _ => None,
+        }
+    }
+    pub(super) fn population_contains(&self, id: InstrumentId) -> bool {
+        match &self.population {
+            DatasetPopulationEvidence::Historical(rows) => {
+                rows.iter().any(|v| v.instrument_id() == id)
+            }
+            DatasetPopulationEvidence::Current { population, .. } => population.contains(id),
+        }
+    }
+    pub fn population_retained_bytes(&self) -> Result<usize, DatasetBuildError> {
+        match &self.population {
+            DatasetPopulationEvidence::Current {
+                population,
+                unavailable,
+            } => population
+                .population()
+                .retained_bytes()
+                .checked_add(retained_array_bytes::<InstrumentId>(
+                    population.instrument_ids().len(),
+                )?)
+                .and_then(|bytes| {
+                    bytes.checked_add(std::mem::size_of::<DatasetPopulationPartition>())
+                })
+                .ok_or(DatasetBuildError::LimitExceeded)?
+                .checked_add(retained_array_bytes::<CurrentPopulationInputUnavailable>(
+                    unavailable.len(),
+                )?)
+                .ok_or(DatasetBuildError::LimitExceeded),
+            DatasetPopulationEvidence::Historical(rows) => {
+                let mut retained = retained_array_bytes::<UniverseMembership>(rows.len())?;
+                for value in rows {
+                    retained = retained
+                        .checked_add(manifest_dynamic_bytes(value.source_manifest())?)
+                        .and_then(|v| {
+                            v.checked_add(availability_dynamic_bytes(value.availability()))
+                        })
+                        .ok_or(DatasetBuildError::LimitExceeded)?;
+                }
+                Ok(retained)
+            }
+        }
     }
 
     /// Returns the complete canonical component contract.
@@ -679,6 +1630,7 @@ pub struct DatasetBuildLimits {
     max_components_per_example: usize,
     max_output_rows: usize,
     max_retained_bytes: usize,
+    max_spill_bytes: u64,
     max_duration: Duration,
     point_in_time: PointInTimeLimits,
     universe: UniverseLimits,
@@ -703,13 +1655,11 @@ impl DatasetBuildLimits {
         corporate_actions: CorporateActionLimits,
     ) -> Result<Self, DatasetBuildError> {
         if max_input_rows == 0
-            || max_input_rows > MAX_BUILD_INPUT_ROWS
             || max_examples == 0
             || max_examples > MAX_BUILD_EXAMPLES
             || max_components_per_example == 0
             || max_components_per_example > MAX_COMPONENTS_PER_EXAMPLE
             || max_output_rows == 0
-            || max_output_rows > MAX_BUILD_OUTPUT_ROWS
             || max_retained_bytes == 0
             || max_retained_bytes > MAX_BUILD_RETAINED_BYTES
             || max_duration.is_zero()
@@ -723,6 +1673,7 @@ impl DatasetBuildLimits {
             max_components_per_example,
             max_output_rows,
             max_retained_bytes,
+            max_spill_bytes: 16 * 1024 * 1024 * 1024,
             max_duration,
             point_in_time,
             universe,
@@ -730,8 +1681,29 @@ impl DatasetBuildLimits {
         })
     }
 
+    /// Sets the operation-owned disk budget independently of its resident working set.
+    pub fn with_spill_bytes(mut self, max_spill_bytes: u64) -> Result<Self, DatasetBuildError> {
+        if max_spill_bytes < 4096 || max_spill_bytes > i64::MAX as u64 {
+            return Err(DatasetBuildError::InvalidLimits);
+        }
+        self.max_spill_bytes = max_spill_bytes;
+        Ok(self)
+    }
+
+    pub(super) const fn max_spill_bytes(self) -> u64 {
+        self.max_spill_bytes
+    }
+
     pub(super) const fn max_input_rows(self) -> usize {
         self.max_input_rows
+    }
+
+    pub(super) const fn max_examples(self) -> usize {
+        self.max_examples
+    }
+
+    pub(super) const fn max_components_per_example(self) -> usize {
+        self.max_components_per_example
     }
 
     pub(super) const fn max_output_rows(self) -> usize {
@@ -806,6 +1778,18 @@ impl DatasetOutputAuthorization {
     pub(super) const fn source_id(&self) -> &SourceId {
         &self.source_id
     }
+
+    pub(super) const fn basis(&self) -> &RightsBasis {
+        &self.basis
+    }
+
+    pub(super) const fn authorization_evidence(&self) -> EvidenceDigest {
+        self.authorization_evidence
+    }
+
+    pub(super) const fn authorization_expires_at(&self) -> Option<Timestamp> {
+        self.authorization_expires_at
+    }
 }
 
 /// Complete immutable and authority-bound request for one derived generation.
@@ -845,13 +1829,162 @@ impl DatasetBuildRequest {
             || inputs.parents().len() > research_use_limits.max_roots()
             || inputs.examples.len() > limits.max_examples
             || inputs.component_specs.len() > limits.max_components_per_example
-            || inputs.universe_memberships.len() > limits.universe.max_candidates()
+            || (policy.study_policy().is_none()
+                && !inputs
+                    .component_specs
+                    .iter()
+                    .any(|spec| spec.kind() == ComponentKind::Label))
+            || inputs.population_member_count() > limits.universe.max_candidates()
+            || inputs.population_retained_bytes()? > limits.universe.max_retained_bytes()
             || inputs
                 .parents()
                 .iter()
                 .any(|parent| parent.dataset_id() == &output_dataset)
         {
             return Err(DatasetBuildError::InvalidRequest);
+        }
+        inputs
+            .population_basis()
+            .validate_study_policy(policy.study_policy())?;
+        if let Some(subject) = inputs.probability_subject() {
+            if intended_use != ResearchUse::LocalAnalysis
+                || policy.missing_values() != MissingValuePolicy::Preserve
+                || policy.implementation_revision().as_str()
+                    != super::production::STUDY_IMPLEMENTATION_REVISION
+                || !policy.study_policy().is_some_and(|study| {
+                    study.purpose() == super::DatasetBuildPurpose::StudyInputs
+                        && study
+                            .target_horizon()
+                            .exact_elapsed()
+                            .map(|value| value.as_nanos())
+                            == Some(u128::from(subject.horizon_nanos.get()))
+                })
+            {
+                return Err(DatasetBuildError::InvalidRequest);
+            }
+        }
+        let probability_training = inputs
+            .examples()
+            .first()
+            .and_then(DatasetExample::probability_event_target)
+            .is_some_and(|target| {
+                inputs
+                    .examples()
+                    .iter()
+                    .all(|example| example.probability_event_target() == Some(target))
+                    && policy.study_policy().is_some_and(|study| {
+                        study.purpose() == super::DatasetBuildPurpose::Training
+                    })
+            });
+        let preserves_probability_origins = policy.missing_values() == MissingValuePolicy::Preserve
+            && (inputs.probability_subject().is_some() || probability_training);
+        if inputs.examples.iter().any(|value| {
+            value.nominal_daily_source().is_some() || value.timestamp_history_source().is_some()
+        }) {
+            let study = policy
+                .study_policy()
+                .ok_or(DatasetBuildError::InvalidRequest)?;
+            let revision = match study.purpose() {
+                super::DatasetBuildPurpose::Training => {
+                    super::production::RECIPE_IMPLEMENTATION_REVISION
+                }
+                super::DatasetBuildPurpose::StudyInputs => {
+                    super::production::STUDY_IMPLEMENTATION_REVISION
+                }
+            };
+            let event_revision = inputs.examples.first().and_then(DatasetExample::probability_event_target)
+                .map(|event| match event {
+                    super::ProbabilityEventTarget::PriceHigher => super::FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonPriceHigherTrainingV1.implementation_revision(),
+                    super::ProbabilityEventTarget::BenchmarkOutperformance { .. } => super::FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonBenchmarkOutperformanceTrainingV1.implementation_revision(),
+                    super::ProbabilityEventTarget::ProfitAfterCosts { .. } => super::FeatureDatasetProductContract::PriceReturnMacroContextFixedHorizonProfitAfterCostsTrainingV1.implementation_revision(),
+                });
+            if policy.implementation_revision().as_str() != event_revision.unwrap_or(revision)
+                || (event_revision.is_some()
+                    && study.purpose() != super::DatasetBuildPurpose::Training)
+            {
+                return Err(DatasetBuildError::InvalidRequest);
+            }
+        }
+
+        let mixed_price_origins = inputs
+            .examples
+            .iter()
+            .any(|value| value.nominal_daily_source().is_some())
+            && inputs
+                .examples
+                .iter()
+                .any(|value| value.nominal_daily_source().is_none());
+        if mixed_price_origins
+            && !(inputs.population_basis() == DatasetPopulationBasis::CurrentListedSnapshot
+                && policy.study_policy().is_some_and(|study| {
+                    study.basis() == HistoricalStudyBasis::HistoricalAsKnown
+                        && study.purpose() == super::DatasetBuildPurpose::StudyInputs
+                })
+                && inputs
+                    .examples
+                    .iter()
+                    .all(|value| value.financial_source().is_none()))
+        {
+            return Err(DatasetBuildError::InvalidRequest);
+        }
+
+        if let Some(partition) = inputs.population_partition() {
+            partition.validate(inputs.population_member_count())?;
+        }
+        if let Some(population) = inputs.current_population() {
+            if !population.has_research_use(intended_use) {
+                return Err(DatasetBuildError::CurrentPopulation(
+                    crate::CurrentPopulationError::ResearchUseUnavailable,
+                ));
+            }
+            let study = policy
+                .study_policy()
+                .ok_or(DatasetBuildError::InvalidRequest)?;
+            let allowed = match inputs.population_basis() {
+                DatasetPopulationBasis::CurrentListedSnapshot => {
+                    study.basis() == market_squawk_domain::HistoricalStudyBasis::HistoricalAsKnown
+                        && study.purpose() == super::DatasetBuildPurpose::StudyInputs
+                        && intended_use == ResearchUse::LocalAnalysis
+                        && inputs.examples.len() + inputs.population_unavailable().len()
+                            == inputs
+                                .population_partition()
+                                .ok_or(DatasetBuildError::InvalidRequest)?
+                                .member_ids()
+                                .len()
+                        && inputs.examples.iter().all(|v| {
+                            v.financial_source().is_none()
+                                && v.decision_at() == Some(population.membership_as_of())
+                        })
+                }
+                DatasetPopulationBasis::PresentDayFixedCohort => {
+                    study.basis()
+                        == market_squawk_domain::HistoricalStudyBasis::RetrospectiveFrozenSnapshot
+                        && inputs.population_unavailable().is_empty()
+                        && match study.target_horizon() {
+                            super::DatasetTargetHorizon::FiscalPeriods { .. } => inputs
+                                .examples
+                                .iter()
+                                .all(|v| v.financial_source().is_some()),
+                            super::DatasetTargetHorizon::ExactElapsed(_) => {
+                                inputs.examples.iter().all(|v| {
+                                    v.nominal_daily_source().is_some()
+                                        || v.timestamp_history_source().is_some()
+                                })
+                            }
+                        }
+                }
+                DatasetPopulationBasis::PublishedHistoricalMembership => false,
+            };
+            if !allowed
+                || (policy.missing_values() != MissingValuePolicy::Reject
+                    && !preserves_probability_origins)
+                || inputs
+                    .examples
+                    .iter()
+                    .any(|v| v.source_selection_as_of() != population.membership_as_of())
+            {
+                return Err(DatasetBuildError::InvalidRequest);
+            }
         }
         let output_rows = inputs
             .examples
@@ -862,14 +1995,83 @@ impl DatasetBuildRequest {
             return Err(DatasetBuildError::LimitExceeded);
         }
         for example in &inputs.examples {
+            if let Some(derivation) = example.probability_derivation() {
+                derivation.validate(example)?;
+                derivation.validate_parents(inputs.parents())?;
+            }
             let split = policy
                 .split
-                .split_for(example.cutoff_at)
+                .split_for(&policy.chronological_at(example))
                 .ok_or(DatasetBuildError::TemporalLeakage)?;
-            if example.label_cutoff_at > policy.split.split_end(split) {
+            if inputs.population_basis() == DatasetPopulationBasis::CurrentListedSnapshot
+                && split != DatasetSplit::Test
+            {
+                return Err(DatasetBuildError::InvalidRequest);
+            }
+            if let Some(study) = policy.study_policy() {
+                if example
+                    .timestamp_history_source()
+                    .is_some_and(|source| source.study() != *study)
+                {
+                    return Err(DatasetBuildError::ComponentEvidenceMismatch);
+                }
+                study.validate_example(example)?;
+                if let Some(super::ProbabilityEventTarget::ProfitAfterCosts { policy: costs }) =
+                    example.probability_event_target()
+                {
+                    let (_, target) = example
+                        .exact_target_coordinates()
+                        .ok_or(DatasetBuildError::InvalidRequest)?;
+                    let window_end = target
+                        .checked_add_nanos(costs.maximum_exit_lag_nanos)
+                        .map_err(|_| DatasetBuildError::TemporalLeakage)?;
+                    if policy
+                        .split
+                        .split_end(split)
+                        .exact_timestamp()
+                        .is_none_or(|end| window_end > end)
+                    {
+                        return Err(DatasetBuildError::TemporalLeakage);
+                    }
+                }
+                if study.purpose() == super::DatasetBuildPurpose::Training {
+                    let purge_end = match study.basis() {
+                        market_squawk_domain::HistoricalStudyBasis::HistoricalAsKnown => {
+                            ResearchTemporalCoordinate::exact(
+                                example
+                                    .label_selection_as_of
+                                    .ok_or(DatasetBuildError::InvalidRequest)?,
+                            )
+                        }
+                        market_squawk_domain::HistoricalStudyBasis::RetrospectiveFrozenSnapshot => {
+                            example
+                                .label_effective_cutoff
+                                .clone()
+                                .ok_or(DatasetBuildError::InvalidRequest)?
+                        }
+                    };
+                    if !matches!(
+                        purge_end.partial_cmp(&policy.split.split_end(split)),
+                        Some(Ordering::Less | Ordering::Equal)
+                    ) {
+                        return Err(DatasetBuildError::TemporalLeakage);
+                    }
+                }
+            } else if example.label_selection_as_of.is_none_or(|label| {
+                label <= example.source_selection_as_of
+                    || ResearchTemporalCoordinate::exact(label)
+                        .partial_cmp(&policy.split.split_end(split))
+                        != Some(Ordering::Less)
+                        && ResearchTemporalCoordinate::exact(label) != policy.split.split_end(split)
+            }) || example.decision_at() != Some(example.source_selection_as_of)
+                || example.financial_source().is_some()
+                || example.nominal_daily_source().is_some()
+                || example.timestamp_history_source().is_some()
+            {
                 return Err(DatasetBuildError::TemporalLeakage);
             }
         }
+
         let retained = request_retained_bytes(&inputs)?;
         if retained > limits.max_retained_bytes {
             return Err(DatasetBuildError::LimitExceeded);
@@ -881,7 +2083,9 @@ impl DatasetBuildRequest {
                 &output_dataset,
                 &inputs,
                 intended_use,
-                output_authorization.source_id(),
+                research_use_limits,
+                &output_authorization,
+                limits,
                 policy_digest,
                 universe_digest,
             )
@@ -907,15 +2111,22 @@ impl DatasetBuildRequest {
         self.build_spec_digest
     }
 
-    pub(super) const fn output_dataset(&self) -> &DatasetId {
+    /// Returns the exact output identity fixed by the complete build specification.
+    pub const fn output_dataset(&self) -> &DatasetId {
         &self.output_dataset
+    }
+
+    /// Returns the exact retained input generations for final authority revalidation.
+    pub fn parent_manifests(&self) -> &[DatasetManifestRef] {
+        self.inputs.parents()
     }
 
     pub(super) const fn inputs(&self) -> &DatasetBuildInputs {
         &self.inputs
     }
 
-    pub(super) const fn policy(&self) -> &DatasetBuildPolicy {
+    /// Returns the immutable temporal and financial policy fixed before construction.
+    pub const fn policy(&self) -> &DatasetBuildPolicy {
         &self.policy
     }
 
@@ -943,7 +2154,8 @@ impl DatasetBuildRequest {
         self.universe_digest
     }
 
-    pub(super) const fn retained_bytes(&self) -> usize {
+    /// Returns the checked Rust-visible bytes retained by this complete request.
+    pub const fn retained_bytes(&self) -> usize {
         self.retained_bytes
     }
 }
@@ -1006,9 +2218,46 @@ pub struct FeatureLabelDataset {
     pub(super) point_in_time_policy: PointInTimePolicy,
     pub(super) missing_value_policy: MissingValuePolicy,
     pub(super) component_specs: Box<[FeatureLabelComponentSpec]>,
+    pub(super) label_measurements: Box<[FeatureLabelMeasurementBinding]>,
+    pub(super) study_policy: Option<super::DatasetStudyPolicy>,
+    pub(super) source_snapshot_digest: Option<Sha256Digest>,
+    pub(super) population_basis: DatasetPopulationBasis,
+    pub(super) price_input_origin: Option<DatasetPriceInputOrigin>,
+    pub(super) population_member_count: usize,
+    pub(super) population_unavailable: Box<[CurrentPopulationInputUnavailable]>,
+    pub(super) population_partition: Option<DatasetPopulationPartition>,
+    pub(super) population_source_use: Option<crate::DatasetPopulationSourceUse>,
 }
 
 impl FeatureLabelDataset {
+    pub const fn price_input_origin(&self) -> Option<DatasetPriceInputOrigin> {
+        self.price_input_origin
+    }
+
+    pub const fn population_source_use(&self) -> Option<&crate::DatasetPopulationSourceUse> {
+        self.population_source_use.as_ref()
+    }
+
+    pub fn population_partition(&self) -> Option<&DatasetPopulationPartition> {
+        self.population_partition.as_ref()
+    }
+    pub const fn population_basis(&self) -> DatasetPopulationBasis {
+        self.population_basis
+    }
+    pub const fn population_member_count(&self) -> usize {
+        self.population_member_count
+    }
+    pub fn population_unavailable(&self) -> &[CurrentPopulationInputUnavailable] {
+        &self.population_unavailable
+    }
+
+    pub const fn study_policy(&self) -> Option<&super::DatasetStudyPolicy> {
+        self.study_policy.as_ref()
+    }
+    pub const fn source_snapshot_digest(&self) -> Option<Sha256Digest> {
+        self.source_snapshot_digest
+    }
+
     /// Returns the exact immutable derived generation.
     pub const fn pinned(&self) -> &PinnedDataset {
         &self.pinned
@@ -1039,7 +2288,16 @@ impl FeatureLabelDataset {
         self.split_counts
     }
 
-    /// Produces the bounded canonical Task 11 descriptor consumed by Python research training.
+    /// Returns the exact measurements derived from all retained numeric label rows.
+    #[must_use]
+    pub fn label_measurements(&self) -> &[FeatureLabelMeasurementBinding] {
+        &self.label_measurements
+    }
+
+    /// Produces the bounded canonical phase-one descriptor.
+    ///
+    /// This export proves an immutable analytical generation only; it carries no product/model
+    /// admission or training authority without a matching closed production receipt.
     pub fn python_export(
         &self,
     ) -> Result<super::export::FeatureLabelPythonExport, DatasetBuildError> {
@@ -1048,8 +2306,9 @@ impl FeatureLabelDataset {
 }
 
 fn compare_examples(left: &DatasetExample, right: &DatasetExample) -> Ordering {
-    left.cutoff_at
-        .cmp(&right.cutoff_at)
+    left.decision_coordinate
+        .partial_cmp(&right.decision_coordinate)
+        .unwrap_or(Ordering::Equal)
         .then_with(|| left.instrument_id.cmp(&right.instrument_id))
         .then_with(|| left.example_id.cmp(&right.example_id))
 }
@@ -1058,7 +2317,7 @@ fn request_retained_bytes(inputs: &DatasetBuildInputs) -> Result<usize, DatasetB
     let mut retained = size_of::<DatasetBuildRequest>();
     for additional in [
         retained_array_bytes::<DatasetManifestRef>(inputs.parents().len())?,
-        retained_array_bytes::<UniverseMembership>(inputs.universe_memberships.len())?,
+        inputs.population_retained_bytes()?,
         retained_array_bytes::<FeatureLabelComponentSpec>(inputs.component_specs.len())?,
         retained_array_bytes::<DatasetExample>(inputs.examples.len())?,
     ] {
@@ -1074,22 +2333,74 @@ fn request_retained_bytes(inputs: &DatasetBuildInputs) -> Result<usize, DatasetB
             .checked_add(manifest_dynamic_bytes(parent)?)
             .ok_or(DatasetBuildError::LimitExceeded)?;
     }
-    for membership in &inputs.universe_memberships {
-        retained = retained
-            .checked_add(manifest_dynamic_bytes(membership.source_manifest())?)
-            .and_then(|bytes| {
-                bytes.checked_add(availability_dynamic_bytes(membership.availability()))
-            })
-            .ok_or(DatasetBuildError::LimitExceeded)?;
-    }
     for spec in &inputs.component_specs {
         retained = retained
             .checked_add(spec.name.len())
             .ok_or(DatasetBuildError::LimitExceeded)?;
     }
+    let mut financial_sources = Vec::new();
+    financial_sources
+        .try_reserve_exact(inputs.examples.len())
+        .map_err(|_| DatasetBuildError::LimitExceeded)?;
+    let mut price_sources = Vec::new();
+    price_sources
+        .try_reserve_exact(inputs.examples.len())
+        .map_err(|_| DatasetBuildError::LimitExceeded)?;
     for example in &inputs.examples {
+        if let Some(derivation) = example.probability_derivation() {
+            retained = retained
+                .checked_add(derivation.retained_bytes()?)
+                .ok_or(DatasetBuildError::LimitExceeded)?;
+        }
+        if let Some(plan) = example.source_price_plan() {
+            let identity = std::sync::Arc::as_ptr(plan);
+            if !price_sources.contains(&identity) {
+                price_sources.push(identity);
+                retained = retained
+                    .checked_add(plan.retained_bytes())
+                    .and_then(|bytes| bytes.checked_add(2 * size_of::<usize>()))
+                    .ok_or(DatasetBuildError::LimitExceeded)?;
+            }
+        }
+        if let Some(source) = example.timestamp_history_source() {
+            retained = retained
+                .checked_add(source.retained_bytes())
+                .ok_or(DatasetBuildError::LimitExceeded)?;
+        }
+        if let Some(source) = example.nominal_daily_source() {
+            retained = retained
+                .checked_add(manifest_dynamic_bytes(&source.manifest)?)
+                .ok_or(DatasetBuildError::LimitExceeded)?;
+        }
+        if let Some(financial) = example.financial_source() {
+            let identity = std::sync::Arc::as_ptr(&financial.source);
+            if !financial_sources.contains(&identity) {
+                financial_sources.push(identity);
+                retained = retained
+                    .checked_add(financial.source.retained_bytes)
+                    .ok_or(DatasetBuildError::LimitExceeded)?;
+            }
+            let encoded = serde_json::to_vec(&financial.binding)
+                .map_err(|_| DatasetBuildError::InvalidRequest)?;
+            retained = retained
+                .checked_add(encoded.len() * 2)
+                .ok_or(DatasetBuildError::LimitExceeded)?;
+        }
         retained = retained
             .checked_add(example.example_id.len())
+            .and_then(|value| {
+                coordinate_dynamic_bytes(&example.effective_cutoff)
+                    .ok()
+                    .and_then(|bytes| value.checked_add(bytes))
+            })
+            .and_then(|value| {
+                example
+                    .label_effective_cutoff
+                    .as_ref()
+                    .map_or(Ok(0), coordinate_dynamic_bytes)
+                    .ok()
+                    .and_then(|bytes| value.checked_add(bytes))
+            })
             .and_then(|value| {
                 retained_array_bytes::<FeatureLabelComponentInput>(example.components.len())
                     .ok()
@@ -1098,22 +2409,39 @@ fn request_retained_bytes(inputs: &DatasetBuildInputs) -> Result<usize, DatasetB
             .ok_or(DatasetBuildError::LimitExceeded)?;
         for component in &example.components {
             retained = retained
-                .checked_add(component.spec.name.len())
-                .and_then(|bytes| {
-                    bytes.checked_add(component_value_dynamic_bytes(&component.value))
-                })
-                .and_then(|bytes| {
-                    retained_array_bytes::<ComponentSelector>(component.selectors.len())
-                        .ok()
-                        .and_then(|selectors| bytes.checked_add(selectors))
-                })
+                .checked_add(component_dynamic_bytes(component)?)
                 .ok_or(DatasetBuildError::LimitExceeded)?;
-            for selector in &component.selectors {
-                retained = retained
-                    .checked_add(family_dynamic_bytes(selector.family())?)
-                    .ok_or(DatasetBuildError::LimitExceeded)?;
-            }
         }
+    }
+    Ok(retained)
+}
+
+fn component_dynamic_bytes(
+    component: &FeatureLabelComponentInput,
+) -> Result<usize, DatasetBuildError> {
+    let mut retained = component
+        .spec
+        .name
+        .len()
+        .checked_add(coordinate_dynamic_bytes(
+            &component.selection_effective_cutoff,
+        )?)
+        .and_then(|bytes| bytes.checked_add(component_value_dynamic_bytes(&component.value)))
+        .and_then(|bytes| {
+            retained_array_bytes::<ComponentSelector>(component.selectors.len())
+                .ok()
+                .and_then(|selectors| bytes.checked_add(selectors))
+        })
+        .ok_or(DatasetBuildError::LimitExceeded)?;
+    if let Some(coordinate) = &component.label_selection_effective_cutoff {
+        retained = retained
+            .checked_add(coordinate_dynamic_bytes(coordinate)?)
+            .ok_or(DatasetBuildError::LimitExceeded)?;
+    }
+    for selector in &component.selectors {
+        retained = retained
+            .checked_add(family_dynamic_bytes(selector.family())?)
+            .ok_or(DatasetBuildError::LimitExceeded)?;
     }
     Ok(retained)
 }
@@ -1146,28 +2474,99 @@ fn component_value_dynamic_bytes(value: &ComponentValue) -> usize {
 
 fn family_dynamic_bytes(family: &ObservationFamilyKey) -> Result<usize, DatasetBuildError> {
     match family {
+        ObservationFamilyKey::MarketCalendar {
+            source_id,
+            venue_id,
+            scope,
+            effective,
+            ..
+        } => {
+            let source = checked_family_dynamic(
+                source_id,
+                &[venue_id.as_ref().map_or("", |venue| venue.as_str())],
+                Some(effective),
+            )?;
+            // The closed, bounded scope's encoded size conservatively includes every retained text field.
+            let scope_bytes = serde_json::to_vec(scope)
+                .map_err(|_| DatasetBuildError::InvalidRequest)?
+                .len();
+            source
+                .checked_add(scope_bytes)
+                .ok_or(DatasetBuildError::LimitExceeded)
+        }
         ObservationFamilyKey::Filing {
             source_id,
             accession,
-            ..
-        } => checked_family_dynamic(source_id, &[accession.as_str()], None),
+            subject,
+        } => checked_family_dynamic(
+            source_id,
+            &[
+                accession.as_str(),
+                subject.issuer_id().map_or("", |id| id.as_str()),
+            ],
+            None,
+        ),
         ObservationFamilyKey::Fundamental {
             source_id,
-            source_record,
             concept,
             unit,
-            effective,
+            subject,
             ..
         } => checked_family_dynamic(
             source_id,
-            &[source_record.as_str(), concept.as_str(), unit.as_str()],
-            Some(effective),
+            &[
+                concept.as_str(),
+                unit.as_str(),
+                subject.issuer_id().map_or("", |id| id.as_str()),
+            ],
+            None,
         ),
         ObservationFamilyKey::Macro {
             source_id,
             series,
             effective,
         } => checked_family_dynamic(source_id, &[series.as_str()], Some(effective)),
+        ObservationFamilyKey::MarketBar {
+            source_id,
+            venue_id,
+            provider_instrument_id,
+            feed,
+            interval,
+            session,
+            nominal_ruleset,
+            effective,
+            ..
+        } => checked_family_dynamic(
+            source_id,
+            &[
+                venue_id.as_str(),
+                provider_instrument_id.as_str(),
+                feed.as_str(),
+                interval.as_str(),
+                session
+                    .as_ref()
+                    .map_or("", |value| value.ruleset().as_str()),
+                nominal_ruleset.as_ref().map_or("", |value| value.as_str()),
+            ],
+            Some(effective),
+        ),
+        ObservationFamilyKey::FundNav {
+            source_id,
+            provider_product,
+            provider_channel,
+            provider_instrument_id,
+            currency,
+            ..
+        } => checked_family_dynamic(
+            source_id,
+            &[
+                provider_product.as_source_identifier().as_str(),
+                provider_channel.as_source_identifier().as_str(),
+                provider_instrument_id.as_str(),
+                currency.as_str(),
+            ],
+            None,
+        ),
         ObservationFamilyKey::PortfolioPosition {
             source_id,
             account_id,
@@ -1184,7 +2583,11 @@ fn family_dynamic_bytes(family: &ObservationFamilyKey) -> Result<usize, DatasetB
             &[account_id.as_str(), source_record_id.as_str()],
             None,
         ),
-        ObservationFamilyKey::CorporateAction {
+        ObservationFamilyKey::CorporateActionSource {
+            source_id,
+            source_record,
+        }
+        | ObservationFamilyKey::CorporateAction {
             source_id,
             source_record,
             ..
@@ -1254,14 +2657,18 @@ fn retained_array_bytes<T>(len: usize) -> Result<usize, DatasetBuildError> {
 
 const fn selector_instrument(family: &ObservationFamilyKey) -> Option<InstrumentId> {
     match family {
-        ObservationFamilyKey::Filing { instrument_id, .. }
-        | ObservationFamilyKey::Fundamental { instrument_id, .. }
+        ObservationFamilyKey::Filing { subject, .. }
+        | ObservationFamilyKey::Fundamental { subject, .. } => subject.instrument_id(),
+        ObservationFamilyKey::MarketBar { instrument_id, .. }
+        | ObservationFamilyKey::FundNav { instrument_id, .. }
         | ObservationFamilyKey::PortfolioPosition { instrument_id, .. }
         | ObservationFamilyKey::CorporateAction { instrument_id, .. }
         | ObservationFamilyKey::UniverseMembership { instrument_id, .. } => Some(*instrument_id),
         ObservationFamilyKey::AlternativeData { instrument_id, .. }
         | ObservationFamilyKey::Transaction { instrument_id, .. } => *instrument_id,
-        ObservationFamilyKey::Macro { .. } => None,
+        ObservationFamilyKey::Macro { .. }
+        | ObservationFamilyKey::MarketCalendar { .. }
+        | ObservationFamilyKey::CorporateActionSource { .. } => None,
     }
 }
 
@@ -1278,11 +2685,14 @@ const fn selector_scope(family: &ObservationFamilyKey) -> SelectorScope {
     }
     match family {
         ObservationFamilyKey::Transaction { .. } => SelectorScope::Account,
-        ObservationFamilyKey::Macro { .. } | ObservationFamilyKey::AlternativeData { .. } => {
-            SelectorScope::Global
-        }
+        ObservationFamilyKey::Macro { .. }
+        | ObservationFamilyKey::AlternativeData { .. }
+        | ObservationFamilyKey::MarketCalendar { .. }
+        | ObservationFamilyKey::CorporateActionSource { .. } => SelectorScope::Global,
         ObservationFamilyKey::Filing { .. }
         | ObservationFamilyKey::Fundamental { .. }
+        | ObservationFamilyKey::MarketBar { .. }
+        | ObservationFamilyKey::FundNav { .. }
         | ObservationFamilyKey::PortfolioPosition { .. }
         | ObservationFamilyKey::CorporateAction { .. }
         | ObservationFamilyKey::UniverseMembership { .. } => SelectorScope::Global,

@@ -25,8 +25,32 @@ use crate::capture::CapturedRawRecord;
 use crate::capture::writer::{
     CaptureDestination, CaptureIoContext, CaptureSink, CaptureSinkError, CaptureStorageErrorClass,
 };
+use crate::raw_record::write_json_buffered;
 
 const STARTUP_REAP_POLL_INTERVAL: Duration = Duration::from_millis(1);
+
+#[cfg(unix)]
+fn isolate_helper_from_terminal_interrupts(command: &mut Command) {
+    use std::os::unix::process::CommandExt as _;
+
+    // The service owns helper shutdown through its bounded protocol and process
+    // supervisor. A separate process group prevents a terminal Ctrl-C from
+    // killing the helper before the service can flush, stop, and reap it.
+    command.process_group(0);
+}
+
+#[cfg(windows)]
+fn isolate_helper_from_terminal_interrupts(command: &mut Command) {
+    use std::os::windows::process::CommandExt as _;
+
+    // CREATE_NEW_PROCESS_GROUP prevents the helper from receiving the parent
+    // console's Ctrl-C event. Explicit parent kill and reap remain available.
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    command.creation_flags(CREATE_NEW_PROCESS_GROUP);
+}
+
+#[cfg(not(any(unix, windows)))]
+fn isolate_helper_from_terminal_interrupts(_command: &mut Command) {}
 
 #[derive(Debug)]
 pub(super) struct StartedProcessJournalSink {
@@ -60,6 +84,7 @@ impl ProcessJournalSink {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .env_clear();
+        isolate_helper_from_terminal_interrupts(&mut command);
         #[cfg(all(feature = "capture-test", debug_assertions))]
         if let Some(behavior) = config.test_behavior() {
             let mode = match behavior {
@@ -179,14 +204,14 @@ impl ProcessJournalSink {
     fn append_record(&mut self, record: &CapturedRawRecord) -> Result<(), CaptureSinkError> {
         let sequence = self.next_sequence;
         let mut measurement = CountingDigestWriter::new();
-        serde_json::to_writer(&mut measurement, record.record())
+        write_json_buffered(&mut measurement, record.record())
             .map_err(|_error| storage_error(CaptureStorageErrorClass::Corruption))?;
         let (payload_bytes, digest) = measurement.finish();
         Header::try_new(MessageKind::Append, sequence, payload_bytes, digest)
             .and_then(|header| header.write_to(&mut self.input))
             .map_err(protocol_storage_error)?;
         let mut forwarding = VerifyingForwardWriter::new(&mut self.input, payload_bytes);
-        serde_json::to_writer(&mut forwarding, record.record())
+        write_json_buffered(&mut forwarding, record.record())
             .map_err(|_error| storage_error(CaptureStorageErrorClass::Corruption))?;
         let (observed_bytes, observed_digest) = forwarding.finish();
         if observed_bytes != payload_bytes || observed_digest != digest {

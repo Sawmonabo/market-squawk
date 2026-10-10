@@ -38,10 +38,11 @@ pub use worker::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct OnnxRuntimeEvidence {
     model_digest: [u8; 32],
+    forecast_policy_digest: Option<[u8; 32]>,
+    forecast_residuals_digest: Option<[u8; 32]>,
     policy_digest: [u8; 32],
     worker_runtime_semantics_digest: [u8; 32],
     warm_up_digest: [u8; 32],
-    warm_up_score_bits: u32,
 }
 
 impl OnnxRuntimeEvidence {
@@ -49,6 +50,18 @@ impl OnnxRuntimeEvidence {
     #[must_use]
     pub const fn model_digest(self) -> [u8; 32] {
         self.model_digest
+    }
+
+    /// Returns the exact first-class interval-policy member digest for forecast bundles.
+    #[must_use]
+    pub const fn forecast_policy_digest(self) -> Option<[u8; 32]> {
+        self.forecast_policy_digest
+    }
+
+    /// Returns the exact first-class calibration-residual member digest for forecast bundles.
+    #[must_use]
+    pub const fn forecast_residuals_digest(self) -> Option<[u8; 32]> {
+        self.forecast_residuals_digest
     }
 
     /// Returns the exact graph-policy digest.
@@ -67,11 +80,6 @@ impl OnnxRuntimeEvidence {
     #[must_use]
     pub const fn warm_up_digest(self) -> [u8; 32] {
         self.warm_up_digest
-    }
-
-    #[cfg(feature = "onnx-runtime")]
-    const fn warm_up_score(self) -> f32 {
-        f32::from_bits(self.warm_up_score_bits)
     }
 }
 
@@ -111,7 +119,26 @@ impl TractOnnxBackend {
         let preflight = policy
             .preflight(artifact)
             .map_err(OnnxBackendError::Policy)?;
-        if preflight.input_elements() != bundle.metadata().features().len() {
+        let lag_count = match (
+            bundle.research_forecast_layout(),
+            policy.forecast_horizons(),
+        ) {
+            (Some((lags, horizons, strategy)), Some(admitted)) if horizons == admitted => {
+                policy
+                    .validate_research_layout(artifact, lags, strategy)
+                    .map_err(OnnxBackendError::Policy)?;
+                // The sealed research exporter fits raw lag and exogenous columns.
+                if bundle.metadata().features().iter().any(|feature| {
+                    !matches!(feature.normalizer(), crate::FeatureNormalizer::Identity)
+                }) {
+                    return Err(OnnxBackendError::FeatureShapeMismatch);
+                }
+                lags.len()
+            }
+            (None, None) => 0,
+            _ => return Err(OnnxBackendError::OutputSemanticsMismatch),
+        };
+        if preflight.input_elements() != bundle.metadata().features().len() + lag_count {
             return Err(OnnxBackendError::FeatureShapeMismatch);
         }
         let (worker, warm_up) = OnnxWorker::start_tract(
@@ -119,34 +146,51 @@ impl TractOnnxBackend {
             artifact,
             policy.input_shape(),
             preflight.input_elements(),
+            preflight.output_elements(),
             policy.inference_deadline(),
         )
         .map_err(|error| match error {
             WorkerError::Load => OnnxBackendError::RuntimeLoad,
             WorkerError::Resource => OnnxBackendError::IntermediateLimit,
-            WorkerError::Unavailable
-            | WorkerError::Deadline
-            | WorkerError::Runtime
-            | WorkerError::TerminationUncertain => OnnxBackendError::WarmUp,
+            WorkerError::Unavailable | WorkerError::Deadline | WorkerError::Runtime => {
+                OnnxBackendError::WarmUp
+            }
+            WorkerError::TerminationUncertain => OnnxBackendError::TerminationUncertain,
         })?;
-        if !warm_up.is_finite()
-            || (policy.output_semantics() == ModelOutputSemantics::BinaryProbability
-                && !(0.0..=1.0).contains(&warm_up))
+        if warm_up.len() != preflight.output_elements()
+            || warm_up.iter().any(|value| {
+                !value.is_finite()
+                    || (policy.output_semantics() == ModelOutputSemantics::BinaryProbability
+                        && !(0.0..=1.0).contains(value))
+            })
         {
+            worker
+                .retire()
+                .map_err(|_| OnnxBackendError::TerminationUncertain)?;
             return Err(OnnxBackendError::WarmUp);
         }
         let worker_runtime_semantics_digest = worker.runtime_semantics_digest();
         let mut warm_up_digest = Sha256::new();
-        warm_up_digest.update(b"market-squawk/onnx-warm-up/v3");
+        warm_up_digest.update(b"market-squawk/onnx-warm-up/v4");
         warm_up_digest.update(policy.policy_digest());
         warm_up_digest.update(worker_runtime_semantics_digest);
-        warm_up_digest.update(warm_up.to_bits().to_be_bytes());
+        warm_up_digest.update((warm_up.len() as u64).to_be_bytes());
+        for value in &warm_up {
+            warm_up_digest.update(value.to_bits().to_be_bytes());
+        }
         let evidence = OnnxRuntimeEvidence {
             model_digest: bundle.metadata().artifact_hash().bytes(),
+            forecast_policy_digest: bundle
+                .metadata()
+                .forecast_calibration()
+                .map(|value| value.policy_hash().bytes()),
+            forecast_residuals_digest: bundle
+                .metadata()
+                .forecast_calibration()
+                .map(|value| value.residuals_hash().bytes()),
             policy_digest: policy.policy_digest(),
             worker_runtime_semantics_digest,
             warm_up_digest: warm_up_digest.finalize().into(),
-            warm_up_score_bits: warm_up.to_bits(),
         };
         let output_identity = Arc::new(ModelOutputIdentity::from_metadata(bundle.metadata()));
         Ok(Self {
@@ -184,11 +228,17 @@ impl TractOnnxBackend {
         absolute_deadline: Instant,
     ) -> Result<ModelOutput, InferenceError> {
         let metadata = self.bundle.metadata();
-        let score = f64::from(
-            self.worker
-                .execute_until(normalized, absolute_deadline)
-                .map_err(worker_inference_error)?,
-        );
+        if self.policy.forecast_horizons().is_some() {
+            return Err(InferenceError::OnnxRuntimeFailure);
+        }
+        let values = self
+            .worker
+            .execute_until(normalized, absolute_deadline)
+            .map_err(worker_inference_error)?;
+        let [score] = values.as_slice() else {
+            return Err(InferenceError::OnnxRuntimeFailure);
+        };
+        let score = f64::from(*score);
         validate_output_score(metadata, score)?;
         let (decision, confidence) = decide(score, metadata.decision_thresholds())?;
         Ok(ModelOutput::new(
@@ -201,6 +251,52 @@ impl TractOnnxBackend {
 }
 
 impl InferenceBackend for TractOnnxBackend {
+    fn retire(&self) -> Result<(), InferenceError> {
+        self.worker.retire().map_err(worker_inference_error)
+    }
+
+    fn infer_research(
+        &self,
+        input: &crate::native::ResearchForecastInput<'_>,
+    ) -> Result<crate::native::ResearchForecastOutput, InferenceError> {
+        let (lags, horizons, _) = self
+            .bundle
+            .research_forecast_layout()
+            .ok_or(InferenceError::FeatureShapeMismatch)?;
+        if lags != input.lag_offsets() {
+            return Err(InferenceError::FeatureShapeMismatch);
+        }
+        let exogenous = normalize_input(self.bundle.metadata(), input.exogenous())?;
+        let mut normalized = Vec::new();
+        normalized
+            .try_reserve_exact(lags.len() + exogenous.len())
+            .map_err(|_| InferenceError::OnnxWorkerUnavailable)?;
+        for value in input.lag_values() {
+            let value = *value as f32;
+            if !value.is_finite() {
+                return Err(InferenceError::NonFiniteComputation);
+            }
+            normalized.push(value);
+        }
+        normalized.extend(exogenous);
+        let deadline = Instant::now()
+            .checked_add(self.worker.deadline())
+            .ok_or(InferenceError::OnnxDeadlineExceeded)?;
+        let values = self
+            .worker
+            .execute_until(normalized, deadline)
+            .map_err(worker_inference_error)?;
+        if values.len() != horizons.len() {
+            return Err(InferenceError::OnnxRuntimeFailure);
+        }
+        Ok(crate::native::ResearchForecastOutput::new(
+            self.metadata().metadata_hash(),
+            self.metadata().artifact_hash(),
+            horizons,
+            values.into_iter().map(f64::from).collect(),
+        ))
+    }
+
     fn metadata(&self) -> &ModelMetadata {
         self.bundle.metadata()
     }
@@ -275,4 +371,6 @@ pub enum OnnxBackendError {
     IntermediateLimit,
     #[error("tract ONNX warm-up failed")]
     WarmUp,
+    #[error("ONNX worker termination could not be confirmed")]
+    TerminationUncertain,
 }

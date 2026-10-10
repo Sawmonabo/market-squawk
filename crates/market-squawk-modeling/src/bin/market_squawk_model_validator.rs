@@ -5,11 +5,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-use market_squawk_data::{CatalogEndpointIdentity, PythonDatasetVerificationLimits, Sha256Digest};
+use market_squawk_data::{
+    CatalogEndpointIdentity, FeatureDatasetProductContract, PythonDatasetVerificationLimits,
+    Sha256Digest,
+};
 use market_squawk_domain::Timestamp;
 use market_squawk_modeling::{
-    BundleMetadataRef, ControlledModelRoot, ProductionFeatureRegistry,
-    PythonDatasetAdmissionAuthority, verify_model_candidate, verify_validator_training_environment,
+    BundleMetadataRef, ConfiguredTrainingEnvironment, ControlledModelRoot,
+    ProductionFeatureRegistry, PythonDatasetAdmissionAuthority, verify_model_candidate,
+    verify_validator_training_environment,
 };
 use sha2::{Digest as _, Sha256};
 use tokio_util::sync::CancellationToken;
@@ -31,9 +35,22 @@ fn main() {
 fn run() -> Result<String, ()> {
     let arguments = arguments()?;
     let validator = env::current_exe().map_err(|_| ())?;
-    let release_root = validator.parent().and_then(Path::parent).ok_or(())?;
-    let training_environment =
-        verify_validator_training_environment(release_root, &validator).map_err(|_| ())?;
+    let training_environment = if let Some(root) = &arguments.source_development_root {
+        let environment =
+            ConfiguredTrainingEnvironment::open_source(root, &|| Ok(())).map_err(|_| ())?;
+        let source = environment.source().ok_or(())?;
+        if fs::canonicalize(source.validator()).map_err(|_| ())?
+            != fs::canonicalize(&validator).map_err(|_| ())?
+        {
+            return Err(());
+        }
+        environment
+    } else {
+        let release_root = validator.parent().and_then(Path::parent).ok_or(())?;
+        verify_validator_training_environment(release_root, &validator)
+            .map(ConfiguredTrainingEnvironment::from)
+            .map_err(|_| ())?
+    };
     let candidate_path = controlled_root(&arguments.root)?;
     let authority_root = controlled_root(&arguments.authority_root)?;
     if candidate_path.starts_with(&authority_root) || authority_root.starts_with(&candidate_path) {
@@ -60,6 +77,7 @@ fn run() -> Result<String, ()> {
         Timestamp::from_unix_nanos(arguments.dataset_as_of_unix_nanos),
         Sha256Digest::new(parse_hex(&arguments.dataset_selection_sha256)?),
         catalog_identity,
+        arguments.dataset_product_contract,
     )
     .map_err(|_| ())?;
     let root = ControlledModelRoot::open_ambient(candidate_path).map_err(|_| ())?;
@@ -126,6 +144,7 @@ fn read_authority(
 }
 
 struct Arguments {
+    source_development_root: Option<PathBuf>,
     root: PathBuf,
     metadata: String,
     metadata_sha256: String,
@@ -137,11 +156,12 @@ struct Arguments {
     dataset_as_of_unix_nanos: i64,
     dataset_selection_sha256: String,
     catalog_identity_sha256: String,
+    dataset_product_contract: FeatureDatasetProductContract,
 }
 
 fn arguments() -> Result<Arguments, ()> {
     let values = env::args().skip(1).collect::<Vec<_>>();
-    if values.len() != 22
+    if !matches!(values.len(), 24 | 26)
         || values[0] != "--root"
         || values[2] != "--metadata"
         || values[4] != "--metadata-sha256"
@@ -153,6 +173,8 @@ fn arguments() -> Result<Arguments, ()> {
         || values[16] != "--dataset-as-of-unix-nanos"
         || values[18] != "--dataset-selection-sha256"
         || values[20] != "--catalog-identity-sha256"
+        || values[22] != "--dataset-product-contract"
+        || (values.len() == 26 && values[24] != "--source-development-root")
     {
         return Err(());
     }
@@ -166,6 +188,7 @@ fn arguments() -> Result<Arguments, ()> {
         parse_hex(value)?;
     }
     Ok(Arguments {
+        source_development_root: values.get(25).map(PathBuf::from),
         root: PathBuf::from(&values[1]),
         metadata: values[3].clone(),
         metadata_sha256: values[5].clone(),
@@ -177,6 +200,8 @@ fn arguments() -> Result<Arguments, ()> {
         dataset_as_of_unix_nanos: values[17].parse().map_err(|_| ())?,
         dataset_selection_sha256: values[19].clone(),
         catalog_identity_sha256: values[21].clone(),
+        dataset_product_contract: FeatureDatasetProductContract::from_identity(&values[23])
+            .ok_or(())?,
     })
 }
 

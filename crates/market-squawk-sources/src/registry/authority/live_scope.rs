@@ -21,12 +21,15 @@ pub struct ValidatedLiveScope {
     trusted_valid_from: Timestamp,
     trusted_valid_from_monotonic: RegistryMonotonicInstant,
     valid_until_monotonic: RegistryMonotonicInstant,
+    permission_valid_until: Timestamp,
+    permission_valid_until_monotonic: RegistryMonotonicInstant,
     health_epoch: u64,
     lease: Arc<SessionLeaseState>,
     capture: crate::CaptureGenerationLease,
-    budget: CurrentBudgetAuthority,
+    producer: CurrentProducerLifetime,
     clock: Arc<SealedRegistryClock>,
     universe_evidence: Option<ExactPayloadEvidence>,
+    provider_identity: CurrentProviderIdentity,
 }
 
 impl ValidatedLiveScope {
@@ -42,9 +45,11 @@ impl ValidatedLiveScope {
             trusted_valid_from: self.trusted_valid_from,
             trusted_valid_from_monotonic: self.trusted_valid_from_monotonic,
             valid_until_monotonic: self.valid_until_monotonic,
+            permission_valid_until: self.permission_valid_until,
+            permission_valid_until_monotonic: self.permission_valid_until_monotonic,
             lease: Arc::clone(&self.lease),
             capture: self.capture.clone(),
-            budget: self.budget.clone(),
+            producer: self.producer.clone(),
             clock: Arc::clone(&self.clock),
         }
     }
@@ -60,6 +65,8 @@ impl ValidatedLiveScope {
     /// Fails after health/subscription change, session/revision rollover, or deadline expiry.
     pub fn validate_at(&self, at: Timestamp) -> Result<(), RegistryError> {
         let trusted = self.clock.observe()?;
+        self.provider_identity.validate_at(trusted.wall())?;
+        self.provider_identity.validate_at(at)?;
         if trusted.monotonic() < self.trusted_valid_from_monotonic {
             return Err(RegistryError::TrustedClockRegression);
         }
@@ -68,9 +75,9 @@ impl ValidatedLiveScope {
             && trusted.monotonic() <= self.valid_until_monotonic
             && at >= self.valid_from
             && at <= self.valid_until
-            && self.lease.validate_health_epoch(self.health_epoch, at)
+            && self.lease.validate_health_epoch(self.health_epoch)
             && self.capture.is_healthy()
-            && self.budget.is_available()
+            && self.producer.is_alive()
         {
             Ok(())
         } else {
@@ -156,8 +163,13 @@ impl ValidatedLiveScope {
     fn into_current_observation(
         self,
         observation: crate::ProviderNormalizedObservation,
-        frame_evidence: CurrentFrameEvidence,
+        evidence: CurrentObservationEvidence,
+        row_ordinal: usize,
+        row_count: usize,
     ) -> Result<CurrentProviderObservation, RegistryError> {
+        if row_count == 0 || row_count > crate::MAX_DECODED_EVENTS || row_ordinal >= row_count {
+            return Err(RegistryError::DecoderProfileMismatch);
+        }
         let crate::SourceProtocolProfile::Live(protocol) = self.protocol else {
             return Err(RegistryError::DecoderProfileMismatch);
         };
@@ -178,9 +190,11 @@ impl ValidatedLiveScope {
             trusted_valid_from_monotonic: self.trusted_valid_from_monotonic,
             valid_until: self.valid_until,
             valid_until_monotonic: self.valid_until_monotonic,
+            permission_valid_until: self.permission_valid_until,
+            permission_valid_until_monotonic: self.permission_valid_until_monotonic,
             lease: self.lease,
             capture: self.capture,
-            budget: self.budget,
+            producer: self.producer,
             clock: self.clock,
         };
         let key = CurrentBatchKey {
@@ -189,7 +203,10 @@ impl ValidatedLiveScope {
         };
         Ok(CurrentProviderObservation {
             key,
-            frame_evidence,
+            provider_identity: self.provider_identity,
+            row_ordinal,
+            row_count,
+            evidence,
             observation,
             policy: CurrentLivePolicy {
                 stream_key,

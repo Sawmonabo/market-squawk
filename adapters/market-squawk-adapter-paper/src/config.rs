@@ -9,6 +9,22 @@ use thiserror::Error;
 
 use crate::{FeeSchedule, PaperExposureValuation, PaperLedgerConfig, PaperVenueSessionCalendar};
 
+/// Account funding carries no session or execution authority. A venue policy is admitted only
+/// when the existing stopped repository binds genuine calendar evidence before execution.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PaperExecutionSessionPolicy {
+    AccountOnly,
+    Venue(PaperVenueSessionCalendar),
+}
+impl PaperExecutionSessionPolicy {
+    pub const fn calendar(&self) -> Option<&PaperVenueSessionCalendar> {
+        match self {
+            Self::AccountOnly => None,
+            Self::Venue(calendar) => Some(calendar),
+        }
+    }
+}
+
 /// Construction input for a realistic paper worker.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaperExecutionConfigInput {
@@ -29,7 +45,7 @@ pub struct PaperExecutionConfigInput {
     pub maximum_latency_nanos: u64,
     pub cancel_latency_nanos: u64,
     pub maximum_mark_age_nanos: u64,
-    pub day_session_calendar: PaperVenueSessionCalendar,
+    pub session_policy: PaperExecutionSessionPolicy,
     pub maximum_participation_basis_points: u32,
     pub impact_basis_points_per_level: u32,
     pub reporting_currency: Currency,
@@ -50,7 +66,7 @@ pub struct PaperExecutionConfig {
 }
 
 impl PaperExecutionConfig {
-    pub const CHECKPOINT_SCHEMA_VERSION: u32 = 10;
+    pub const CHECKPOINT_SCHEMA_VERSION: u32 = 11;
 
     /// Validates bounds and seals a stable configuration digest.
     pub fn try_new(input: PaperExecutionConfigInput) -> Result<Self, PaperConfigError> {
@@ -103,7 +119,12 @@ impl PaperExecutionConfig {
         ] {
             digest.update(value.to_be_bytes());
         }
-        digest.update(input.day_session_calendar.digest());
+        match &input.session_policy {
+            PaperExecutionSessionPolicy::Venue(calendar) => digest.update(calendar.digest()),
+            PaperExecutionSessionPolicy::AccountOnly => {
+                digest.update(b"market-squawk/paper-account-only/no-session-authority/v1\0");
+            }
+        }
         digest.update(input.reporting_currency.as_str().as_bytes());
         digest.update(input.abort_join_deadline.as_secs().to_be_bytes());
         digest.update(input.abort_join_deadline.subsec_nanos().to_be_bytes());

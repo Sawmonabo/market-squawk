@@ -4,7 +4,7 @@ use market_squawk_domain::{
     AuctionEvent, BookChange, BookDeltaEvent, BookSnapshotEvent, CorporateActionEvent,
     CorporateActionKind, InstrumentDefinition, InstrumentStatusEvent, LiveProvenance, MarketEvent,
     MergerConsideration, Money, PriceTicks, QuantityLots, QuoteEvent, SourceIdentifier, Timestamp,
-    TradeEvent, TradingHaltEvent, TradingStatus,
+    TradeEvent, TradeTakerOrderType, TradingHaltEvent, TradingStatus,
 };
 use market_squawk_sources::ProviderObservationPayload;
 use sha2::{Digest, Sha256};
@@ -41,6 +41,7 @@ pub(super) enum PreparedEvent {
         price: PriceTicks,
         quantity: QuantityLots,
         aggressor: market_squawk_domain::AggressorSide,
+        taker_order_type: Option<TradeTakerOrderType>,
     },
     Quote {
         bid: Option<market_squawk_domain::BookLevel>,
@@ -85,8 +86,13 @@ impl PreparedEvent {
                 price,
                 quantity,
                 aggressor,
+                taker_order_type,
             } => Ok(MarketEvent::Trade(TradeEvent::new(
-                provenance, price, quantity, aggressor,
+                provenance,
+                price,
+                quantity,
+                aggressor,
+                taker_order_type,
             )?)),
             Self::Quote { bid, ask } => {
                 Ok(MarketEvent::Quote(QuoteEvent::new(provenance, bid, ask)?))
@@ -133,12 +139,13 @@ impl PreparedEvent {
         output
             .try_reserve(512)
             .map_err(|_| LiveApplyError::Allocation)?;
-        output.extend_from_slice(b"MSQKEVENT\x01");
+        output.extend_from_slice(b"MSQKEVENT\x02");
         match self {
             Self::Trade {
                 price,
                 quantity,
                 aggressor,
+                taker_order_type,
             } => {
                 output.push(1);
                 encode_i64(&mut output, price.get());
@@ -147,6 +154,11 @@ impl PreparedEvent {
                     market_squawk_domain::AggressorSide::Buy => 1,
                     market_squawk_domain::AggressorSide::Sell => 2,
                     market_squawk_domain::AggressorSide::Unknown => 3,
+                });
+                output.push(match taker_order_type {
+                    None => 0,
+                    Some(TradeTakerOrderType::Limit) => 1,
+                    Some(TradeTakerOrderType::Market) => 2,
                 });
             }
             Self::Quote { bid, ask } => {
@@ -202,11 +214,13 @@ pub(super) fn prepare_non_book(
             price,
             quantity,
             aggressor,
+            taker_order_type,
             ..
         } => Ok(PreparedEvent::Trade {
             price: normalize_price(price, definition.tick_size())?,
             quantity: normalize_positive_quantity(quantity, definition.lot_size())?,
             aggressor: aggressor.side(),
+            taker_order_type: *taker_order_type,
         }),
         ProviderObservationPayload::Quote { bid, ask } => Ok(PreparedEvent::Quote {
             bid: bid

@@ -104,11 +104,14 @@ pub(crate) fn normalize_batch(
                 account_id,
                 currency,
                 cash_balance,
+                settlement_available_cash,
                 as_of_unix_nanos,
             } => {
                 let account_id = account(&account_id)?;
                 let currency = parse_currency(&currency)?;
                 let cash_balance = money(&cash_balance, currency)?;
+                let settlement_available_cash =
+                    optional_money(settlement_available_cash.as_deref(), currency)?;
                 let as_of = timestamp(&as_of_unix_nanos)?;
                 state.account_binding = Some(AccountBinding {
                     account_id,
@@ -130,18 +133,30 @@ pub(crate) fn normalize_batch(
                     account_id,
                     currency,
                     cash_balance,
+                    settlement_available_cash,
                     as_of,
                     raw.source_reference().clone(),
                 ));
                 push_scalar(
                     &mut normalized.canonical,
                     input_index,
-                    context,
+                    context.clone(),
                     DATASET_ACCOUNTS,
                     "cash_balance",
                     cash_balance.amount(),
                     Some(currency.as_str()),
                 )?;
+                if let Some(value) = settlement_available_cash {
+                    push_scalar(
+                        &mut normalized.canonical,
+                        input_index,
+                        context,
+                        DATASET_ACCOUNTS,
+                        "settlement_available_cash",
+                        value.amount(),
+                        Some(currency.as_str()),
+                    )?;
+                }
             }
             RawRecordWire::Holding {
                 account_id,
