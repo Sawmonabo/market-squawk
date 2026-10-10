@@ -12,8 +12,7 @@ impl crate::SourceMetadataProvider for TestExtractionAdapter {
 #[test]
 fn extraction_authority_is_exact_revocation_aware_and_budget_bound() -> TestResult {
     let at = Timestamp::from_unix_nanos(1_000_000_000);
-    let mut registry =
-        AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
+    let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
     let metadata = extraction_metadata("macro-source", "revision-1", 1)?;
     let adapter = TestExtractionAdapter {
         metadata: metadata.clone(),
@@ -69,8 +68,7 @@ fn extraction_authority_fails_closed_when_registry_is_dropped() -> TestResult {
         metadata: metadata.clone(),
     };
     let authority = {
-        let mut registry =
-            AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
+        let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
         let registered = registry.register(metadata, at)?;
         registry.extraction_authority(&registered, &adapter)?
     };
@@ -111,11 +109,8 @@ fn provider_backoff_authority_is_narrow_and_revocation_aware() -> TestResult {
 fn redirect_hops_are_origin_bound_and_each_consume_one_request_admission() -> TestResult {
     let at = Timestamp::from_unix_nanos(1_000_000_000);
     let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
-    let mut metadata_wire = serde_json::to_value(extraction_metadata(
-        "redirect-source",
-        "revision-1",
-        4,
-    )?)?;
+    let mut metadata_wire =
+        serde_json::to_value(extraction_metadata("redirect-source", "revision-1", 4)?)?;
     metadata_wire["network"]["allowlisted"]["endpoints"] = serde_json::json!([
         "https://redirect-source.example.test/data",
         "https://redirect-source.example.test/next",
@@ -150,9 +145,11 @@ fn redirect_hops_are_origin_bound_and_each_consume_one_request_admission() -> Te
         "https://redirect-source.example.test/next",
         true,
     )?;
-    assert!(redirect
-        .redirect_authorization()
-        .forward_sensitive_headers());
+    assert!(
+        redirect
+            .redirect_authorization()
+            .forward_sensitive_headers()
+    );
     assert!(matches!(
         authority.try_network_request("https://redirect-source.example.test/data"),
         Err(crate::ExtractionAuthorityError::BudgetUnavailable {
@@ -167,6 +164,18 @@ fn redirect_hops_are_origin_bound_and_each_consume_one_request_admission() -> Te
     authority
         .try_network_request("https://redirect-source.example.test/data")?
         .release();
+    // Canceled and mismatched admissions do not charge the window. Two original sends
+    // above consumed requests 1 and 2; this send and its actual redirect consume 3 and 4.
+    authority
+        .try_network_request("https://redirect-source.example.test/data")?
+        .authorize_send("https://redirect-source.example.test/data")?
+        .authorize_redirect_from(
+            "https://redirect-source.example.test/data",
+            "https://redirect-source.example.test/next",
+            true,
+        )?
+        .authorize_send("https://redirect-source.example.test/next")?
+        .release();
     assert!(matches!(
         authority.try_network_request("https://redirect-source.example.test/data"),
         Err(crate::ExtractionAuthorityError::BudgetWaitUntil { .. })
@@ -178,11 +187,8 @@ fn redirect_hops_are_origin_bound_and_each_consume_one_request_admission() -> Te
 fn in_flight_refusal_applies_shared_bounded_retry_after_without_budget_access() -> TestResult {
     let at = Timestamp::from_unix_nanos(1_000_000_000);
     let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
-    let mut metadata_wire = serde_json::to_value(extraction_metadata(
-        "retry-after-source",
-        "revision-1",
-        4,
-    )?)?;
+    let mut metadata_wire =
+        serde_json::to_value(extraction_metadata("retry-after-source", "revision-1", 4)?)?;
     metadata_wire["network"]["allowlisted"]["endpoints"] =
         serde_json::json!(["https://retry-after-source.example.test/data"]);
     metadata_wire["budget"]["max_concurrent"] = serde_json::json!(2);

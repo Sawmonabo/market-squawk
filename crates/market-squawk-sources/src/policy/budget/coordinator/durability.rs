@@ -1119,6 +1119,12 @@ impl std::fmt::Debug for BudgetPermitLease {
 }
 
 impl BudgetPermitLease {
+    /// Proves only producer ownership for received data, never permission to dispatch.
+    /// Handshake replacement, release and owner drop invalidate this exact active marker.
+    pub(crate) fn owner_is_alive(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
     pub(crate) fn is_current(&self) -> bool {
         self.provider_generation.is_none_or(|generation| {
             self.allocation

@@ -23,9 +23,9 @@ use crate::authority_time::{
 };
 use crate::bounded::BoundedVec;
 use crate::policy::{
-    AuthorityDurabilitySession, AuthorityPersistenceError, BudgetAvailabilityLease,
-    BudgetPermitLease, BudgetPolicyResolutionError, DurableBudgetGroup,
-    PersistedProviderBudgetPolicy, ProviderBudgetPool, ResolvedProviderBudgetPolicy,
+    AuthorityDurabilitySession, AuthorityPersistenceError, BudgetPermitLease,
+    BudgetPolicyResolutionError, DurableBudgetGroup, PersistedProviderBudgetPolicy,
+    ProviderBudgetPool, ResolvedProviderBudgetPolicy,
 };
 use crate::{FrameSessionBinding, SessionId, SharedProviderBudget, SourceMetadata};
 
@@ -226,7 +226,7 @@ struct CurrentHealthAuthority {
     permission_valid_until_monotonic: RegistryMonotonicInstant,
     authorization: crate::AuthorizationHealth,
     coverage: crate::CoverageHealth,
-    budget: CurrentBudgetAuthority,
+    producer: CurrentProducerLifetime,
 }
 
 /// Result of recording one exact-generation health observation.
@@ -259,8 +259,7 @@ impl CurrentHealthUnqualification {
     const CAPTURE_INTEGRITY: u16 = 1 << 6;
     const AUTHORIZATION: u16 = 1 << 7;
     const COVERAGE: u16 = 1 << 8;
-    const SNAPSHOT_BUDGET: u16 = 1 << 9;
-    const REPORTER_BUDGET: u16 = 1 << 10;
+    const PRODUCER_INACTIVE: u16 = 1 << 10;
     const LAST_ERROR: u16 = 1 << 11;
     const CURRENT_DATA_DEADLINE: u16 = 1 << 12;
     const STATIC_DEADLINE: u16 = 1 << 13;
@@ -277,8 +276,8 @@ impl CurrentHealthUnqualification {
 
     /// Returns true only when every rejected dimension is a current-data freshness clock.
     ///
-    /// Authorization, coverage, budget, capture, integrity, and provider-error failures can never
-    /// be classified as freshness-only, including when one also coexists with stale data.
+    /// Authorization, coverage, producer lifetime, capture, integrity, and provider-error failures
+    /// can never be classified as freshness-only, including when one also coexists with stale data.
     pub const fn is_freshness_only(self) -> bool {
         self.causes != 0 && self.causes & !Self::FRESHNESS == 0
     }
@@ -297,62 +296,38 @@ impl crate::AuthorizationSubjectResolver for UnconfiguredAuthorizationSubjectRes
     }
 }
 
+/// Optional producer ownership, independent of capacity to dispatch another request.
 #[derive(Clone, Debug)]
-enum CurrentBudgetAuthority {
-    NotRequired,
-    Available(BudgetAvailabilityLease),
-    ActiveRequest(BudgetPermitLease),
-    Unavailable,
+enum CurrentProducerLifetime {
+    Session,
+    Bound(BudgetPermitLease),
 }
 
-impl CurrentBudgetAuthority {
-    fn observe(budget: Option<&SharedProviderBudget>) -> Self {
-        let Some(budget) = budget else {
-            return Self::NotRequired;
-        };
-        match budget.availability_lease() {
-            Ok(lease) => Self::Available(lease),
-            Err(_) => Self::Unavailable,
-        }
-    }
-
-    fn observe_active_request(
+impl CurrentProducerLifetime {
+    fn bind(
         budget: Option<&SharedProviderBudget>,
         lease: &BudgetPermitLease,
     ) -> Result<Self, RegistryError> {
         let budget = budget.ok_or(RegistryError::BudgetAuthorityMismatch)?;
-        if !lease.shares_allocation_with(budget) || !lease.is_current() {
+        if !lease.shares_allocation_with(budget) || !lease.owner_is_alive() {
             return Err(RegistryError::BudgetAuthorityMismatch);
         }
-        Ok(Self::ActiveRequest(lease.clone()))
+        Ok(Self::Bound(lease.clone()))
     }
 
-    fn is_available(&self) -> bool {
+    fn is_alive(&self) -> bool {
         match self {
-            Self::NotRequired => true,
-            Self::Available(lease) => lease.is_available(),
-            Self::ActiveRequest(lease) => lease.is_current(),
-            Self::Unavailable => false,
-        }
-    }
-
-    fn health(&self) -> crate::BudgetHealth {
-        if self.is_available() {
-            crate::BudgetHealth::Available
-        } else {
-            crate::BudgetHealth::Unavailable
+            Self::Session => true,
+            Self::Bound(lease) => lease.owner_is_alive(),
         }
     }
 
     fn shared_allocation_charge(&self) -> Result<usize, RegistryError> {
         match self {
-            Self::Available(lease) => lease
+            Self::Bound(lease) => lease
                 .shared_allocation_charge()
                 .ok_or(RegistryError::RetainedSizeOverflow),
-            Self::ActiveRequest(lease) => lease
-                .shared_allocation_charge()
-                .ok_or(RegistryError::RetainedSizeOverflow),
-            Self::NotRequired | Self::Unavailable => Ok(0),
+            Self::Session => Ok(0),
         }
     }
 }
@@ -482,7 +457,8 @@ pub trait CatalogProviderIdentityAuthority: std::fmt::Debug + Send + Sync {
 /// Opaque catalog selection bound privately to one exact source registration.
 ///
 /// This is identity authority only. Current observations must also retain and validate their
-/// existing source session, account/authorization generation, health, capture, and budget lease.
+/// existing source session, account/authorization generation, health, capture, and any bound
+/// producer lifetime.
 #[derive(Clone, Debug)]
 pub struct CurrentProviderIdentity {
     source_id: SourceId,

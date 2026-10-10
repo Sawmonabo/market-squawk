@@ -1,9 +1,7 @@
 #[test]
 fn frame_factory_owns_receipt_time_and_accepts_equal_wall_progress() -> TestResult {
     let mut harness = HealthHarness::new("receipt-source-owned")?;
-    let mut factory = harness
-        .registry
-        .take_raw_frame_factory(&harness.session)?;
+    let mut factory = harness.registry.take_raw_frame_factory(&harness.session)?;
     harness.set_time(0, 1)?;
     let first = factory.try_frame(TransportFrameKind::Binary, Bytes::from_static(b"one"))?;
     harness.set_time(0, 2)?;
@@ -18,13 +16,12 @@ fn frame_factory_owns_receipt_time_and_accepts_equal_wall_progress() -> TestResu
 
 #[test]
 fn either_clock_component_rollback_latches_permanently() -> TestResult {
-    for (source, rollback_wall, rollback_monotonic) in
-        [("wall-rollback", 9_i64, 11_u64), ("monotonic-rollback", 11, 9)]
-    {
+    for (source, rollback_wall, rollback_monotonic) in [
+        ("wall-rollback", 9_i64, 11_u64),
+        ("monotonic-rollback", 11, 9),
+    ] {
         let mut harness = HealthHarness::new(source)?;
-        let mut factory = harness
-            .registry
-            .take_raw_frame_factory(&harness.session)?;
+        let mut factory = harness.registry.take_raw_frame_factory(&harness.session)?;
         harness.set_time(10, 10)?;
         factory.try_frame(TransportFrameKind::Binary, Bytes::from_static(b"before"))?;
         harness.set_time(rollback_wall, rollback_monotonic)?;
@@ -48,9 +45,7 @@ fn either_clock_component_rollback_latches_permanently() -> TestResult {
 #[test]
 fn clock_source_failure_latches_permanently() -> TestResult {
     let mut harness = HealthHarness::new("clock-source-failure")?;
-    let mut factory = harness
-        .registry
-        .take_raw_frame_factory(&harness.session)?;
+    let mut factory = harness.registry.take_raw_frame_factory(&harness.session)?;
     harness.clock.fail()?;
     assert_eq!(
         factory.try_frame(TransportFrameKind::Binary, Bytes::from_static(b"failure")),
@@ -67,9 +62,7 @@ fn clock_source_failure_latches_permanently() -> TestResult {
 #[test]
 fn deserialized_frame_has_no_live_continuity_authority() -> TestResult {
     let mut harness = HealthHarness::new("missing-frame-continuity")?;
-    let mut factory = harness
-        .registry
-        .take_raw_frame_factory(&harness.session)?;
+    let mut factory = harness.registry.take_raw_frame_factory(&harness.session)?;
     harness.set_time(1, 1)?;
     let frame = factory.try_frame(TransportFrameKind::Binary, Bytes::from_static(b"frame"))?;
     let mut reconstructed = frame.clone();
@@ -89,12 +82,25 @@ fn retained_capture_authority_and_same_registry_replacement_reject_after_latch()
     let clock = Arc::new(ManualRegistryClock::new(TrustedRegistryTime::new(
         wall, monotonic,
     )));
+    let metadata = direct_metadata("retained-time", "revision-1")?;
+    let [instrument] = metadata.coverage().instruments().instruments() else {
+        return Err("retained time fixture requires one covered instrument".into());
+    };
+    let (identity_authority, identity_requests) =
+        fixture_identity_authority(&[(*instrument, "BTC-USD")], wall)?;
     let mut registry =
         AuthoritativeSourceRegistry::try_new_ephemeral_with_authority_state_and_clock_for_diagnostics(
             super::super::RegistryAuthorityState::empty(),
             clock.clone(),
-        )?;
-    let registered = registry.register(direct_metadata("retained-time", "revision-1")?, wall)?;
+        )?
+        .with_provider_identity_authority(identity_authority)?;
+    let registered = registry.register(metadata, wall)?;
+    registry.record_provider_identities(
+        &registered,
+        &identity_requests,
+        std::time::Instant::now() + Duration::from_secs(2),
+        &tokio_util::sync::CancellationToken::new(),
+    )?;
     let session = registry.begin_session(
         &registered,
         SessionId::new(SourceIdentifier::try_from("session-1")?),
@@ -136,9 +142,11 @@ fn retained_capture_authority_and_same_registry_replacement_reject_after_latch()
     ));
 
     let mut fresh = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
-    assert!(fresh
-        .register(direct_metadata("fresh-time", "revision-1")?, wall)
-        .is_ok());
+    assert!(
+        fresh
+            .register(direct_metadata("fresh-time", "revision-1")?, wall)
+            .is_ok()
+    );
     Ok(())
 }
 
@@ -151,10 +159,22 @@ fn durable_time_fault_preserves_in_use_restart_rejection() -> TestResult {
     )));
     let store_for_registry: Arc<dyn AuthorityStateStore> = store.clone();
     let raw_clock: Arc<dyn RawRegistryClockSource> = clock.clone();
-    let mut registry = durable_registry_with_test_store_and_clock(store_for_registry, raw_clock)?;
-    let registered = registry.register(
-        direct_metadata("durable-time-fault", "revision-1")?,
+    let metadata = direct_metadata("durable-time-fault", "revision-1")?;
+    let [instrument] = metadata.coverage().instruments().instruments() else {
+        return Err("durable time fixture requires one covered instrument".into());
+    };
+    let (identity_authority, identity_requests) = fixture_identity_authority(
+        &[(*instrument, "BTC-USD")],
         Timestamp::from_unix_nanos(1_000_000_000),
+    )?;
+    let mut registry = durable_registry_with_test_store_and_clock(store_for_registry, raw_clock)?
+        .with_provider_identity_authority(identity_authority)?;
+    let registered = registry.register(metadata, Timestamp::from_unix_nanos(1_000_000_000))?;
+    registry.record_provider_identities(
+        &registered,
+        &identity_requests,
+        std::time::Instant::now() + Duration::from_secs(2),
+        &tokio_util::sync::CancellationToken::new(),
     )?;
     let session = registry.begin_session(
         &registered,

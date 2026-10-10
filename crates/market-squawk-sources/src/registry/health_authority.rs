@@ -145,11 +145,8 @@ impl AuthoritativeSourceRegistry {
         if !exact_runtime_coverage {
             causes |= CurrentHealthUnqualification::COVERAGE;
         }
-        if health.budget() != crate::BudgetHealth::Available {
-            causes |= CurrentHealthUnqualification::SNAPSHOT_BUDGET;
-        }
-        if update.budget.health() != crate::BudgetHealth::Available {
-            causes |= CurrentHealthUnqualification::REPORTER_BUDGET;
+        if !update.producer.is_alive() {
+            causes |= CurrentHealthUnqualification::PRODUCER_INACTIVE;
         }
         if health.last_error().is_some() {
             causes |= CurrentHealthUnqualification::LAST_ERROR;
@@ -264,7 +261,7 @@ impl AuthoritativeSourceRegistry {
                     .ok_or(RegistryError::HealthNotQualified)?,
                 authorization: health.authorization().clone(),
                 coverage: health.coverage().clone(),
-                budget: update.budget,
+                producer: update.producer,
             })
         } else {
             None
@@ -323,7 +320,7 @@ impl AuthoritativeSourceRegistry {
         {
             return Err(RegistryError::HealthNotQualified);
         }
-        if !health.budget.is_available() {
+        if !health.producer.is_alive() {
             return Err(RegistryError::HealthNotQualified);
         }
         if !session.capture.is_healthy() {
@@ -446,6 +443,6 @@ impl CurrentHealthAuthority {
             && coverage_continues
             && next.valid_until >= self.valid_until
             && next.valid_until_monotonic >= self.valid_until_monotonic
-            && self.budget.is_available()
+            && self.producer.is_alive()
     }
 }

@@ -14,6 +14,7 @@ impl CurrentHealthReporter {
     /// Binds a locally constructed snapshot to this exact session allocation and metadata policy.
     ///
     /// Deserialized audit DTOs have no process-local binding and cannot be reported.
+    /// Request-budget state is diagnostic; it does not qualify already received data.
     ///
     /// # Errors
     ///
@@ -22,29 +23,29 @@ impl CurrentHealthReporter {
         &mut self,
         snapshot: crate::SourceHealthSnapshot,
     ) -> Result<CurrentHealthUpdate, RegistryError> {
-        let budget = CurrentBudgetAuthority::observe(self.budget.as_ref());
-        self.report_with_budget(snapshot, budget)
+        self.report_with_producer(snapshot, CurrentProducerLifetime::Session)
     }
 
-    /// Binds health to the exact active request or established transport carrying this stream.
+    /// Binds health to the lifetime of the exact request or established transport owner.
+    /// Request capacity, cooldown and scheduling changes do not invalidate received data.
     ///
     /// # Errors
     ///
-    /// Rejects an inactive, revoked, or transplanted permit in addition to the ordinary health
+    /// Rejects an exited or transplanted producer owner in addition to the ordinary health
     /// identity, policy, session, and temporal validation failures.
     pub fn report_with_active_request(
         &mut self,
         snapshot: crate::SourceHealthSnapshot,
         request: &crate::BudgetPermitLease,
     ) -> Result<CurrentHealthUpdate, RegistryError> {
-        let budget = CurrentBudgetAuthority::observe_active_request(self.budget.as_ref(), request)?;
-        self.report_with_budget(snapshot, budget)
+        let producer = CurrentProducerLifetime::bind(self.budget.as_ref(), request)?;
+        self.report_with_producer(snapshot, producer)
     }
 
-    fn report_with_budget(
+    fn report_with_producer(
         &mut self,
         snapshot: crate::SourceHealthSnapshot,
-        budget: CurrentBudgetAuthority,
+        producer: CurrentProducerLifetime,
     ) -> Result<CurrentHealthUpdate, RegistryError> {
         if !self.lease.is_current()
             || !snapshot.uses_freshness_policy(self.freshness)
@@ -67,7 +68,7 @@ impl CurrentHealthReporter {
             snapshot,
             binding: self.binding.clone(),
             lease: Arc::clone(&self.lease),
-            budget,
+            producer,
             trusted_reported_at,
         })
     }
@@ -79,7 +80,7 @@ pub struct CurrentHealthUpdate {
     snapshot: crate::SourceHealthSnapshot,
     binding: FrameSessionBinding,
     lease: Arc<SessionLeaseState>,
-    budget: CurrentBudgetAuthority,
+    producer: CurrentProducerLifetime,
     trusted_reported_at: TrustedRegistryTime,
 }
 
@@ -1258,7 +1259,7 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
                 .session
                 .lease
                 .validate_health_epoch(self.health.epoch)
-            || !self.health.budget.is_available()
+            || !self.health.producer.is_alive()
             || !self.validated.session.capture.is_healthy()
         {
             return Err(RegistryError::HealthNotQualified);
@@ -1277,7 +1278,7 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             permission_valid_until_monotonic: self.health.permission_valid_until_monotonic,
             lease: Arc::clone(&self.validated.session.lease),
             capture: self.validated.session.capture.clone(),
-            budget: self.health.budget.clone(),
+            producer: self.health.producer.clone(),
             clock: Arc::clone(self.clock),
         };
         lease.validate_at(mint_at.wall())?;
@@ -1364,7 +1365,7 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             .session
             .lease
             .validate_health_epoch(self.health.epoch)
-            || !self.health.budget.is_available()
+            || !self.health.producer.is_alive()
         {
             return Err(RegistryError::HealthNotQualified);
         }
@@ -1487,7 +1488,7 @@ impl<'a> ValidatedCurrentSourceAuthority<'a> {
             health_epoch: self.health.epoch,
             lease: Arc::clone(&self.validated.session.lease),
             capture: self.validated.session.capture.clone(),
-            budget: self.health.budget.clone(),
+            producer: self.health.producer.clone(),
             clock: Arc::clone(self.clock),
             universe_evidence: self.attestation.map(|value| value.evidence.clone()),
             provider_identity,

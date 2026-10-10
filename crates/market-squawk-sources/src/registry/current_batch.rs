@@ -267,7 +267,7 @@ pub struct CurrentSourceAuthorityLease {
     permission_valid_until_monotonic: RegistryMonotonicInstant,
     lease: Arc<SessionLeaseState>,
     capture: crate::CaptureGenerationLease,
-    budget: CurrentBudgetAuthority,
+    producer: CurrentProducerLifetime,
     clock: Arc<SealedRegistryClock>,
 }
 
@@ -301,7 +301,7 @@ impl CommittedSourceObservationAuthority {
             || self.admitted_at > source.valid_until
             || !source.lease.validate_health_epoch(source.health_epoch)
             || !source.capture.is_healthy()
-            || !source.budget.is_available()
+            || !source.producer.is_alive()
         {
             return Err(RegistryError::HealthNotQualified);
         }
@@ -326,7 +326,7 @@ impl CurrentSourceAuthorityLease {
         })
     }
 
-    /// Revalidates a selected identity together with source, capture, health and budget authority.
+    /// Revalidates a selected identity together with source, capture, health and producer lifetime.
     /// A fresh sealed clock sample prevents a retained event timestamp from extending identity
     /// validity. This does not grant observation or mutation authority to either input alone.
     pub fn validate_provider_identity_at(
@@ -367,7 +367,7 @@ impl CurrentSourceAuthorityLease {
         let event_after_valid_until = at > self.valid_until;
         let epoch_or_session_invalid = !self.lease.validate_health_epoch(self.health_epoch);
         let capture_unhealthy = !self.capture.is_healthy();
-        let budget_unavailable = !self.budget.is_available();
+        let producer_inactive = !self.producer.is_alive();
         if trusted_wall_before_acceptance
             || trusted_wall_expired
             || trusted_monotonic_expired
@@ -375,7 +375,7 @@ impl CurrentSourceAuthorityLease {
             || event_after_valid_until
             || epoch_or_session_invalid
             || capture_unhealthy
-            || budget_unavailable
+            || producer_inactive
         {
             tracing::warn!(
                 trusted_wall_before_acceptance,
@@ -385,7 +385,7 @@ impl CurrentSourceAuthorityLease {
                 event_after_valid_until,
                 epoch_or_session_invalid,
                 capture_unhealthy,
-                budget_unavailable,
+                producer_inactive,
                 "queued source authority validation failed"
             );
             Err(RegistryError::HealthNotQualified)
@@ -429,7 +429,7 @@ impl CurrentSourceAuthorityLease {
             .runtime_health
             .conservative_arc_allocation_charge()
             .ok_or(RegistryError::RetainedSizeOverflow)?;
-        let budget = self.budget.shared_allocation_charge()?;
+        let budget = self.producer.shared_allocation_charge()?;
         let clock = self
             .clock
             .shared_allocation_charge()

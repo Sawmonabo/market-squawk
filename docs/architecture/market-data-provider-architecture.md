@@ -754,15 +754,19 @@ Queued source authority retains each lease's original wall-clock, monotonic and 
 Benign healthy renewals preserve that authority through a constant-size epoch floor, independent of
 refresh count. Degradation, session invalidation, changed authorization/subscription evidence,
 narrower authority or a gap in qualified time starts a new run; later recovery cannot revive old
-leases. Capture, budget and native-identity revocation checks remain separate. This is queued-work
+leases. Capture, bound producer-owner lifetime and native-identity revocation checks remain separate. This is queued-work
 continuity, not an extension of price freshness or permission to use expired observations.
 
 The actor seals publication-only authority for each research observation after live admission
 succeeds. Durable publication retains that exact admission time and original qualification; it does
 not require the price to remain live-fresh while raw evidence is synchronized. Before database
-commit, the receipt still checks session and health-run revocation, capture integrity, budget,
+commit, the receipt still checks session and health-run revocation, capture integrity, producer lifetime,
 native identity, and the independent static/runtime permission deadlines using sealed wall and
 monotonic clocks. It cannot admit another live observation or renew price/execution authority.
+Request capacity and cooldown govern new network dispatch, not already received observations.
+Plain current-health reports require their exact live source session; explicitly owner-bound reports
+also reject immediately when that request/transport owner exits. Budget health remains diagnostic,
+and dispatch reservations, rate accounting and refusal controls keep their existing enforcement.
 The ordinary live validator retains its original freshness checks. Verification status belongs in
 the delivery ledger.
 

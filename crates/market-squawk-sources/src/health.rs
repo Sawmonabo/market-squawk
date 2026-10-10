@@ -63,7 +63,8 @@ pub enum SourceTimestampFreshness {
     Stale { last_source_at: Timestamp },
 }
 
-/// Shared provider-budget health without exposing credentials or alternate identities.
+/// Shared request-scheduling state without exposing credentials or alternate identities.
+/// This diagnostic state does not invalidate data already received from a current producer.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BudgetHealth {

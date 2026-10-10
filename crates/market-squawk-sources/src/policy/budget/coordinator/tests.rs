@@ -685,9 +685,11 @@ mod coordinator_tests {
                 .checked_mul(std::mem::size_of_val(window))
                 .ok_or("budget window storage charge overflow")?
         };
-        let lease = budget.availability_lease().map_err(|reason| {
-            std::io::Error::other(format!("budget lease unavailable: {reason:?}"))
-        })?;
+        let permit = match budget.try_acquire() {
+            BudgetDecision::Ready(permit) => permit,
+            other => return Err(format!("budget permit unavailable: {other:?}").into()),
+        };
+        let lease = permit.active_lease();
         let expected = std::mem::size_of::<BudgetAllocation>()
             .checked_add(crate::conservative_arc_control_block_charge::<
                 BudgetAllocation,
@@ -706,6 +708,10 @@ mod coordinator_tests {
                 )
             })
             .and_then(|bytes| bytes.checked_add(clock.shared_allocation_charge()))
+            .and_then(|bytes| bytes.checked_add(std::mem::size_of::<AtomicBool>()))
+            .and_then(|bytes| {
+                bytes.checked_add(crate::conservative_arc_control_block_charge::<AtomicBool>())
+            })
             .ok_or("shared budget allocation charge overflow")?;
 
         assert_eq!(lease.shared_allocation_charge(), Some(expected));

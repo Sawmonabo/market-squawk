@@ -1678,6 +1678,7 @@ impl RawMarketSink for ProductionRawMarketSink<'_> {
         if self.active_request_budget.is_some() {
             return Err(self.fail(ProductionSinkFailure::DuplicateActiveRequestBudget));
         }
+        // Retain producer lifetime; later request-capacity changes do not revoke received data.
         self.active_request_budget = Some(request);
         Ok(())
     }

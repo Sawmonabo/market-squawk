@@ -16,10 +16,12 @@ pub(crate) mod persistence;
 pub(in crate::policy) use budget_checkpoint::{
     checkpoint_from_runtime, runtime_state_from_checkpoint, validate_checkpoint,
 };
+#[cfg(test)]
+pub(crate) use budget_coordinator::BudgetAvailabilityLease;
 use budget_coordinator::BudgetClock;
 pub(in crate::policy) use budget_coordinator::CleanShutdownProof;
+pub(crate) use budget_coordinator::ProviderBudgetPool;
 pub(in crate::policy) use budget_coordinator::SystemBudgetClock;
-pub(crate) use budget_coordinator::{BudgetAvailabilityLease, ProviderBudgetPool};
 pub use budget_coordinator::{BudgetPermit, BudgetPermitLease, BudgetPoolError, BudgetReservation};
 pub(in crate::policy) use budget_identity::BudgetCollisionMergeError;
 pub use budget_identity::{
@@ -35,6 +37,7 @@ pub(in crate::policy) use budget_identity::{
 pub use budget_retry_after::apply_http_retry_after;
 pub(in crate::policy) use budget_runtime::RuntimeOperationAdmission;
 pub use budget_runtime::SharedProviderBudget;
+#[cfg(test)]
 pub(in crate::policy) use budget_runtime::evaluate_budget_windows;
 pub(in crate::policy) use budget_runtime_types::{
     BudgetAllocation, BudgetDurabilityBinding, BudgetState, ClockObservation,

@@ -171,8 +171,20 @@ mod tests {
     #[test]
     fn active_live_generation_validates_only_its_exact_current_frames() -> TestResult {
         let metadata = direct_metadata("active-frame-source", "active-frame-revision")?;
-        let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?;
+        let [instrument] = metadata.coverage().instruments().instruments() else {
+            return Err("active frame fixture requires one covered instrument".into());
+        };
+        let (identity_authority, identity_requests) =
+            fixture_identity_authority(&[(*instrument, "BTC-USD")], Timestamp::from_unix_nanos(1))?;
+        let mut registry = AuthoritativeSourceRegistry::try_new_ephemeral_for_diagnostics()?
+            .with_provider_identity_authority(identity_authority)?;
         let registered = registry.register(metadata.clone(), Timestamp::from_unix_nanos(1))?;
+        registry.record_provider_identities(
+            &registered,
+            &identity_requests,
+            std::time::Instant::now() + Duration::from_secs(2),
+            &tokio_util::sync::CancellationToken::new(),
+        )?;
         let session = registry.begin_session(
             &registered,
             SessionId::new(SourceIdentifier::try_from("active-frame-session")?),

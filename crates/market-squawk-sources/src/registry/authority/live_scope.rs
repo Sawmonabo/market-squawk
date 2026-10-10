@@ -26,7 +26,7 @@ pub struct ValidatedLiveScope {
     health_epoch: u64,
     lease: Arc<SessionLeaseState>,
     capture: crate::CaptureGenerationLease,
-    budget: CurrentBudgetAuthority,
+    producer: CurrentProducerLifetime,
     clock: Arc<SealedRegistryClock>,
     universe_evidence: Option<ExactPayloadEvidence>,
     provider_identity: CurrentProviderIdentity,
@@ -49,7 +49,7 @@ impl ValidatedLiveScope {
             permission_valid_until_monotonic: self.permission_valid_until_monotonic,
             lease: Arc::clone(&self.lease),
             capture: self.capture.clone(),
-            budget: self.budget.clone(),
+            producer: self.producer.clone(),
             clock: Arc::clone(&self.clock),
         }
     }
@@ -77,7 +77,7 @@ impl ValidatedLiveScope {
             && at <= self.valid_until
             && self.lease.validate_health_epoch(self.health_epoch)
             && self.capture.is_healthy()
-            && self.budget.is_available()
+            && self.producer.is_alive()
         {
             Ok(())
         } else {
@@ -194,7 +194,7 @@ impl ValidatedLiveScope {
             permission_valid_until_monotonic: self.permission_valid_until_monotonic,
             lease: self.lease,
             capture: self.capture,
-            budget: self.budget,
+            producer: self.producer,
             clock: self.clock,
         };
         let key = CurrentBatchKey {

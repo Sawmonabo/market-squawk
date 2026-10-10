@@ -470,7 +470,8 @@ pub trait RawMarketSink: Send {
     /// Sources call this once after the transport handshake and before publishing the first
     /// frame. A successfully upgraded transport may release request concurrency through its
     /// permit while retaining the same owner-bound lease. Sinks that do not qualify live
-    /// authority may ignore the opaque lease.
+    /// authority may ignore the opaque lease. Received-data qualification uses this owner lifetime,
+    /// independently of capacity or cooldown for another request.
     ///
     /// # Errors
     ///

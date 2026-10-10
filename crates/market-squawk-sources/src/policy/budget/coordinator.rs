@@ -1,6 +1,8 @@
 use super::*;
 
-/// Lock-free lease proving a budget remained available at one allocation generation.
+/// Test probe for dispatch-generation and durable-budget failure cases.
+/// Received-data authority does not retain request availability.
+#[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct BudgetAvailabilityLease {
     allocation: Arc<BudgetAllocation>,
@@ -8,6 +10,7 @@ pub(crate) struct BudgetAvailabilityLease {
     provider_generation: Option<u64>,
 }
 
+#[cfg(test)]
 impl std::fmt::Debug for BudgetAvailabilityLease {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -17,6 +20,7 @@ impl std::fmt::Debug for BudgetAvailabilityLease {
     }
 }
 
+#[cfg(test)]
 impl BudgetAvailabilityLease {
     pub(crate) fn is_available(&self) -> bool {
         self.provider_generation.is_none_or(|generation| {
@@ -39,32 +43,9 @@ impl BudgetAvailabilityLease {
             && !self.allocation.state.is_poisoned()
             && !self.allocation.terminal.load(Ordering::Acquire)
     }
-
-    pub(crate) fn shared_allocation_charge(&self) -> Option<usize> {
-        let state_dynamic = self
-            .allocation
-            .state
-            .lock()
-            .ok()?
-            .dynamic_retained_bytes()?;
-        std::mem::size_of::<BudgetAllocation>()
-            .checked_add(crate::conservative_arc_control_block_charge::<
-                BudgetAllocation,
-            >())
-            .and_then(|bytes| {
-                self.allocation
-                    .policy
-                    .dynamic_retained_bytes()
-                    .and_then(|dynamic| bytes.checked_add(dynamic))
-            })
-            .and_then(|bytes| bytes.checked_add(state_dynamic))
-            .and_then(|bytes| {
-                bytes.checked_add(self.allocation.admission.shared_allocation_charge()?)
-            })
-            .and_then(|bytes| bytes.checked_add(self.allocation.clock.shared_allocation_charge()))
-    }
 }
 
+#[cfg(test)]
 impl SharedProviderBudget {
     pub(crate) fn availability_lease(
         &self,
