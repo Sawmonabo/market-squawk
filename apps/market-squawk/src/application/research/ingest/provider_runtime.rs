@@ -3187,6 +3187,16 @@ mod tests {
         );
         assert_eq!(bridge_calls.load(Ordering::SeqCst), 0);
         assert_eq!(wire.exchange_count(), 1);
+        assert!(
+            oauth
+                .acquire_captured_publication_attempt(
+                    oauth_receipt.generation(),
+                    oauth_receipt.credential_authority(),
+                )
+                .await
+                .is_err(),
+            "captured publication accepted a revoked authority"
+        );
         assert!(matches!(
             durable.latest_source_health()?,
             Some(super::super::schwab_market::SchwabRestQuoteSourceHealthOutcome::PostSealPublicationUnavailable {
@@ -3204,6 +3214,18 @@ mod tests {
         )
         .await?;
         let original_rotation_receipt = rotating.current_receipt().await?;
+        // A received stream batch inside the early-refresh window must not rotate its own
+        // LOGIN token. Publication still owns the same barrier as ordinary refreshing dispatch.
+        let captured_epoch = rotating
+            .acquire_captured_publication_attempt(
+                original_rotation_receipt.generation(),
+                original_rotation_receipt.credential_authority(),
+            )
+            .await?;
+        assert_eq!(captured_epoch.receipt(), original_rotation_receipt);
+        captured_epoch.validate_current(original_rotation_receipt)?;
+        assert_eq!(rotating_wire.exchange_count(), 1);
+        drop(captured_epoch);
         let (rotating_durable, rotating_evidence, rotating_binding, rotating_generation, _) =
             quote_publication_fixture(
                 &directory.path().join("rotating-publication"),
@@ -3277,6 +3299,17 @@ mod tests {
             1,
             "same-grant refresh was rejected before current quote qualification"
         );
+        assert!(
+            rotating
+                .acquire_captured_publication_attempt(
+                    original_rotation_receipt.generation(),
+                    original_rotation_receipt.credential_authority(),
+                )
+                .await
+                .is_err(),
+            "captured publication accepted a rotated token"
+        );
+        assert_eq!(rotating_wire.exchange_count(), 2);
 
         // Restored access expiry must reach the sole writer's refresh path before requests. Pure receipt inspection remains read-only and rejects the expired epoch.
         let (expired, expired_wire, _) = scripted_market_authority(
@@ -3288,6 +3321,16 @@ mod tests {
         )
         .await?;
         let prior = expired.issued_receipt();
+        assert!(
+            expired
+                .acquire_captured_publication_attempt(
+                    prior.generation(),
+                    prior.credential_authority(),
+                )
+                .await
+                .is_err(),
+            "captured publication accepted an expired token"
+        );
         assert!(expired.current_receipt().await.is_err());
         assert_eq!(expired_wire.exchange_count(), 1);
         expired_wire.refresh_release.try_acquire()?.forget();

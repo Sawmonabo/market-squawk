@@ -179,7 +179,17 @@ impl SchwabRestQuoteCurrentSessionInput {
                 observed_at,
                 None,
                 sealed_frame.payload_digest().bytes(),
-            )?;
+            )
+            .map_err(|error| {
+                tracing::warn!(
+                    ?service,
+                    generation = self.session.generation().get(),
+                    first_ordinal = sealed.streamer_receipt().first_ordinal().get(),
+                    received_at_millis = sealed_frame.received_at_unix_millis(),
+                    "stream health qualification failed"
+                );
+                error
+            })?;
             let venue = self
                 .display_ingresses
                 .first()

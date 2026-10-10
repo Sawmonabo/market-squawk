@@ -619,21 +619,47 @@ impl SchwabRestQuoteCurrentSessionInput {
         let current = self
             .registry
             .validate_current_authority(&self.session)
-            .map_err(|_| SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?;
-        let source_lease = current
-            .try_current_lease()
-            .map_err(|_| SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?;
+            .map_err(|error| {
+                tracing::warn!(
+                    stage = "current_authority",
+                    ?error,
+                    "current quote qualification failed"
+                );
+                SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth
+            })?;
+        let source_lease = current.try_current_lease().map_err(|error| {
+            tracing::warn!(
+                stage = "current_lease",
+                ?error,
+                "current quote qualification failed"
+            );
+            SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth
+        })?;
         let selected_provider_identities = instruments
             .map(|instrument| {
                 current
                     .selected_provider_identity(venue, instrument)
-                    .map_err(|_| SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)
+                    .map_err(|error| {
+                        tracing::warn!(
+                            stage = "selected_identity",
+                            ?error,
+                            "current quote qualification failed"
+                        );
+                        SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth
+                    })
             })
             .collect::<Result<Vec<_>, _>>()?;
         for identity in &selected_provider_identities {
             source_lease
                 .validate_provider_identity_at(identity, observed_at)
-                .map_err(|_| SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?;
+                .map_err(|error| {
+                    tracing::warn!(
+                        stage = "identity_at_observation",
+                        ?error,
+                        "current quote qualification failed"
+                    );
+                    SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth
+                })?;
         }
         Ok(SchwabQualifiedCurrent {
             batches,
@@ -708,7 +734,14 @@ impl SchwabRestQuoteCurrentSessionInput {
     ) -> Result<(), SchwabRestQuoteCurrentUnavailable> {
         // Configured rights have no saved-probe expiry. This response's actual access token
         // bounds runtime authority, while any narrower configured interval still applies.
-        let access_deadline = oauth_access_deadline(oauth, observed_at)?;
+        let access_deadline = oauth_access_deadline(oauth, observed_at).map_err(|error| {
+            tracing::warn!(
+                stage = "oauth_deadline",
+                ?error,
+                "current quote qualification failed"
+            );
+            error
+        })?;
         let authorization_deadline = metadata
             .authorization()
             .inclusive_authorization_deadline()
@@ -748,17 +781,41 @@ impl SchwabRestQuoteCurrentSessionInput {
             None,
             Vec::new(),
         )
-        .map_err(|_error| SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?;
-        let update = self
-            .health_reporter
-            .report(health)
-            .map_err(|_error| SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?;
-        if self
+        .map_err(|error| {
+            tracing::warn!(
+                stage = "health_snapshot",
+                ?error,
+                "current quote qualification failed"
+            );
+            SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth
+        })?;
+        let update = self.health_reporter.report(health).map_err(|error| {
+            tracing::warn!(
+                stage = "health_report",
+                ?error,
+                "current quote qualification failed"
+            );
+            SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth
+        })?;
+        let recording = self
             .registry
             .record_health_with_qualification(&self.session, update)
-            .map_err(|_error| SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth)?
-            != CurrentHealthRecording::Qualified
-        {
+            .map_err(|error| {
+                tracing::warn!(
+                    stage = "health_record",
+                    ?error,
+                    observed_at = observed_at.unix_nanos(),
+                    "current quote qualification failed"
+                );
+                SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth
+            })?;
+        if let CurrentHealthRecording::Unqualified(cause) = recording {
+            tracing::warn!(
+                stage = "health_record",
+                ?cause,
+                freshness_only = cause.is_freshness_only(),
+                "current quote health did not qualify data"
+            );
             return Err(SchwabRestQuoteCurrentUnavailable::AuthorityOrHealth);
         }
         Ok(())

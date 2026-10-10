@@ -17,10 +17,11 @@ use std::sync::{Arc, LazyLock, Mutex as StdMutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use market_squawk_adapter_schwab::{
-    AuthorizationRequest, CallbackOutcome, OAuthCallback, OAuthLoopbackBounds, OAuthLoopbackError,
-    OAuthLoopbackReceiver, OAuthLoopbackTlsAcceptor, ProtectedSchwabOAuthAuthority,
-    RequestAdmission, ReqwestSchwabOAuthWire, SchwabAccessTokenSource,
-    SchwabApplicationCredentialReplacement, SchwabApplicationCredentialReplacementBinding,
+    AccessTokenGeneration, AuthorizationRequest, CallbackOutcome, OAuthCallback,
+    OAuthLoopbackBounds, OAuthLoopbackError, OAuthLoopbackReceiver, OAuthLoopbackTlsAcceptor,
+    ProtectedSchwabOAuthAuthority, RequestAdmission, ReqwestSchwabOAuthWire,
+    SchwabAccessTokenSource, SchwabApplicationCredentialReplacement,
+    SchwabApplicationCredentialReplacementBinding, SchwabCredentialAuthorityBinding,
     SchwabOAuthAuthorityError, SchwabOAuthAuthorityReceipt, SchwabOAuthAuthorityStatus,
     SchwabOAuthInteraction, SchwabOAuthWire, SchwabOAuthWireBounds, TokenAuthorityError,
     TransientAccessToken,
@@ -1498,8 +1499,7 @@ impl SchwabOAuthMarketAuthority {
     /// The returned epoch retains the serialized token/publication barrier until the caller has
     /// sealed the response and crossed durable precommit. A refresh therefore cannot rotate the
     /// protected generation underneath an admitted response. If this acquisition did rotate the
-    /// token, the returned receipt exposes that exact generation so the account activation can
-    /// require a fresh doctor disposition before the request is dispatched.
+    /// token, the returned receipt binds that exact generation for dispatch and publication.
     pub(crate) async fn acquire_publication_attempt(
         &self,
     ) -> Result<(TransientAccessToken, SchwabOAuthPublicationEpoch), SchwabOAuthRuntimeError> {
@@ -1524,6 +1524,30 @@ impl SchwabOAuthMarketAuthority {
         };
         epoch.validate_current(receipt)?;
         Ok((token, epoch))
+    }
+
+    /// Holds publication authority for an already captured response without acquiring or
+    /// refreshing a bearer token. A rotated, expired or revoked capture remains inadmissible.
+    pub(crate) async fn acquire_captured_publication_attempt(
+        &self,
+        token_generation: AccessTokenGeneration,
+        credential_authority: SchwabCredentialAuthorityBinding,
+    ) -> Result<SchwabOAuthPublicationEpoch, SchwabOAuthRuntimeError> {
+        let barrier = self.currentness.acquire_attempt_barrier().await?;
+        let (receipt, generation_currentness) = self.reconciled_receipt().await?;
+        if receipt.generation() != token_generation
+            || receipt.credential_authority() != credential_authority
+        {
+            return Err(SchwabOAuthRuntimeError::MarketAuthorityRevoked);
+        }
+        let epoch = SchwabOAuthPublicationEpoch {
+            session_id: self.currentness.session_id,
+            receipt,
+            currentness: generation_currentness.child_token(),
+            _attempt_barrier: barrier,
+        };
+        epoch.validate_current(receipt)?;
+        Ok(epoch)
     }
 
     async fn reconciled_receipt(

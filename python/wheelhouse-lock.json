@@ -4043,8 +4043,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/market_runtime/schwab_streamer/publication.rs",
-      "sha256": "8f0569d69d52983fc57fa1adbd0b0a6f12d89db78dc1e83cbb01bc0f74b3641b",
-      "size_bytes": 23440
+      "sha256": "1f6c54d71f1724ed01986ea6c3d6edf3a5152c1c177f639c48280e18300f238a",
+      "size_bytes": 23513
     },
     {
       "path": "apps/market-squawk/src/application/market_selection/candidate.rs",
@@ -4658,8 +4658,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/research/ingest/provider_runtime.rs",
-      "sha256": "3d44ab8e43b66ffa67f74b89b3f6f0882c5b0eb6ccd2432a7c7be09cd2e07f91",
-      "size_bytes": 168815
+      "sha256": "c7373d01b116be0809a7d02ffd62956832af80d0c91cbd392a6744e6459efa87",
+      "size_bytes": 170554
     },
     {
       "path": "apps/market-squawk/src/application/research/ingest/schwab_instrument_reference.rs",
@@ -5243,13 +5243,13 @@
     },
     {
       "path": "apps/market-squawk/src/live_source/schwab_rest.rs",
-      "sha256": "b6d74a6d17b8ba3eb05993deb61f560f09512476ccd56d209c14cb85f2c60dfc",
-      "size_bytes": 48091
+      "sha256": "510a240e07ba6ab1ae534427306fd70644e19158f3a9096d6e771e5ea4494a1d",
+      "size_bytes": 50074
     },
     {
       "path": "apps/market-squawk/src/live_source/schwab_rest/streamer.rs",
-      "sha256": "2aecc87cf26c22be99f6f56124cfbc08992cd7cc6aa93376dc535c0ff57925f9",
-      "size_bytes": 20089
+      "sha256": "ebc3e8bf45e7c1731af64b5aa3df359ea202e5bd3fa956370e3fabf6f87afaa4",
+      "size_bytes": 20527
     },
     {
       "path": "apps/market-squawk/src/live_source/sink.rs",
@@ -5843,8 +5843,8 @@
     },
     {
       "path": "apps/market-squawk/src/provider_activation/schwab.rs",
-      "sha256": "4c89a827fa36fdfbce21d9189e08b3c29e03b96ba12955512f1ed4c7b4ae18cd",
-      "size_bytes": 44582
+      "sha256": "596a4091f5dd769e2907b197b3d28b53f22a39f3b8bad358cc6eb01544062ece",
+      "size_bytes": 45422
     },
     {
       "path": "apps/market-squawk/src/provider_activation/schwab_market_hours.rs",
@@ -5953,8 +5953,8 @@
     },
     {
       "path": "apps/market-squawk/src/provider_onboarding/schwab_oauth_runtime.rs",
-      "sha256": "9fdd43fb105b11e2297e5ee322982f86bc13e10ade92cf7e88102897c5242cea",
-      "size_bytes": 80551
+      "sha256": "813030a2e6523221810b84399704ea9a3cadf99265bd33e4c9df0c28e1c59b2a",
+      "size_bytes": 81654
     },
     {
       "path": "apps/market-squawk/src/provider_onboarding/service.rs",

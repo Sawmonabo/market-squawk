@@ -11,9 +11,9 @@ use std::{
 };
 
 use market_squawk_adapter_schwab::{
-    AccessTokenAdmission, ParseBounds, ProviderIdentifier, RequestAdmission, RestTransportBounds,
-    SchwabCredentialAuthorityBinding, SchwabOAuthAuthorityReceipt, SchwabTransportTelemetry,
-    TransientAccessToken,
+    AccessTokenAdmission, AccessTokenGeneration, ParseBounds, ProviderIdentifier, RequestAdmission,
+    RestTransportBounds, SchwabCredentialAuthorityBinding, SchwabOAuthAuthorityReceipt,
+    SchwabTransportTelemetry, TransientAccessToken,
 };
 use market_squawk_data::{
     DatasetId, ListingReferenceGenerationReceipt, ListingReferenceReadCapability,
@@ -390,6 +390,26 @@ impl SchwabMarketDataAccountActivation {
 
     pub async fn require_current(&self) -> Result<(), SchwabMarketDataActivationError> {
         self.current_oauth_receipt().await.map(|_| ())
+    }
+
+    /// Validates captured stream data under its original epoch without requesting a new token.
+    pub(crate) async fn acquire_captured_runtime_publication_attempt(
+        &self,
+        token_generation: AccessTokenGeneration,
+        credential_authority: SchwabCredentialAuthorityBinding,
+    ) -> Result<SchwabOAuthPublicationEpoch, SchwabMarketDataActivationError> {
+        self.runtime_currentness()
+            .acquire_publication_authority()
+            .await?;
+        let epoch = self
+            .oauth
+            .acquire_captured_publication_attempt(token_generation, credential_authority)
+            .await?;
+        self.validate_oauth_authorization(epoch.receipt())?;
+        self.runtime_currentness()
+            .acquire_publication_authority()
+            .await?;
+        Ok(epoch)
     }
 
     /// Acquires one exact token/publication attempt behind the serialized OAuth barrier.

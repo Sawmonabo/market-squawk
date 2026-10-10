@@ -1,11 +1,14 @@
 # Market Squawk Delivery Ledger
 
-## Current execution — 2026-10-09
+## Current execution — 2026-10-10
 
-Goal active; owner resumed after interruption. Previous turn made concrete source changes and
-proved the startup failure against retained state. Pushed HEAD is **18b9ff8f**; recovery and option-capacity corrections are implemented and
-critically verified. Native startup and all-nine retained market reads now verified; remaining failures below. Main/release unchanged.
-One primary worktree; local branches are feature, main, release/market-squawk-v0.1.0. No extra builds.
+Goal active and incomplete. Latest pushed source is **c5a4ede6**. The rejected unpublished inventory
+commit was replaced by **49f2f031**, proper endpoint/object schemas with personal ticker rows removed.
+Lead's captured-publication correction passed its genuine OAuth/bridge critical test1/1 and matching
+managed native build2992. SEC recovery survived restart; financial-page latency and full streaming
+remain unresolved. Current service7503/Desktop7575 are available; watcher30632 is stopped and no
+compiler runs. Exact ownership and verification appear below before the history divider.
+One primary worktree; feature/main/release remain the only local branches. Main/release unchanged.
 
 **Current outcome:** ordinary restart must open the workspace, and option acquisition must wait for
 shared provider capacity rather than turn contention into Network. Native5dd build49663 completed
@@ -126,6 +129,75 @@ Documentation indexes link the copy. CSV/JSON parsing,19,782-row readback, READM
 checks pass; exact configured credential-value/private-key/bearer scans found no matches. Original
 scratch remains intact and ignored. This documents the existing dated inventory, not new live
 provider or product acceptance. The native build continues independently without source changes.
+
+**Owner rejected the copied inventory as schema documentation.** Local docs commit27102ec9 is
+NOT pushed and is not accepted. The inventory's watchlist rows, repeated ticker applicability,
+consumer-status noise and flat field dumps do not meet the requested reusable API schema reference.
+Original local inventory remains evidence, not the documentation design. Lead will inspect the
+rewrite and replace the unpublished documentation checkpoint before pushing it.
+
+| Active owner | Exclusive writable scope | Outcome / check |
+| --- | --- | --- |
+| Sol High complete_asset_inventory (follow-up) | `docs/reference/provider-schemas/**` only; may remove copied dumps here, must preserve original `.agents/tmp/provider-schemas/**` | Rewrite proper provider/endpoint response-schema documentation: nested objects, exact paths/types, optional/null distinction only where proven, units/enums/times, REST envelopes/pagination/errors, separate streaming message dictionaries, sourced examples and honest unknowns. No personal watchlist/ticker lists, per-ticker duplication, or application-derived fields masquerading as upstream schemas. Trace real parsers/requests and official sources; no production edits, builds, Git, runtime/API/credential actions. Hand off concise coverage and unknowns; lead validates links/structure/evidence before commit. |
+| Lead | Shared doc indexes/ledger, native SEC recovery, all Git/build/runtime | Continue goal while docs agent works; keep current source frozen until native build completes. |
+
+Native SEC checkpoint c5a4ede6 build completed8m44s; managed replacement service93381/Desktop93454
+uses generation-a8gugY. Watcher30632 stopped again, no compiler remains. VS Code's queued same-repo
+cargo check87373 was cancelled (no unrelated session stopped). Existing native setup used the saved
+SEC contact configuration to create sessiona67ad100-5f4d-4dfc-a056-8bfaffb3f5b2 and activate it
+successfully; no password, OAuth reset or direct state edits. All4stock x4financial first-page
+native reads returned reported/32items, with read handles closed; this is neither complete pagination
+nor every metric present or rendered-screen proof. Logs `oct10-sec-native-{new-session,activation,financials}.json`.
+Live connection recovery verified; exact new-session restart still to verify during next native
+replacement. Schwab1191 reproduces current_qualification AuthorityOrHealth. The report
+`oct10-schwab-first-frame.md` confirms consumer-induced token refresh separately; exact startup
+health invariant remains hidden. Next lead-owned source slice: captured OAuth publication epoch
+in `provider_onboarding/schwab_oauth_runtime.rs`, account wrapper `provider_activation/schwab.rs`,
+consumer `application/market_runtime/schwab_streamer/publication.rs`; precise closed diagnostics
+in `live_source/schwab_rest.rs`/`schwab_rest/streamer.rs`; extend existing genuine OAuth/bridge
+fixture `application/research/ingest/provider_runtime.rs`. Preserve original receipt and actual
+disconnect/expiry/revocation. No provider-specific logic enters shared market readers.
+
+Schwab captured-publication correction implemented in the six owned files above. Source frozen;
+existing real OAuth/bridge critical fixture is compiling with one job in exec99846, log
+`oct10-stream-captured-critical.log`. It checks no consumer-induced refresh inside the early refresh
+window and rejection after real rotation, expiry and revocation. Exact native health failure still
+requires the newly added closed-enum diagnostics. Ordinal4 is the failing batch, not proof of first-frame
+failure. Current native16 first-page financial reads are reported; NVDA has31reported ratios and
+one missing-input net margin for2025-01-27..2026-01-25, filed2026-05-12. This is not waived as upstream absence.
+
+| Active owner | Exclusive writable scope | Outcome / check |
+| --- | --- | --- |
+| Astra High financial_read_cost (follow-up) | ONLY `.agents/tmp/v1-first-stock/oct10-nvda-ratio-input.md`; production read-only | Trace this exact missing denominator against retained safe source evidence, parser and ratio grouping. Identify real upstream absence versus alias/context/revision pairing defect. No credentials/API/state edits/build/Git/runtime actions. Document smallest correction and existing critical fixture. |
+| Lead | Six frozen Schwab files, shared docs indexes/ledger, integration/build/runtime | Complete current critical, inspect docs rewrite before amending unpublished27102ec9, then integrate source and obtain matching native diagnostics. |
+
+Provider schema coverage review found the prior inventory omitted macro, crypto and remaining reference providers. The owner's all-provider documentation request therefore needs these bounded supplements, without changing production or delaying source verification. Main docs agent now owns only its existing13Markdown files; these names are excluded from its ownership.
+
+| Active owner | Exclusive writable scope in `docs/reference/provider-schemas/` | Outcome/check |
+| --- | --- | --- |
+| Sol High schema_macro | `fred.md`, `bls.md`, `bea.md`, `federal-reserve.md`, `census.md`, `eia.md`, `treasury.md` only | Exact consumed response envelopes/fields/types/presence/units/clocks/pagination/errors, source and primary-doc references; no personal tickers or fabricated examples. Source/link/readback checks, no builds/Git/runtime/credentials. |
+| Sol High schema_crypto_reference | `coinbase.md`, `kraken.md`, `openfigi.md`, `iex-hist.md`, `tradier.md` only | Same contract quality for selected crypto/reference surfaces, including snapshot/delta semantics; state disabled/nonselected routes honestly. No other files or production/runtime/build/Git actions. |
+| Lead | README/coverage indexes after existing docs agent freezes; integration | Reconcile selected architecture matrix with all completed provider pages; require accurate definitions and no copied inventories before amending unpublished docs commit. |
+
+Schwab critical PASS1/1 (compile4m18s,test9.39s; `oct10-stream-captured-critical.log`, exec99846 terminal0). Shipping source closure refreshed/verified; diff check passed. No source changes after the critical run. Documentation rewrite remains under lead remediation review (ambiguous descriptions/object variants), so unpublished rejected inventory checkpoint is not pushed. Lead proceeds with one managed native replacement of the frozen source while documentation-only lanes finish; native evidence will be source-bound, not final exact-head release approval.
+
+NVDA investigation complete/released: authenticated retained proxy accession has40facts, no revenue; original annual filing has compatible revenue and reported55.6025% net margin on the same page. No calculation repair justified. Presentation defect: later incomplete report precedes annual report, with distinguishing filing dates hidden. Report `oct10-nvda-ratio-input.md` specifies minimal visible report dates and report-scoped missing copy; preferred annual summaries require full-period selection before pagination. Both source results must remain accessible. This is a pending UI issue, not a missing-source excuse or full financial-page acceptance.
+
+Managed native Cargo2992 is now the sole compiler under supervisor30620; watcher30632 stopped after dispatch to prevent duplicate builds. Source bytes match the passing critical check; a same-byte write triggered the watcher because metadata-only touch is ignored. Existing service93381/Desktop93454 remain available during compilation. No new target, workspace, sign-in or foreground automation.
+
+| Active owner | Exclusive writable scope | Next dependent outcome |
+| --- | --- | --- |
+| Astra High option_acquisition (follow-up) | ONLY existing `.agents/tmp/v1-first-stock/oct10-option-rejoin-identity.md` | During frozen native compilation, specify exact minimal persisted supersession transaction/API and caller changes for stale option-reference recovery, with original evidence unchanged and one pending successor. No production edits/build/Git/runtime/API or new state. Lead reserves schema/shared interfaces and implementation after current native diagnostic barrier. |
+
+Managed frozen native build2992 PASS5m52s; service7503/Desktop7575 at generation-0by4l1, workspace composition2265ms. Source diagnostics now prove Schwab1192 rejects health solely with CurrentHealthUnqualification bit1024=REPORTER_BUDGET (`oct9-single-quota-native.log:95212`). No stale clock/authorization bit. This confirms request-budget availability gates already-received stream data; exact transient budget reason is not logged. Captured-token critical remains passed, streaming still NOT live complete. Native SEC restart check next.
+
+| Active owner | Exclusive writable scope | Outcome / next dependency |
+| --- | --- | --- |
+| Astra High stream_first_frame (follow-up) | ONLY existing `.agents/tmp/v1-first-stock/oct10-schwab-first-frame.md` | Given verified1024reporter-budget failure, specify smallest provider-neutral correction separating new-request admission from established-stream/data qualification. Compare existing lease semantics versus removal of inappropriate budget coupling; retain account/session revocation, capture integrity and dispatch quotas. No production edits/build/Git/runtime/API; exact source/test seams for lead after current checkpoint integrates. |
+
+Native restart proof now passed for the same recovered SEC session: active_scoped/active after managed replacement, without another setup or credentials action (`oct10-sec-after-stream-build-restart.json`). Native NVDA ratios reopened32rows/reported, including the valid annual margin and separate incomplete proxy, in6005ms (`oct10-sec-restart-nvda-ratios.json`); handle closed. This is persistence/read proof, explicitly NOT instant-loading, complete financial UI or latency acceptance. Current stream failure remains REPORTER_BUDGET1024. Macro and crypto/reference schema agents are complete/frozen; lead validated all25schema pages and437local links with no missing paths/anchors or personal watchlist symbols. Main schema agent final validation and lead index integration remain before replacing unpublished docs commit.
+
+Schema checkpoint49f2f031 replaces the rejected unpublished copy; no scratch files are committed. All25Markdown pages reviewed,195tables and461local links/anchors checked, no personal symbols or configured credential/private-key matches. Lead independently confirmed13ignored originals unchanged by SHA256. Schema lanes released; upstream specification/example gaps remain explicit. Source checkpoint now ready: six Schwab files and closure preserve captured OAuth generation without consumer refresh, and identify precise qualification errors. Critical1/1 and matching native build passed; live budget failure1024 remains a separate next dependency. No source changes after these checks. Lead commits/pushes both coherent checkpoints and updates PR43 before starting the neutral budget/current-data repair. Options stale-reference recovery contract is complete; implementation follows shared-schema ownership assignment and the current integration barrier.
 
 ### Recent checkpoint history (superseded runtime/assignment states)
 

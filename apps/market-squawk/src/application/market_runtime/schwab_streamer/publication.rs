@@ -194,8 +194,7 @@ impl Consumer {
             return Err(ServiceError::InvalidResult);
         }
         *stage = "publication_authorization";
-        let (token, epoch) = tokio::select! {biased; ()=cancellation.cancelled()=>return Err(ServiceError::Cancelled), ()=tokio::time::sleep_until(deadline.into())=>return Err(ServiceError::DeadlineExceeded), value=self.activation.acquire_runtime_publication_attempt()=>value.map_err(|_|ServiceError::Unauthorized)?,};
-        drop(token);
+        let epoch = tokio::select! {biased; ()=cancellation.cancelled()=>return Err(ServiceError::Cancelled), ()=tokio::time::sleep_until(deadline.into())=>return Err(ServiceError::DeadlineExceeded), value=self.activation.acquire_captured_runtime_publication_attempt(sealed.streamer_receipt().token_generation(), sealed.streamer_receipt().credential_authority())=>value.map_err(|_|ServiceError::Unauthorized)?,};
         let oauth = epoch.receipt();
         if oauth.generation() != sealed.streamer_receipt().token_generation() {
             return Err(ServiceError::Unauthorized);
