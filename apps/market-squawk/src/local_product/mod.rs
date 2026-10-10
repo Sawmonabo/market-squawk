@@ -683,6 +683,7 @@ impl LocalProduct {
                         selected_workspace,
                         key,
                         Arc::clone(&authorization_subject_resolver),
+                        provider_rate.clone(),
                     )?;
                 }
                 if config.coinbase().is_some() {
@@ -690,6 +691,7 @@ impl LocalProduct {
                         selected_workspace,
                         COINBASE_LIVE_AUTHORITY_KEY,
                         Arc::clone(&authorization_subject_resolver),
+                        provider_rate.clone(),
                     )?;
                 }
                 if config.kraken().is_some() {
@@ -697,6 +699,7 @@ impl LocalProduct {
                         selected_workspace,
                         KRAKEN_LIVE_AUTHORITY_KEY,
                         Arc::clone(&authorization_subject_resolver),
+                        provider_rate.clone(),
                     )?;
                 }
                 if schwab_oauth_installation.is_some() {
@@ -704,6 +707,7 @@ impl LocalProduct {
                         selected_workspace,
                         SCHWAB_CURRENT_LIVE_AUTHORITY_KEY,
                         Arc::clone(&authorization_subject_resolver),
+                        provider_rate.clone(),
                     )?;
                 }
             }

@@ -2211,6 +2211,7 @@ fn map_adapter_error(error: AlpacaError) -> ExtractionSourceError {
 mod capture_tests {
     use std::error::Error;
     use std::num::{NonZeroU16, NonZeroU32, NonZeroU64};
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering as AtomicOrdering};
     use std::time::{Duration, Instant};
 
@@ -2227,6 +2228,7 @@ mod capture_tests {
     };
     use market_squawk_sources::{
         AuthorizationMode, BackoffPolicy, BudgetReservationDecision, BudgetScope,
+        BudgetUnavailableReason,
         PreparedProviderRateRegistrationBatch, ProviderBudgetPolicy,
         ProviderIdentitySelectionEvidence, ProviderNativeIdentityRequest, ProviderRateAuthority,
         ProviderRateDeclaration, ProviderRateDispatchDecision, ProviderRateGroupId,
@@ -2409,6 +2411,47 @@ mod capture_tests {
     #[derive(Debug, Default)]
     struct ReadyRateStore {
         dispatches: AtomicUsize,
+        state: Arc<Mutex<ReadyRateState>>,
+    }
+
+    // This fixture is the request authority, including the one shared concurrency slot and
+    // fixed window. Provider-backed budgets deliberately do not duplicate these counters.
+    #[derive(Debug, Default)]
+    struct ReadyRateState {
+        policy: Option<ProviderBudgetPolicy>,
+        window_end: Option<Timestamp>,
+        window_used: u32,
+        next_id: u128,
+        reservation: Option<ProviderRateReservationId>,
+        permit: Option<ProviderRatePermitId>,
+    }
+
+    impl ReadyRateState {
+        fn window_wait(&mut self, now: Timestamp) -> Result<Option<Timestamp>, ProviderRateStoreError> {
+            let policy = self
+                .policy
+                .as_ref()
+                .ok_or(ProviderRateStoreError::Corrupt)?;
+            if self.window_end.is_none_or(|end| now >= end) {
+                let nanos = i64::try_from(
+                    policy
+                        .window_nanos()
+                        .ok_or(ProviderRateStoreError::Corrupt)?,
+                )
+                .map_err(|_| ProviderRateStoreError::Clock)?;
+                self.window_end = Some(Timestamp::from_unix_nanos(
+                    now.unix_nanos()
+                        .checked_add(nanos)
+                        .ok_or(ProviderRateStoreError::Clock)?,
+                ));
+                self.window_used = 0;
+            }
+            Ok((self.window_used
+                >= policy
+                    .requests_per_window()
+                    .ok_or(ProviderRateStoreError::Corrupt)?)
+            .then_some(self.window_end.ok_or(ProviderRateStoreError::Corrupt)?))
+        }
     }
 
     impl ReadyRateStore {
@@ -2420,6 +2463,8 @@ mod capture_tests {
     #[derive(Debug)]
     struct ReadyPreparedRateBatch {
         registrations: Box<[ProviderRateRegistration]>,
+        state: Arc<Mutex<ReadyRateState>>,
+        policy: ProviderBudgetPolicy,
     }
 
     impl PreparedProviderRateRegistrationBatch for ReadyPreparedRateBatch {
@@ -2428,6 +2473,10 @@ mod capture_tests {
         }
 
         fn commit(self: Box<Self>) -> Result<(), ProviderRateStoreError> {
+            self.state
+                .lock()
+                .map_err(|_| ProviderRateStoreError::Unavailable)?
+                .policy = Some(self.policy);
             Ok(())
         }
     }
@@ -2442,8 +2491,13 @@ mod capture_tests {
             _run_id: ProviderRateRunId,
             declarations: &[ProviderRateDeclaration],
             _now: Timestamp,
-        ) -> Result<Box<dyn PreparedProviderRateRegistrationBatch>, ProviderRateStoreError>
-        {
+        ) -> Result<Box<dyn PreparedProviderRateRegistrationBatch>, ProviderRateStoreError> {
+            let [declaration] = declarations else {
+                return Err(ProviderRateStoreError::Conflict);
+            };
+            if declaration.policy().max_concurrent() != 1 || declaration.policy().window_count() != 1 {
+                return Err(ProviderRateStoreError::Conflict);
+            }
             let registrations = declarations
                 .iter()
                 .map(|declaration| {
@@ -2455,39 +2509,79 @@ mod capture_tests {
                 })
                 .collect::<Vec<_>>()
                 .into_boxed_slice();
-            Ok(Box::new(ReadyPreparedRateBatch { registrations }))
+            Ok(Box::new(ReadyPreparedRateBatch {
+                registrations,
+                state: Arc::clone(&self.state),
+                policy: declaration.policy().clone(),
+            }))
         }
 
         fn try_reserve(
             &self,
             _run_id: ProviderRateRunId,
             _registration: ProviderRateRegistration,
-            _now: Timestamp,
+            now: Timestamp,
         ) -> Result<ProviderRateReservationDecision, ProviderRateStoreError> {
-            Ok(ProviderRateReservationDecision::Ready(
-                ProviderRateReservationId::from_bytes([3; 16]),
-            ))
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ProviderRateStoreError::Unavailable)?;
+            if let Some(until) = state.window_wait(now)? {
+                return Ok(ProviderRateReservationDecision::WaitUntil(until));
+            }
+            if state.reservation.is_some() || state.permit.is_some() {
+                return Ok(ProviderRateReservationDecision::Unavailable(
+                    BudgetUnavailableReason::ConcurrencyExhausted,
+                ));
+            }
+            state.next_id = state
+                .next_id
+                .checked_add(1)
+                .ok_or(ProviderRateStoreError::Corrupt)?;
+            let reservation = ProviderRateReservationId::from_bytes(state.next_id.to_be_bytes());
+            state.reservation = Some(reservation);
+            Ok(ProviderRateReservationDecision::Ready(reservation))
         }
 
         fn commit_dispatch(
             &self,
             _run_id: ProviderRateRunId,
             _registration: ProviderRateRegistration,
-            _reservation_id: ProviderRateReservationId,
-            _now: Timestamp,
+            reservation_id: ProviderRateReservationId,
+            now: Timestamp,
         ) -> Result<ProviderRateDispatchDecision, ProviderRateStoreError> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ProviderRateStoreError::Unavailable)?;
+            if state.reservation != Some(reservation_id) || state.permit.is_some() {
+                return Err(ProviderRateStoreError::Corrupt);
+            }
+            state.reservation = None;
+            if let Some(until) = state.window_wait(now)? {
+                return Ok(ProviderRateDispatchDecision::WaitUntil(until));
+            }
+            state.window_used += 1;
+            let permit = ProviderRatePermitId::from_bytes(state.next_id.to_be_bytes());
+            state.permit = Some(permit);
             self.dispatches.fetch_add(1, AtomicOrdering::SeqCst);
-            Ok(ProviderRateDispatchDecision::Ready(
-                ProviderRatePermitId::from_bytes([4; 16]),
-            ))
+            Ok(ProviderRateDispatchDecision::Ready(permit))
         }
 
         fn cancel_reservation(
             &self,
             _run_id: ProviderRateRunId,
             _registration: ProviderRateRegistration,
-            _reservation_id: ProviderRateReservationId,
+            reservation_id: ProviderRateReservationId,
         ) -> Result<(), ProviderRateStoreError> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ProviderRateStoreError::Unavailable)?;
+            if state.reservation != Some(reservation_id) {
+                return Err(ProviderRateStoreError::Corrupt);
+            }
+            state.reservation = None;
             Ok(())
         }
 
@@ -2495,8 +2589,16 @@ mod capture_tests {
             &self,
             _run_id: ProviderRateRunId,
             _registration: ProviderRateRegistration,
-            _permit_id: ProviderRatePermitId,
+            permit_id: ProviderRatePermitId,
         ) -> Result<(), ProviderRateStoreError> {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|_| ProviderRateStoreError::Unavailable)?;
+            if state.permit != Some(permit_id) {
+                return Err(ProviderRateStoreError::Corrupt);
+            }
+            state.permit = None;
             Ok(())
         }
 
@@ -2642,8 +2744,7 @@ mod capture_tests {
         let transport_dispatches = AtomicUsize::new(0);
         let blocked = async {
             let reservation = acquire_preflight_budget(&budget, deadline, &cancellation).await?;
-            let permit =
-                commit_preflight_budget(reservation, &budget, deadline, &cancellation).await?;
+            let permit = commit_preflight_budget(reservation, &budget, deadline, &cancellation).await?;
             transport_dispatches.fetch_add(1, AtomicOrdering::SeqCst);
             permit.release();
             Ok::<_, AlpacaError>(())
@@ -2667,6 +2768,79 @@ mod capture_tests {
         assert_eq!(store.dispatches(), 1);
         let reservation = acquire_preflight_budget(&budget, deadline, &cancellation).await?;
         let permit = commit_preflight_budget(reservation, &budget, deadline, &cancellation).await?;
+        assert_eq!(store.dispatches(), 2);
+        permit.release();
+
+        // Options share the historical transport's one durable slot. Waiting is not dispatch,
+        // releasing the first permit admits exactly one option request, and release does not
+        // restore an already charged request-window unit.
+        let store = Arc::new(ReadyRateStore::default());
+        let budget = request_budget(store.clone(), NonZeroU32::new(2).ok_or("request count")?)?;
+        let cancellation = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let held = acquire_preflight_budget(&budget, deadline, &cancellation).await?;
+        let held = commit_preflight_budget(held, &budget, deadline, &cancellation).await?;
+        let option = crate::option_chain::acquire_budget(&budget, deadline, &cancellation);
+        tokio::pin!(option);
+        assert!(futures_util::poll!(&mut option).is_pending());
+        assert_eq!(store.dispatches(), 1);
+        held.release();
+        let reservation = option.await?;
+        assert_eq!(store.dispatches(), 1);
+        let permit =
+            crate::option_chain::commit_budget(reservation, &budget, deadline, &cancellation).await?;
+        assert_eq!(store.dispatches(), 2);
+        permit.release();
+        assert!(matches!(
+            budget.try_reserve_request(),
+            BudgetReservationDecision::WaitUntil(_)
+        ));
+        assert!(matches!(
+            crate::option_chain::acquire_budget(&budget, deadline, &cancellation).await,
+            Err(AlpacaError::DeadlineExceeded),
+        ));
+        assert_eq!(store.dispatches(), 2);
+
+        let store = Arc::new(ReadyRateStore::default());
+        let budget = request_budget(store.clone(), NonZeroU32::new(2).ok_or("request count")?)?;
+        let cancellation = CancellationToken::new();
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let held = acquire_preflight_budget(&budget, deadline, &cancellation).await?;
+        let held = commit_preflight_budget(held, &budget, deadline, &cancellation).await?;
+        let option = crate::option_chain::acquire_budget(&budget, deadline, &cancellation);
+        tokio::pin!(option);
+        assert!(futures_util::poll!(&mut option).is_pending());
+        cancellation.cancel();
+        assert!(matches!(option.await, Err(AlpacaError::Cancelled)));
+        assert_eq!(store.dispatches(), 1);
+
+        let cancellation = CancellationToken::new();
+        let wait_deadline = Instant::now() + Duration::from_millis(20);
+        let option = crate::option_chain::acquire_budget(&budget, wait_deadline, &cancellation);
+        tokio::pin!(option);
+        assert!(futures_util::poll!(&mut option).is_pending());
+        assert!(matches!(option.await, Err(AlpacaError::DeadlineExceeded)));
+        assert_eq!(store.dispatches(), 1);
+        held.release();
+
+        // Cancellation/expiry after reservation must release that slot without charging it.
+        let reservation = crate::option_chain::acquire_budget(&budget, deadline, &cancellation).await?;
+        cancellation.cancel();
+        assert!(matches!(
+            crate::option_chain::commit_budget(reservation, &budget, deadline, &cancellation).await,
+            Err(AlpacaError::Cancelled),
+        ));
+        let cancellation = CancellationToken::new();
+        let reservation = crate::option_chain::acquire_budget(&budget, deadline, &cancellation).await?;
+        assert!(matches!(
+            crate::option_chain::commit_budget(reservation, &budget, Instant::now(), &cancellation)
+                .await,
+            Err(AlpacaError::DeadlineExceeded),
+        ));
+        assert_eq!(store.dispatches(), 1);
+        let reservation = crate::option_chain::acquire_budget(&budget, deadline, &cancellation).await?;
+        let permit =
+            crate::option_chain::commit_budget(reservation, &budget, deadline, &cancellation).await?;
         assert_eq!(store.dispatches(), 2);
         permit.release();
         Ok(())

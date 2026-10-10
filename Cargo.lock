@@ -4613,6 +4613,7 @@ dependencies = [
  "tokio",
  "tokio-tungstenite",
  "tokio-util",
+ "tracing",
  "url",
  "uuid",
  "zeroize",

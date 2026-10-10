@@ -2,22 +2,109 @@
 
 ## Current execution — 2026-10-09
 
-Current pushed base **5a53cbd8**. Integration candidate fixes retained market horizon query order
-and Schwab REST publication-admission clock ordering. Data publication/current selection/restart
-critical1/1 PASS (53.14s compile,12.03s test); application real-bridge quote publication and revoked
-OAuth epoch critical1/1 PASS (5m24s compile,9.63s test). Source closure refresh/verify and diff checks
-pass; only source identities changed in the lock. No schema, credentials or financial clocks changed.
-Lead inspected affected consumers. Commit/push this candidate, then let the existing supervisor
-build once and verify its matching native generation before claiming the timeout/publication fixed.
+Goal active; owner resumed after interruption. Previous turn made concrete source changes and
+proved the startup failure against retained state. Pushed HEAD remains **5ddad586**; current recovery
+and option-capacity changes are implemented and critically verified; integration commit follows,
+matching native verification remains pending. Main/release unchanged.
+One primary worktree; local branches are feature, main, release/market-squawk-v0.1.0. No extra builds.
+
+**Current outcome:** ordinary restart must open the workspace, and option acquisition must wait for
+shared provider capacity rather than turn contention into Network. Native5dd build49663 completed
+6m54s; service53464 failed startup with `registry authority state is invalid`; native53509 remains.
+Exact cause: startup reconciliation passed no shared rate authority for valid Alpaca1policy/0local
+checkpoint and Schwab1/0 registries. Retained envelope digests and SQLite associations verified.
+Lead corrected the existing constructor plus its four application callers. Strict local-only
+validation stays intact; no reset, migration, credential changes or quota/history rewrites.
+
+| Active owner | Exact files / outcome | Check and next dependency |
+| --- | --- | --- |
+| Lead | Source `registry/catalog/construction.rs`; app `local_product/mod.rs`, `provider_rate.rs`; Alpaca Cargo manifest, Cargo.lock, source closure, ledger; all Git/build/runtime | New essential real-SQLite startup regression covers missing local checkpoints, repeated reconciliation, preserved quota/state and exact reopen. App critical1/1 PASS (6m26s compile,0.29s test); compiler61377/exec98161 terminal0. Watcher30632 stopped; supervisor30620 retained. |
+| Astra option_capacity — handed off, frozen | Alpaca `src/option_chain.rs`, `historical_calendar.rs`, existing `historical.rs` fixture | Existing shared waiting reused; safe closed diagnostics added; authoritative fixture accounting repaired. Existing historical capture checks **5/5 PASS** (18.33s compile,0.11s test; oct10-option-capacity-critical.log). Exact earlier native Network cause remains unproven until normal recovery on matching build. |
+| Sol complete_asset_inventory | `.agents/tmp/provider-schemas/{alpaca,sec-company,market-squawk-derived,nasdaq,tiingo,occ,cboe}.csv` as applicable, `inventory.csv`, `README.md` | Complete owner-requested table: provider, exact path, type, actual example or explicit unrequested/absent/unverified status, asset applicability and consumer wiring. Integrates specialists; delivery independent of app build. |
+| Sol inventory_schwab — finishing | `.agents/tmp/provider-schemas/schwab.json` | 647 source field rows; five actual Instruments examples, remaining support/receipt status explicit. Coordinator verifies and integrates. |
+| Sol inventory_yahoo — complete | `.agents/tmp/provider-schemas/{yahoo,sec-funds,fund-nav}.json` | 270/203/63 rows, canonical contracts separated from provider payload; no invented values. |
+
+Source-closure verification and diff check pass; dependency lock adds only already-present tracing
+to Alpaca and Python lock changes only source identities. Lead next: commit/push coherent
+recovery+option correction and update PR43. Then let existing single managed
+watcher build matching native once; verify startup, all-nine affected market reads and normal saved
+workflow recovery. Source edits remain frozen during compilation. No final installed acceptance.
+
+**Other concrete dependencies remain:** SEC source descriptor concurrency1 versus operational2
+must be separated through allocation and normal blocked-session recovery (`oct9-sec-recovery-budget.md`);
+Schwab Streamer self-refresh; all-source summary/financial/fund producers through neutral selectors
+and UI; complete stock analysis/Brief, Find/portfolio/paper, all screens and final installed gates.
+No capability/provider dropped; whole-app RAM measurement remains deferred until workflows complete.
+
+**Evidence:** `oct9-registry-startup.md` proves the startup invariant; `oct9-option-acquisition.md`
+records capacity bug and diagnostic limits. Native5a all9 detail and16stockfinancial first pages
+returned; handles closed, not full pagination/rendered coverage. Direct Alpaca all9 snapshots and
+one indicative MSFT option page HTTP200; complete schema inventory explicitly exceeds those samples.
+Managed launcher already removed the superseded generation; only active generation-0KjxPr remains
+under session-l9OANi (~1.44GB). Recovery/catalog and current compiler outputs preserved.
+
+### Recent checkpoint history (superseded runtime/assignment states)
+
+
+Owner inventory destination correction: `.agents/tmp/provider-schemas/` is the dedicated output.
+Sol High inventory_schwab owns `schwab.json`; inventory_yahoo owns `yahoo.json`, `sec-funds.json`
+and `fund-nav.json`; complete_asset_inventory owns `alpaca.csv`, `sec-company.csv`,
+`market-squawk-derived.csv`, `nasdaq.csv`, `tiingo.csv`, applicable `occ.csv`/`cboe.csv`, `inventory.csv`, `README.md` in that directory and integrates specialist
+files read-only. Each provider has a separate file; cross-provider inventory indexes them.
+These supersede earlier inventory output ownership paths only; other implementation lanes unchanged.
+
+Matching5dd native build49663 finished6m54s; service53464 failed startup `registry authority state is invalid`.
+Watcher30632 stopped; no compiler remains. This is a native failure, not verification acceptance.
+Astra High registry_startup diagnosis complete: Alpaca1policy/0localgroups and Schwab1/0
+are valid shared-rate states; startup erroneously passedNone. Lead owns correction in source
+`registry/catalog/construction.rs`, app `local_product/mod.rs`, and essential real-SQLite recovery
+regression in app `provider_rate.rs`. Existing strict local-only validation remains unchanged.
+Astra High registry_startup read-only owns ONLY `oct9-registry-startup.md` in existing scratch:
+trace exact invalid authority validation against retained catalog/control state, no mutation/provider
+calls/runtime/build/Git. Lead owns runtime recovery/shared source interfaces and all integration.
+Astra High option_capacity implements ONLY Alpaca src/option_chain.rs, historical_calendar.rs,
+historical.rs existing tests: reuse request admission waiting/cancellation, safe closed diagnostics,
+repair existing fake authoritative quota fixture and extend current critical for options. Lead owns
+Cargo.toml/Cargo.lock/source closure. No child builds/Git/runtime or edits outside assigned files.
+SEC implementation remains serialized behind this fresh startup diagnosis to avoid overlapping fixes.
+
+Owner-requested complete asset-field inventory (read-only while native build49663 continues):
+previous CSV519 rows omitted supported-but-not-yet-verified fields and is incomplete for the request.
+Sol High complete_asset_inventory owns combined `oct9-complete-asset-field-inventory.csv` and `.md`; lead supplies already captured safe provider examples. Sol High inventory_schwab owns ONLY
+`.agents/tmp/v1-first-stock/oct9-schwab-field-inventory.json`; Sol High inventory_yahoo owns ONLY
+`.agents/tmp/v1-first-stock/oct9-yahoo-field-inventory.json`. Enumerate exact API paths/types for all
+asset-page-relevant quote/fundamental/profile/dividend/action/fund/option fields from adapter parsing,
+including missing consumers, with source-file evidence; no credentials/API/build/Git/runtime/source
+edits. Required output includes every supported field, actual samples are lead-verified separately.
+The full CSV must retain unrequested/absent fields instead of silently omitting them. Critical check:
+coverage of the quoted seven inventory families and actual source payload paths; no fabricated values.
+Option diagnosis completed: capacity exhaustion maps to Network; exact native failing edge remains
+unproven. Report oct9-option-acquisition.md retained; implementation awaits compiler/source boundary.
+
+Current pushed checkpoint **5ddad586** fixes retained market horizon query order and Schwab REST
+publication-admission clock ordering. Data publication/current-selection/restart critical1/1 PASS
+(53.14s compile,12.03s test); application real-bridge quote publication and revoked OAuth epoch
+critical1/1 PASS (5m24s compile,9.63s test). Source closure verifies; only source identities changed
+in lock. PR43 comment6091291107 records evidence and gaps. Source writers are released/frozen.
+Existing supervisor30620/watcher30632 owns matching one-job native build **49663**; no duplicate
+compiler. Watchexec had no queued rebuild after resume; one unchanged-content save delivered the
+required normal watcher event. Current runtime43557/43594 stays available during compilation.
+Next: observe49663, then native collection/details and quote publication on its replacement generation.
 Full V1 remains active/incomplete; previous turn produced implementation and direct/native evidence.
 
 | Current owner | Outcome and exact scope | Verification / next dependency |
 | --- | --- | --- |
-| Lead | Integration, matching native verification, shared contracts/schema/composition and Git/build scheduling | Both critical checks PASS. Supervisor30620/watcher30632 retained; watcher stopped for frozen checks. Current runtime43557/43594 is5a53cbd8, not the candidate. |
+| Lead | Integration, matching native verification, shared contracts/schema/composition and Git/build scheduling | Pushed5ddad586; matching native build49663 active. Current runtime43557/43594 is5a53cbd8. All native checks and build scheduling lead-owned. |
 | Astra High market_read_timeout | Completed; source frozen in `data/src/manifest/catalog.rs` | JOIN ordering correction; same horizon in read-only probe2214ms→<1ms. Bundled critical passes, native latency still unproven. Report `oct9-market-read-timeout.md`. |
 | Astra High stream_publication_time | Completed; source frozen in app `market_runtime/schwab_sink.rs` and existing `research/ingest/provider_runtime.rs` fixture | Admission clock sampled after qualification; original source/receive clocks preserved. Positive real bridge plus revoke/refresh fixture passes. Streamer OAuth self-refresh defect remains separate. |
 | Astra High financial_read_cost | Read-only SEC recovery diagnosis complete | Saved metadata1/current2 concurrency changes activation/runtime identity. Report `oct9-sec-recovery-budget.md` identifies operational-policy separation and existing blocked-session recovery; no state edits. |
 | Sol High investment_metric_mapping | Read-only source-to-screen audit complete | Report `oct9-investment-metric-mapping.md` maps all9 symbols and applicable fields; request/normalization/selector/UI gaps explicit. No all-source direct coverage claim. |
+
+Next independent diagnosis during build: Astra High `option_acquisition`, read-only source and
+bounded quota-state investigation; write ONLY `.agents/tmp/v1-first-stock/oct9-option-acquisition.md`.
+Outcome: classify current chain.acquire Network failure against direct HTTP200 (acceptance1/2),
+identify exact producer/consumer correction and smallest existing critical check. No provider calls,
+secrets, tests, Git, process controls or source edits; lead owns all shared runtime/configuration.
 
 Native5a evidence: `oct9-financial-reopen-native-{status,collection,connections,all-nine,summary}.json`.
 Nine details and all16 stock first financial pages returned successfully; all16 read handles closed.

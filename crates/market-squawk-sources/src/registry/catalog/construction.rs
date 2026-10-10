@@ -208,6 +208,7 @@ impl AuthoritativeSourceRegistry {
         selected_workspace: &market_squawk_platform::InstalledServiceSelectedWorkspaceGuard,
         source_key: &str,
         resolver: Arc<dyn crate::AuthorizationSubjectResolver>,
+        provider_rate: crate::ProviderRateAuthority,
     ) -> Result<(), RegistryError> {
         if !is_safe_live_authority_key(source_key) {
             return Err(RegistryError::AuthorityPersistence);
@@ -225,7 +226,7 @@ impl AuthoritativeSourceRegistry {
             store,
             resolver,
             Arc::new(SystemRawRegistryClock::try_new()?),
-            None,
+            Some(provider_rate),
             UncleanPredecessorPolicy::RecoverStructurallyValidExclusiveInstalledReplacement,
         )?;
         registry.shutdown()

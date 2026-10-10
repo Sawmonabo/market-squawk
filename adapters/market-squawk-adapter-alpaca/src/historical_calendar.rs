@@ -464,6 +464,7 @@ pub(crate) async fn authenticated_bounded_get_with_completion<T>(
     cancellation: &CancellationToken,
     complete: impl FnOnce(u16, HeaderMap, Box<[u8]>) -> T,
 ) -> Result<T, AlpacaError> {
+    let started = Instant::now();
     if cancellation.is_cancelled() {
         return Err(AlpacaError::Cancelled);
     }
@@ -482,7 +483,9 @@ pub(crate) async fn authenticated_bounded_get_with_completion<T>(
         () = cancellation.cancelled() => return Err(AlpacaError::Cancelled),
         result = tokio::time::timeout(total_timeout, operation.send()) => match result {
             Ok(Ok(response)) => response,
-            Ok(Err(_error)) => return Err(AlpacaError::Network),
+            Ok(Err(error)) => {
+                return Err(http_network_error("http.send", &error, None, started));
+            }
             Err(_elapsed) => return Err(AlpacaError::DeadlineExceeded),
         },
     };
@@ -525,7 +528,9 @@ pub(crate) async fn authenticated_bounded_get_with_completion<T>(
             },
         };
         let Some(chunk) = next else { break };
-        let chunk = chunk.map_err(|_| AlpacaError::Network)?;
+        let chunk = chunk.map_err(|error| {
+            http_network_error("http.body", &error, Some(status), started)
+        })?;
         let next_length = body
             .len()
             .checked_add(chunk.len())
@@ -538,6 +543,27 @@ pub(crate) async fn authenticated_bounded_get_with_completion<T>(
         body.extend_from_slice(&chunk);
     }
     Ok(complete(status, headers, body.into_boxed_slice()))
+}
+
+fn http_network_error(
+    stage: &'static str,
+    error: &reqwest::Error,
+    status: Option<u16>,
+    started: Instant,
+) -> AlpacaError {
+    // Never format the reqwest error: its URL and nested causes can contain secrets.
+    tracing::warn!(
+        stage,
+        http_status = status,
+        timeout = error.is_timeout(),
+        connect = error.is_connect(),
+        request = error.is_request(),
+        body = error.is_body(),
+        decode = error.is_decode(),
+        elapsed_ms = started.elapsed().as_millis(),
+        "Alpaca HTTP request failed"
+    );
+    AlpacaError::Network
 }
 
 fn calendar_request_identity(
@@ -578,10 +604,24 @@ fn hash_request_field(digest: &mut Sha256, value: &str) -> Result<(), AlpacaErro
 fn system_timestamp() -> Result<Timestamp, AlpacaError> {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map_err(|_| AlpacaError::Network)?
+        .map_err(|_| {
+            tracing::warn!(
+                stage = "response.clock",
+                reason = "pre_epoch",
+                "Alpaca response clock unavailable"
+            );
+            AlpacaError::Network
+        })?
         .as_nanos();
     Ok(Timestamp::from_unix_nanos(
-        i64::try_from(nanos).map_err(|_| AlpacaError::Network)?,
+        i64::try_from(nanos).map_err(|_| {
+            tracing::warn!(
+                stage = "response.clock",
+                reason = "overflow",
+                "Alpaca response clock unavailable"
+            );
+            AlpacaError::Network
+        })?,
     ))
 }
 

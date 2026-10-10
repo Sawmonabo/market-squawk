@@ -21,7 +21,7 @@ use market_squawk_domain::{
 };
 use market_squawk_platform::RawCaptureRecord;
 use market_squawk_sources::{
-    BudgetDecision, BudgetDispatchDecision, BudgetReservation, BudgetReservationDecision,
+    BudgetDecision, BudgetReservation, BudgetUnavailableReason,
     OptionMarketBatchDisposition, OptionMarketCompleteness, OptionMarketCompletenessInput,
     OptionMarketCursorState, OptionMarketRequestFilter, OptionMarketRequestScope,
     OptionMarketRequestScopeInput, ProviderCaptureMaterial, ProviderCapturePageReceipt,
@@ -217,6 +217,11 @@ impl AlpacaOptionChainClient {
     /// Acquires all chain pages until the provider omits `next_page_token`.
     ///
     /// The returned continuation owns the only parsed copy and the one-use capture expectation.
+    #[tracing::instrument(
+        name = "alpaca.option_chain",
+        skip_all,
+        fields(page_ordinal = tracing::field::Empty, attempt = tracing::field::Empty)
+    )]
     pub async fn acquire_complete_chain<Retain, Retained>(
         &self,
         credentials: &AlpacaCredentials,
@@ -231,6 +236,7 @@ impl AlpacaOptionChainClient {
         Retain: FnMut(ProviderCaptureSealRequest) -> Retained,
         Retained: std::future::Future<Output = Result<(), AlpacaError>>,
     {
+        let started = Instant::now();
         if reference_request.underlying_symbol() != underlying.symbol() {
             return Err(AlpacaError::InvalidCoverage);
         }
@@ -253,11 +259,13 @@ impl AlpacaOptionChainClient {
             }
             ensure_active(deadline, cancellation)?;
             let ordinal = u16::try_from(pages.len()).map_err(|_| AlpacaError::Protocol)?;
+            tracing::Span::current().record("page_ordinal", ordinal);
             let url = chain_url(underlying.symbol(), reference_request, token.as_deref())?;
             metadata.network_policy().authorize(url.as_str())?;
             let mut attempts = 0_u8;
             let response = loop {
                 attempts = attempts.checked_add(1).ok_or(AlpacaError::Protocol)?;
+                tracing::Span::current().record("attempt", attempts);
                 let reservation = acquire_budget(budget, deadline, cancellation).await?;
                 let permit = commit_budget(reservation, budget, deadline, cancellation).await?;
                 let response = authenticated_bounded_get(
@@ -278,7 +286,15 @@ impl AlpacaOptionChainClient {
                     if attempts == MAX_PAGE_ATTEMPTS {
                         return Err(AlpacaError::OptionChainHttpStatus(response.status));
                     }
-                    wait_for_budget_decision(budget, decision, deadline, cancellation).await?;
+                    wait_for_budget_decision(
+                        budget,
+                        decision,
+                        response.status,
+                        started,
+                        deadline,
+                        cancellation,
+                    )
+                    .await?;
                     continue;
                 }
                 if response.status != 200 {
@@ -297,7 +313,9 @@ impl AlpacaOptionChainClient {
             if !json_content_type(&response.headers)? {
                 return Err(AlpacaError::Protocol);
             }
-            budget.record_success().map_err(|_| AlpacaError::Network)?;
+            budget.record_success().map_err(|reason| {
+                budget_network_error("budget.record_success", reason, started)
+            })?;
             if !metadata.is_effective_at(response.received_at) {
                 return Err(AlpacaError::InvalidAuthorization);
             }
@@ -1333,38 +1351,50 @@ fn page_request_identity(
     ))
 }
 
-async fn acquire_budget(
+pub(crate) async fn acquire_budget(
     budget: &SharedProviderBudget,
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<BudgetReservation, AlpacaError> {
+    let started = Instant::now();
     loop {
-        ensure_active(deadline, cancellation)?;
-        match budget.try_reserve_request() {
-            BudgetReservationDecision::Ready(reservation) => return Ok(reservation),
-            BudgetReservationDecision::WaitUntil(wait_until) => {
+        match crate::budget::reserve_request(budget, deadline, cancellation).await {
+            Ok(reservation) => return Ok(reservation),
+            Err(crate::budget::AdmissionError::WaitUntil(wait_until)) => {
                 wait_for_budget(budget, wait_until, deadline, cancellation).await?;
             }
-            BudgetReservationDecision::Unavailable(_) => return Err(AlpacaError::Network),
+            Err(crate::budget::AdmissionError::Cancelled) => return Err(AlpacaError::Cancelled),
+            Err(crate::budget::AdmissionError::DeadlineExceeded) => {
+                return Err(AlpacaError::DeadlineExceeded);
+            }
+            Err(crate::budget::AdmissionError::Unavailable(reason)) => {
+                return Err(budget_network_error("budget.reserve", reason, started));
+            }
         }
     }
 }
 
-async fn commit_budget(
+pub(crate) async fn commit_budget(
     mut reservation: BudgetReservation,
     budget: &SharedProviderBudget,
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<market_squawk_sources::BudgetPermit, AlpacaError> {
+    let started = Instant::now();
     loop {
-        ensure_active(deadline, cancellation)?;
-        match reservation.commit_dispatch() {
-            BudgetDispatchDecision::Ready(permit) => return Ok(permit),
-            BudgetDispatchDecision::WaitUntil(wait_until) => {
+        match crate::budget::commit_request(reservation, budget, deadline, cancellation).await {
+            Ok(permit) => return Ok(permit),
+            Err(crate::budget::AdmissionError::WaitUntil(wait_until)) => {
                 wait_for_budget(budget, wait_until, deadline, cancellation).await?;
                 reservation = acquire_budget(budget, deadline, cancellation).await?;
             }
-            BudgetDispatchDecision::Unavailable(_) => return Err(AlpacaError::Network),
+            Err(crate::budget::AdmissionError::Cancelled) => return Err(AlpacaError::Cancelled),
+            Err(crate::budget::AdmissionError::DeadlineExceeded) => {
+                return Err(AlpacaError::DeadlineExceeded);
+            }
+            Err(crate::budget::AdmissionError::Unavailable(reason)) => {
+                return Err(budget_network_error("budget.dispatch", reason, started));
+            }
         }
     }
 }
@@ -1375,9 +1405,10 @@ async fn wait_for_budget(
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<(), AlpacaError> {
+    let started = Instant::now();
     let wait = budget
         .remaining_wait(wait_until)
-        .map_err(|_| AlpacaError::Network)?;
+        .map_err(|reason| budget_network_error("budget.remaining_wait", reason, started))?;
     if wait
         > deadline
             .checked_duration_since(Instant::now())
@@ -1395,6 +1426,8 @@ async fn wait_for_budget(
 async fn wait_for_budget_decision(
     budget: &SharedProviderBudget,
     decision: BudgetDecision,
+    status: u16,
+    started: Instant,
     deadline: Instant,
     cancellation: &CancellationToken,
 ) -> Result<(), AlpacaError> {
@@ -1406,8 +1439,32 @@ async fn wait_for_budget_decision(
             permit.release();
             Err(AlpacaError::Protocol)
         }
-        BudgetDecision::Unavailable(_) => Err(AlpacaError::Network),
+        BudgetDecision::Unavailable(reason) => {
+            tracing::warn!(
+                stage = "budget.retry_after",
+                reason = ?reason,
+                http_status = status,
+                elapsed_ms = started.elapsed().as_millis(),
+                "Alpaca option retry budget unavailable"
+            );
+            Err(AlpacaError::Network)
+        }
     }
+}
+
+fn budget_network_error(
+    stage: &'static str,
+    reason: BudgetUnavailableReason,
+    started: Instant,
+) -> AlpacaError {
+    // BudgetUnavailableReason is a closed, fieldless enum; no provider text is logged.
+    tracing::warn!(
+        stage,
+        reason = ?reason,
+        elapsed_ms = started.elapsed().as_millis(),
+        "Alpaca option budget unavailable"
+    );
+    AlpacaError::Network
 }
 
 fn ensure_active(deadline: Instant, cancellation: &CancellationToken) -> Result<(), AlpacaError> {
