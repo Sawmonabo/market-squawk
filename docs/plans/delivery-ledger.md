@@ -100,6 +100,33 @@ remains18b9. Lead refreshes source closure, commits/pushes this coherent correct
 the existing managed watcher for one native replacement. Blocked live SEC-session recovery still
 requires its normal lifecycle path; no direct state/credential edits or live-completion claim.
 
+Pushed **c5a4ede6**; PR43 evidence comment6091758785. Source closure refresh/verification and
+diff check passed; no source changes after critical checks. Existing watcher30632 resumed under
+supervisor30620 and scheduled sole native Cargo84351 in the existing target. Log remains
+`oct9-single-quota-native.log`; current service71463/Desktop71532 stay available until successful
+replacement. Next barrier: wait for that build, inspect managed replacement, stop watcher before
+new source edits, then verify SEC normal recovery and native financial reads. Goal remains active;
+this turn delivered the coherent correction, not final V1 acceptance.
+
+Continuation refresh: prior turn was progress (pushed c5a4ede6 and three critical checks).
+Cargo84351 is confirmed alive under existing supervisor30620. Native pre-replacement bootstrap
+shows SEC session c9626116-d40b-4f9b-b077-b05fb08c5d9a blocked, next_action none, no saved setup
+session exposed; normal new public setup with retained contact is the available recovery path.
+No provider lifecycle mutation yet. Lead owns native verification and all source/build/Git work.
+
+| Active owner | Exclusive writable scope | Concrete outcome / check |
+| --- | --- | --- |
+| Astra High stream_first_frame | ONLY `.agents/tmp/v1-first-stock/oct10-schwab-first-frame.md`; all production source read-only | Trace current first Schwab Streamer frame current_qualification AuthorityOrHealth failure against exact source and safe logs at c5a4ede6. Identify violated invariant and smallest neutral producer-consumer correction, including whether credential refresh invalidates the active stream. No API calls, credentials, state edits, runtime changes, builds, Git or other agents. Report confirmed facts vs hypotheses and existing critical fixture. |
+
+Owner requested a committed documentation copy of the local field inventory. Lead copied all13
+inventory files to `docs/reference/provider-schemas/` plus the original validation record. All12
+CSV/JSON data files are byte-identical to their originals; README adapts its three local evidence
+links and explicitly distinguishes the committed copy from retained local response captures.
+Documentation indexes link the copy. CSV/JSON parsing,19,782-row readback, README links and diff
+checks pass; exact configured credential-value/private-key/bearer scans found no matches. Original
+scratch remains intact and ignored. This documents the existing dated inventory, not new live
+provider or product acceptance. The native build continues independently without source changes.
+
 ### Recent checkpoint history (superseded runtime/assignment states)
 
 

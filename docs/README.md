@@ -18,6 +18,7 @@ delivery status, research, and historical evidence so each page has one clear jo
 | Understand the system and its boundaries | [Architecture](architecture/README.md) |
 | Understand the selected providers, canonical storage, workflow readiness, and remaining data gaps | [Market-data provider architecture](architecture/market-data-provider-architecture.md) |
 | Inspect one selected provider's exact contract, capacity evidence, mapping, and acceptance gate | [Selected provider contracts](reference/providers/README.md) |
+| Inspect provider endpoints, response objects and field definitions | [Provider response schemas](reference/provider-schemas/README.md) |
 | Inspect the shared canonical schemas, clocks, precision, storage, PIT, and typed-read contract | [Canonical market-data schemas](reference/market-data-canonical-schemas.md) |
 | Install, configure, ingest, query, model, or operate Market Squawk | [Operations](operations/README.md) |
 | Create provider accounts and prepare the exact credential input | [Provider account setup](operations/provider-account-setup.md) |

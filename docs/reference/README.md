@@ -18,6 +18,7 @@ coverage, quality semantics, and time/provenance contract at the reviewed implem
 | [Configuration and secrets](configuration.md) | Precedence, keys, defaults, environment, provider profiles, secret locators, and reporting |
 | [Provider credential input template](market-squawk-provider-credentials.env.example) | Exact `market-squawk-provider-credentials/v1` design contract for a thin no-portal parser in existing onboarding; not yet consumed by the product |
 | [Selected provider contracts](providers/README.md) | Per-source authentication, endpoints, feed semantics, capacity evidence, canonical destinations, scheduling, implementation status, and acceptance gates |
+| [Provider response schemas](provider-schemas/README.md) | Endpoint envelopes, nested fields, types, units, timestamps, pagination and stream messages; upstream evidence and local parser limits distinguished |
 | [Canonical market-data schemas](market-data-canonical-schemas.md) | Shared evidence envelope, typed data families, clocks, exact values, revision/supersession, Arrow/Parquet publication, PIT selection, model bindings, and product reads |
 | [Model Context Protocol](mcp.md) | Stdio lifecycle, exact 63-tool registry, schemas, annotations, limits, artifacts, audits, and cancellation |
 | [Source coverage](source-coverage.md) | Supported adapters, current coverage/quality ceilings, rights, credentials, and health semantics |
