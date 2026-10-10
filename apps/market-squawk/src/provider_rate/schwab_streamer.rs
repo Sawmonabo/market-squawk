@@ -66,7 +66,17 @@ impl SchwabStreamerRuntimeAuthority for SchwabStreamerAccountRateAuthority {
                     return Err(SchwabTransportError::Protocol);
                 }
             }
-            SchwabStreamerRuntimeEvent::Disconnected { generation, .. } => {
+            SchwabStreamerRuntimeEvent::Disconnected {
+                generation,
+                retrying,
+                reason,
+            } => {
+                tracing::warn!(
+                    generation = generation.get(),
+                    retrying,
+                    ?reason,
+                    "Schwab Streamer connection ended"
+                );
                 if state.generation != Some(generation) {
                     return Err(SchwabTransportError::Protocol);
                 }
@@ -103,8 +113,17 @@ impl SchwabStreamerRuntimeAuthority for SchwabStreamerAccountRateAuthority {
             {
                 return Err(SchwabTransportError::TokenRefreshRequired);
             }
-            let permit =
-                acquire_streamer_rate_permit(&self.budget, self, cancellation, deadline).await?;
+            let permit = acquire_streamer_rate_permit(&self.budget, self, cancellation, deadline)
+                .await
+                .map_err(|error| {
+                    tracing::warn!(
+                        generation = generation.get(),
+                        stage = "connection_admission",
+                        ?error,
+                        "Schwab Streamer rate admission failed"
+                    );
+                    error
+                })?;
             self.state
                 .lock()
                 .map_err(|_| SchwabTransportError::Protocol)?
@@ -155,8 +174,17 @@ impl SchwabStreamerRuntimeAuthority for SchwabStreamerAccountRateAuthority {
             {
                 return Err(SchwabTransportError::Protocol);
             }
-            let permit =
-                acquire_streamer_rate_permit(&self.budget, self, cancellation, deadline).await?;
+            let permit = acquire_streamer_rate_permit(&self.budget, self, cancellation, deadline)
+                .await
+                .map_err(|error| {
+                    tracing::warn!(
+                        generation = generation.get(),
+                        stage = "request_admission",
+                        ?error,
+                        "Schwab Streamer rate admission failed"
+                    );
+                    error
+                })?;
             Ok(Box::new(SchwabStreamerAccountRatePermit {
                 generation,
                 service,
@@ -338,16 +366,33 @@ const fn map_streamer_budget_error(reason: BudgetUnavailableReason) -> SchwabTra
 impl SchwabStreamerAccountRateAuthority {
     fn require_current(&self) -> Result<(), SchwabTransportError> {
         if !self.currentness.is_current_now() {
+            tracing::warn!(
+                stage = "account_currentness",
+                "Schwab Streamer authority changed"
+            );
             return Err(SchwabTransportError::TokenRefreshRequired);
         }
         self.activation
             .oauth_receipt_currentness()
             .validate_current_receipt(self.oauth_receipt)
-            .map_err(|_| SchwabTransportError::TokenRefreshRequired)?;
+            .map_err(|_| {
+                tracing::warn!(stage = "oauth_receipt", "Schwab Streamer authority changed");
+                SchwabTransportError::TokenRefreshRequired
+            })?;
         self.activation
             .validate_oauth_authorization(self.oauth_receipt)
-            .map_err(|_| SchwabTransportError::TokenRefreshRequired)?;
+            .map_err(|_| {
+                tracing::warn!(
+                    stage = "oauth_authorization",
+                    "Schwab Streamer authority changed"
+                );
+                SchwabTransportError::TokenRefreshRequired
+            })?;
         if self.admitted_services.is_empty() || self.admitted_services.len() > 12 {
+            tracing::warn!(
+                stage = "service_selection",
+                "Schwab Streamer authority changed"
+            );
             return Err(SchwabTransportError::TokenRefreshRequired);
         }
         // This authorizes a bounded authenticated read-only request, not family availability.
@@ -374,13 +419,29 @@ impl SchwabAccessTokenSource for BoundTokenSource {
                 .activation
                 .acquire_runtime_publication_attempt()
                 .await
-                .map_err(|_| TokenAuthorityError::ReauthorizationRequired)?;
+                .map_err(|_| {
+                    tracing::warn!(
+                        stage = "token_acquisition",
+                        "Schwab Streamer token acquisition failed"
+                    );
+                    TokenAuthorityError::ReauthorizationRequired
+                })?;
             if epoch.receipt() != self.authority.oauth_receipt {
+                tracing::warn!(
+                    stage = "token_receipt_changed",
+                    "Schwab Streamer token acquisition failed"
+                );
                 return Err(TokenAuthorityError::ReauthorizationRequired);
             }
             epoch
                 .validate_current(self.authority.oauth_receipt)
-                .map_err(|_| TokenAuthorityError::ReauthorizationRequired)?;
+                .map_err(|_| {
+                    tracing::warn!(
+                        stage = "token_epoch",
+                        "Schwab Streamer token acquisition failed"
+                    );
+                    TokenAuthorityError::ReauthorizationRequired
+                })?;
             Ok(token)
         })
     }

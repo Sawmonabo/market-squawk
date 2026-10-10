@@ -369,6 +369,7 @@ async fn run_native(
         tracing::warn!(
             ?error,
             consumer_failed = failure.is_some(),
+            generation = native_generation.get(),
             "Schwab Streamer native transport ended"
         );
     }

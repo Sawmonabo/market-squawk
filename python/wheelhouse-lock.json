@@ -2618,8 +2618,8 @@
     },
     {
       "path": "adapters/market-squawk-adapter-schwab/src/lib.rs",
-      "sha256": "7a3191c7b76c4fa6b129aa647414a52e0a520255d2e12acb8601153d897a19de",
-      "size_bytes": 9208
+      "sha256": "32fd3cb4675c4e2132d4d7b0517d31a1ca83b4d1a2c315bc6981fc48d8d2cb26",
+      "size_bytes": 9240
     },
     {
       "path": "adapters/market-squawk-adapter-schwab/src/market_hours_publication.rs",
@@ -2693,8 +2693,8 @@
     },
     {
       "path": "adapters/market-squawk-adapter-schwab/src/tests.rs",
-      "sha256": "3a1ffbe95c2781c29868e3af4b75c562bc320d9bbc15798c5f8f34c77ce6ce09",
-      "size_bytes": 181978
+      "sha256": "ad0e2079aaaf3cd19716ee4c24f68dee95f1cf2401c356727da3528b1002c627",
+      "size_bytes": 184243
     },
     {
       "path": "adapters/market-squawk-adapter-schwab/src/transport/http.rs",
@@ -2703,13 +2703,13 @@
     },
     {
       "path": "adapters/market-squawk-adapter-schwab/src/transport/mod.rs",
-      "sha256": "8b3dc486b6b93ec605495675b1ef0c42b3e460fa855a2295f5282b2fe8de3c34",
-      "size_bytes": 32320
+      "sha256": "76d1576708f7a40c985205b18e8d43b77d9c26c50204b1b2ebf7d9a9ad28a7f7",
+      "size_bytes": 33026
     },
     {
       "path": "adapters/market-squawk-adapter-schwab/src/transport/streamer.rs",
-      "sha256": "f74972ddb18de94039c6d7b5e42dd16791e484e1f6a28950d6999792cb1d1291",
-      "size_bytes": 105123
+      "sha256": "bd2a6f681de4413ec8a79a24d7ea387fb9e74e05009d05903e373dc5536bd1b3",
+      "size_bytes": 107701
     },
     {
       "path": "adapters/market-squawk-adapter-schwab/src/vertical.rs",
@@ -4033,8 +4033,8 @@
     },
     {
       "path": "apps/market-squawk/src/application/market_runtime/schwab_streamer.rs",
-      "sha256": "54ada91a89d2b55c2f48d5a12512d510599cc3950ae5667cc5ec7cf9c582e0f5",
-      "size_bytes": 15062
+      "sha256": "ba2e34e826b8be746acebb3ca5e70e3e682940fd8498870042aa03fb4e5ca902",
+      "size_bytes": 15112
     },
     {
       "path": "apps/market-squawk/src/application/market_runtime/schwab_streamer/families.rs",
@@ -5998,8 +5998,8 @@
     },
     {
       "path": "apps/market-squawk/src/provider_rate/schwab_streamer.rs",
-      "sha256": "ccdf66f3ea82cd3152fde5034514d99ceff74641f7fca5d2b2dc39a977ae7fc1",
-      "size_bytes": 19037
+      "sha256": "ca7e857697a22459ab97dfda2dae7ec7157c308e50aaac605579f3f3e76ad39d",
+      "size_bytes": 21216
     },
     {
       "path": "apps/market-squawk/src/provider_rate/tiingo.rs",

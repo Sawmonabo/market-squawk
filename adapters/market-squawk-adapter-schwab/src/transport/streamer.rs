@@ -37,9 +37,9 @@ use crate::{
 
 use super::{
     AccessTokenAdmission, AccessTokenGeneration, SchwabAccessTokenSource, SchwabCaptureCoordinates,
-    SchwabCredentialAuthorityBinding, SchwabTransportError, SchwabTransportTelemetry,
-    StreamerTransportBounds, TransientAccessToken, duration_millis, hash_frame, hash_observation,
-    unix_millis, unix_seconds,
+    SchwabCredentialAuthorityBinding, SchwabStreamerDisconnectReason, SchwabTransportError,
+    SchwabTransportTelemetry, StreamerTransportBounds, TransientAccessToken, duration_millis,
+    hash_frame, hash_observation, unix_millis, unix_seconds,
 };
 
 /// Exact application payload kind delivered by the WebSocket implementation.
@@ -1299,6 +1299,7 @@ pub enum SchwabStreamerRuntimeEvent {
     Disconnected {
         generation: ConnectionGeneration,
         retrying: bool,
+        reason: SchwabStreamerDisconnectReason,
     },
 }
 
@@ -1643,7 +1644,10 @@ impl SchwabStreamerExecutor {
                     self.runtime_authority
                         .observe(SchwabStreamerRuntimeEvent::Disconnected {
                             generation,
-                            retrying: !cancellation.is_cancelled(),
+                            retrying: false,
+                            reason: SchwabStreamerDisconnectReason::Transport(
+                                SchwabTransportError::Cancelled,
+                            ),
                         })?;
                     return Ok(StreamerRunExit::Cancelled);
                 }
@@ -1652,7 +1656,10 @@ impl SchwabStreamerExecutor {
                     self.runtime_authority
                         .observe(SchwabStreamerRuntimeEvent::Disconnected {
                             generation,
-                            retrying: !cancellation.is_cancelled(),
+                            retrying: !cancellation.is_cancelled()
+                                && consecutive_failures
+                                    < self.transport_bounds.max_reconnect_attempts(),
+                            reason: SchwabStreamerDisconnectReason::Transport(error),
                         })?;
                     self.telemetry.record_stream_connect_failure()?;
                     consecutive_failures = consecutive_failures
@@ -1666,7 +1673,8 @@ impl SchwabStreamerExecutor {
                     self.runtime_authority
                         .observe(SchwabStreamerRuntimeEvent::Disconnected {
                             generation,
-                            retrying: !cancellation.is_cancelled(),
+                            retrying: false,
+                            reason: SchwabStreamerDisconnectReason::Transport(error),
                         })?;
                     return Err(error);
                 }
@@ -1704,17 +1712,25 @@ impl SchwabStreamerExecutor {
                     self.runtime_authority
                         .observe(SchwabStreamerRuntimeEvent::Disconnected {
                             generation,
-                            retrying: !cancellation.is_cancelled(),
+                            retrying: false,
+                            reason: SchwabStreamerDisconnectReason::Transport(
+                                SchwabTransportError::Cancelled,
+                            ),
                         })?;
                     self.telemetry.record_stream_clean_close()?;
                     return Ok(StreamerRunExit::Cancelled);
                 }
-                Ok(ConnectionExit::Retry) => {
+                Ok(ConnectionExit::Retry(reason)) => {
                     self.controller.disconnected(generation)?;
                     self.runtime_authority
                         .observe(SchwabStreamerRuntimeEvent::Disconnected {
                             generation,
-                            retrying: !cancellation.is_cancelled(),
+                            retrying: !cancellation.is_cancelled()
+                                && self.transport_bounds.max_reconnect_attempts() > 0
+                                && (stable_health
+                                    || consecutive_failures
+                                        < self.transport_bounds.max_reconnect_attempts()),
+                            reason,
                         })?;
                     self.telemetry.record_stream_disconnect()?;
                     consecutive_failures =
@@ -1726,7 +1742,10 @@ impl SchwabStreamerExecutor {
                     self.runtime_authority
                         .observe(SchwabStreamerRuntimeEvent::Disconnected {
                             generation,
-                            retrying: !cancellation.is_cancelled(),
+                            retrying: false,
+                            reason: SchwabStreamerDisconnectReason::Transport(
+                                SchwabTransportError::Cancelled,
+                            ),
                         })?;
                     self.telemetry.record_stream_clean_close()?;
                     return Ok(StreamerRunExit::Cancelled);
@@ -1736,7 +1755,12 @@ impl SchwabStreamerExecutor {
                     self.runtime_authority
                         .observe(SchwabStreamerRuntimeEvent::Disconnected {
                             generation,
-                            retrying: !cancellation.is_cancelled(),
+                            retrying: !cancellation.is_cancelled()
+                                && self.transport_bounds.max_reconnect_attempts() > 0
+                                && (stable_health
+                                    || consecutive_failures
+                                        < self.transport_bounds.max_reconnect_attempts()),
+                            reason: SchwabStreamerDisconnectReason::Transport(error),
                         })?;
                     self.telemetry.record_stream_disconnect()?;
                     consecutive_failures =
@@ -1748,7 +1772,8 @@ impl SchwabStreamerExecutor {
                     self.runtime_authority
                         .observe(SchwabStreamerRuntimeEvent::Disconnected {
                             generation,
-                            retrying: !cancellation.is_cancelled(),
+                            retrying: false,
+                            reason: SchwabStreamerDisconnectReason::Transport(error),
                         })?;
                     return Err(error);
                 }
@@ -1822,7 +1847,9 @@ impl SchwabStreamerExecutor {
                     }
                     Err(error) if retryable(error) => {
                         flush_batch(&mut batch, sink, &self.telemetry).await?;
-                        return Ok(ConnectionExit::Retry);
+                        return Ok(ConnectionExit::Retry(
+                            SchwabStreamerDisconnectReason::Transport(error),
+                        ));
                     }
                     Err(error) => {
                         flush_batch(&mut batch, sink, &self.telemetry).await?;
@@ -1864,7 +1891,9 @@ impl SchwabStreamerExecutor {
                             )
                             .await?;
                             if !succeeded {
-                                return Ok(ConnectionExit::Retry);
+                                return Ok(ConnectionExit::Retry(
+                                    SchwabStreamerDisconnectReason::LoginRejected,
+                                ));
                             }
                             self.controller.login_accepted(generation)?;
                             self.telemetry.record_stream_connected()?;
@@ -1874,7 +1903,9 @@ impl SchwabStreamerExecutor {
                     ProcessedFrame::Control => {}
                     ProcessedFrame::Closed => {
                         flush_batch(&mut batch, sink, &self.telemetry).await?;
-                        return Ok(ConnectionExit::Retry);
+                        return Ok(ConnectionExit::Retry(
+                            SchwabStreamerDisconnectReason::RemoteClose,
+                        ));
                     }
                 }
             }
@@ -2018,7 +2049,9 @@ impl SchwabStreamerExecutor {
                             ProcessedFrame::Control => {}
                             ProcessedFrame::Closed => {
                                 flush_batch(&mut batch, sink, &self.telemetry).await?;
-                                return Ok(ConnectionExit::Retry);
+                                return Ok(ConnectionExit::Retry(
+                                    SchwabStreamerDisconnectReason::RemoteClose,
+                                ));
                             }
                         }
                     }
@@ -2057,12 +2090,18 @@ impl SchwabStreamerExecutor {
                         let acknowledgement_expired = pending
                             .values()
                             .any(|sent| now >= sent.acknowledgement_deadline);
-                        if now >= refresh_deadline
-                            || now >= idle_deadline
-                            || acknowledgement_expired
-                        {
+                        let reason = if now >= refresh_deadline {
+                            Some(SchwabStreamerDisconnectReason::TokenRefreshDeadline)
+                        } else if now >= idle_deadline {
+                            Some(SchwabStreamerDisconnectReason::IdleDeadline)
+                        } else if acknowledgement_expired {
+                            Some(SchwabStreamerDisconnectReason::AcknowledgementDeadline)
+                        } else {
+                            None
+                        };
+                        if let Some(reason) = reason {
                             flush_batch(&mut batch, sink, &self.telemetry).await?;
-                            return Ok(ConnectionExit::Retry);
+                            return Ok(ConnectionExit::Retry(reason));
                         }
                         flush_batch(&mut batch, sink, &self.telemetry).await?;
                     }
@@ -2072,7 +2111,9 @@ impl SchwabStreamerExecutor {
                     }
                     Err(error) if retryable(error) => {
                         flush_batch(&mut batch, sink, &self.telemetry).await?;
-                        return Ok(ConnectionExit::Retry);
+                        return Ok(ConnectionExit::Retry(
+                            SchwabStreamerDisconnectReason::Transport(error),
+                        ));
                     }
                     Err(error) => return Err(error),
                 }
@@ -2225,7 +2266,7 @@ impl SchwabStreamerExecutor {
 
 enum ConnectionExit {
     Cancelled,
-    Retry,
+    Retry(SchwabStreamerDisconnectReason),
 }
 
 fn next_consecutive_failure(

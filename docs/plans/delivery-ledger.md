@@ -2,20 +2,20 @@
 
 ## Current execution — 2026-10-10
 
-Goal active and incomplete. Latest pushed source is **573b5dcc**; provider schemas are pushed as
+Goal active and incomplete. Latest pushed source is **90267209**; provider schemas are pushed as
 **49f2f031**. All 25 schema pages were reviewed, personal ticker rows removed, and ignored originals
-preserved. The current read-cost correction is critically verified and awaiting commit/push.
+preserved. The read-cost correction is critically verified and pushed; native remains573b5dcc.
 
 **Current outcome:** keep market screens responsive and continuously publish received stream data.
 The request-capacity correction passed 42 critical checks. Its matching managed native build passed
 in 11m43s; service34800/Desktop35011 run `generation-WfxAkw`. Workspace composition took 4,341ms.
-Watcher30632 remains stopped under supervisor30620. No compiler or implementation agent is active.
+Watcher30632 remains stopped under supervisor30620. All diagnostic source is frozen. Focused adapter check passed under exec54346; no native build is active.
 
 | Owner | Current work / evidence | Next barrier |
 | --- | --- | --- |
-| Lead | Two SQL files: `crates/market-squawk-data/src/manifest/catalog/lineage.rs` and `crates/market-squawk-data/src/catalog/market_recovery.rs`. Three JOIN changes preserve predicates while driving exact ancestry/commit/run lookups from selected rows. All three existing critical fixtures passed. Lead also owns closure, ledger, Git, builds and shared contracts. | Commit/push this correction, then integrate cause-preserving stream diagnostics before the next matching native check. No native latency pass yet. |
-| Astra financial_read_cost — complete, released | `oct10-previous-close-read-cost.md`: unchanged query results and approximately 27.5 times less ancestry VM work; route query plan corrected separately. | No further assignment. Wall-time samples during compilation are diagnostic only. |
-| Astra stream_first_frame — diagnosis complete | `oct10-schwab-first-frame.md`: the first retryable transport exit loses its cause and becomes `ReconnectExhausted`. A later postcommit account failure is a separate episode. | Next bounded implementation must retain the original closed disconnect reason through the existing lifecycle event. Keep the outer account owner responsible for fresh-generation recovery. |
+| Lead | Owns adapter shared diagnostic enum/reexports in `src/transport/mod.rs` and `src/lib.rs`, initial event-field contract, app `provider_rate/schwab_streamer.rs` and `application/market_runtime/schwab_streamer.rs`, closure, ledger, Git and all checks. | Preserve original disconnect category/generation, log closed request-admission and account/OAuth failure stages. No policy changes or sensitive payload logging. |
+| Astra stream_first_frame — complete, frozen | Changed ONLY adapter `src/transport/streamer.rs` and existing `src/tests.rs`, using the lead-installed reason contract. Closed retry reasons now reach existing disconnect events; the real capture/reconnect fixture covers exhaustion and zero retries. | Lead inspected all eight disconnect exits and existing callers. Focused fixture passed; native integration next. No agent builds, Git or runtime changes. |
+| Astra financial_read_cost — complete, released | `oct10-previous-close-read-cost.md`; both SQL fixes pushed90267209 and three critical checks passed. | Matching native read verification follows the diagnostic integration. |
 
 Native573 durably published six Schwab quotes, eight book snapshots, three chart records and ten
 screener records through commit61445. This proves received-data publication, not uninterrupted
@@ -37,10 +37,19 @@ Existing bounded `PRAGMA optimize` maintenance remains in place. No schema, API,
 rights, cancellation or runtime-state changes are part of this correction. Exec97288 completed with
 exit0; source stayed frozen during the serialized checks.
 
+Disconnect diagnostic evidence: `oct10-stream-disconnect-critical-final.log`, 1/1 passed
+(13.74s compilation, 0.40s fixture). It retains the existing real capture checks and three-socket
+retry assertions, adds a zero-retry case, and verifies original remote-close reason plus accurate
+retrying state. The initial compile caught a u64/usize assertion mismatch; corrected and rerun, not
+waived. All eight disconnect exits and application consumers were inspected. Governor logs only
+closed error/stage/reason categories and native generation; no token/frame/account material. No
+retry count, timeout, authorization, capture or publication policy changed. Matching native build
+is required to identify the actual disconnect cause; this patch is not a transport repair.
+
 Next dependencies remain the stream disconnect cause, matching native read verification, the ready
 option-reference supersession/retry slice, and remaining analysis/provider/UI journeys. Full V1 and
 installed/resource acceptance remain open. One primary worktree and the intended feature/main/release
-local branches; main/release unchanged. Latest PR43 evidence comment:6092173596.
+local branches; main/release unchanged. Latest PR43 evidence comment:6092354616.
 
 ### Current-wave checkpoint chronology (earlier runtime and ownership entries are superseded)
 

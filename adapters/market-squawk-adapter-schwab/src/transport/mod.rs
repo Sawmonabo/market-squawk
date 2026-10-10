@@ -846,6 +846,23 @@ impl SchwabTransportTelemetry {
     }
 }
 
+/// Original, secret-free reason one native Streamer connection ended.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SchwabStreamerDisconnectReason {
+    /// A closed transport error, retained before retry policy is applied.
+    Transport(SchwabTransportError),
+    /// The peer closed its WebSocket or the receive stream ended.
+    RemoteClose,
+    /// The provider rejected the LOGIN response.
+    LoginRejected,
+    /// The admitted token reached its scheduled refresh boundary.
+    TokenRefreshDeadline,
+    /// No activity arrived within the configured idle allowance.
+    IdleDeadline,
+    /// A dispatched command did not receive its acknowledgement in time.
+    AcknowledgementDeadline,
+}
+
 /// Secret-free transport and capture failure.
 #[derive(Clone, Copy, Debug, Eq, Error, PartialEq)]
 pub enum SchwabTransportError {

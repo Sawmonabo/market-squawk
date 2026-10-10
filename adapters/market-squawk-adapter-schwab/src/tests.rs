@@ -1,6 +1,7 @@
 use crate::{
-    SchwabStreamerConnectionPermit, SchwabStreamerRequestAcknowledgement,
-    SchwabStreamerRequestPermit, SchwabStreamerRuntimeAuthority, SchwabStreamerRuntimeEvent,
+    SchwabStreamerConnectionPermit, SchwabStreamerDisconnectReason,
+    SchwabStreamerRequestAcknowledgement, SchwabStreamerRequestPermit,
+    SchwabStreamerRuntimeAuthority, SchwabStreamerRuntimeEvent,
 };
 use market_squawk_sources::{
     BackoffPolicy, BudgetDecision, BudgetDispatchDecision, BudgetPermit, BudgetReservationDecision,
@@ -2335,6 +2336,7 @@ impl SchwabStreamerConnection for SensitiveHandoffConnection {
 struct MockStreamerRateAuthority {
     budget: Arc<SharedProviderBudget>,
     generation: Mutex<Option<ConnectionGeneration>>,
+    disconnects: Mutex<Vec<SchwabStreamerRuntimeEvent>>,
     _authority: ProviderRateAuthority,
     _temporary: TemporaryDirectory,
 }
@@ -2382,6 +2384,7 @@ impl MockStreamerRateAuthority {
         Self {
             budget,
             generation: Mutex::new(None),
+            disconnects: Mutex::new(Vec::new()),
             _authority: authority,
             _temporary: temporary,
         }
@@ -2429,6 +2432,10 @@ impl SchwabStreamerRuntimeAuthority for MockStreamerRateAuthority {
             SchwabStreamerRuntimeEvent::Disconnected { generation, .. } => {
                 assert_eq!(*current, Some(generation));
                 *current = None;
+                self.disconnects
+                    .lock()
+                    .map_err(|_| SchwabTransportError::Protocol)?
+                    .push(event);
             }
             SchwabStreamerRuntimeEvent::ConnectAttempt { .. }
             | SchwabStreamerRuntimeEvent::QueuePressure => {}
@@ -3597,102 +3604,140 @@ async fn streamer_microbatch_retains_validated_application_frames_without_token_
             MockStreamerInbound::Frame(InboundStreamerFrame::Close),
         ])
     };
-    let reconnect_state = Arc::new(Mutex::new(MockStreamerState {
-        connects: 0,
-        inbound: VecDeque::from([
-            login_then_close(1),
-            login_then_close(3),
-            login_then_close(5),
-        ]),
-        sent: Vec::new(),
-    }));
-    let reconnect_controls = (51_u64..=53)
-        .map(|generation| {
-            SchwabStreamerConnectionControl::new(
-                ConnectionGeneration::new(
-                    NonZeroU64::new(generation)
-                        .unwrap_or_else(|| panic!("reconnect generation must be nonzero")),
-                ),
-                session_identifier.clone(),
-                coordinates.clone(),
-                stream_identity.clone(),
-            )
-        })
-        .collect::<VecDeque<_>>();
-    let reconnect_bounds = StreamerTransportBounds::try_new(
-        Duration::from_secs(1),
-        Duration::from_secs(1),
-        Duration::from_millis(1),
-        2,
-        nonzero(64 * 1024),
-        nonzero(65),
-        nonzero(64 * 1024),
-        Duration::from_millis(1),
-    )
-    .unwrap_or_else(|error| panic!("reconnect bounds: {error}"));
-    let mut reconnecting_streamer = SchwabStreamerExecutor::try_new(
-        Arc::new(MockStreamerConnector {
-            state: reconnect_state.clone(),
-        }),
-        Arc::new(MockTokenSource { token_admission }),
-        Arc::new(MockStreamerControlSource {
-            controls: Mutex::new(reconnect_controls),
-        }),
-        stream_admission,
-        reconnect_bounds,
-        bounds(),
-        token_admission,
-        SchwabTransportTelemetry::default(),
-        Arc::new(MockStreamerRateAuthority::new()),
-    )
-    .unwrap_or_else(|error| panic!("reconnecting executor: {error}"));
-    reconnecting_streamer
-        .replace_desired(
-            StreamerSubscription::try_new(
-                MarketDataService::LevelOneEquities,
-                vec![
-                    ProviderIdentifier::try_new("AAPL")
-                        .unwrap_or_else(|error| panic!("reconnect symbol: {error}")),
-                ],
-                vec![0, 1, 2, 3, 4],
-                stream_admission,
-            )
-            .unwrap_or_else(|error| panic!("reconnect subscription: {error}")),
+    for (max_reconnect_attempts, expected_retrying) in
+        [(2, vec![true, true, false]), (0, vec![false])]
+    {
+        let reconnect_state = Arc::new(Mutex::new(MockStreamerState {
+            connects: 0,
+            inbound: VecDeque::from([
+                login_then_close(1),
+                login_then_close(3),
+                login_then_close(5),
+            ]),
+            sent: Vec::new(),
+        }));
+        let reconnect_controls = (51_u64..=53)
+            .map(|generation| {
+                SchwabStreamerConnectionControl::new(
+                    ConnectionGeneration::new(
+                        NonZeroU64::new(generation)
+                            .unwrap_or_else(|| panic!("reconnect generation must be nonzero")),
+                    ),
+                    session_identifier.clone(),
+                    coordinates.clone(),
+                    stream_identity.clone(),
+                )
+            })
+            .collect::<VecDeque<_>>();
+        let reconnect_bounds = StreamerTransportBounds::try_new(
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Duration::from_millis(1),
+            max_reconnect_attempts,
+            nonzero(64 * 1024),
+            nonzero(65),
+            nonzero(64 * 1024),
+            Duration::from_millis(1),
         )
-        .unwrap_or_else(|error| panic!("reconnect desired state: {error}"));
-    let reconnect_cancellation = CancellationToken::new();
-    let mut reconnect_sink = CancellingCaptureSink {
-        cancellation: reconnect_cancellation.clone(),
-        cancel_after: usize::MAX,
-        microbatches: Vec::new(),
-        blocked_handoff: None,
-    };
-    assert_eq!(
+        .unwrap_or_else(|error| panic!("reconnect bounds: {error}"));
+        let reconnect_authority = Arc::new(MockStreamerRateAuthority::new());
+        let mut reconnecting_streamer = SchwabStreamerExecutor::try_new(
+            Arc::new(MockStreamerConnector {
+                state: reconnect_state.clone(),
+            }),
+            Arc::new(MockTokenSource { token_admission }),
+            Arc::new(MockStreamerControlSource {
+                controls: Mutex::new(reconnect_controls),
+            }),
+            stream_admission,
+            reconnect_bounds,
+            bounds(),
+            token_admission,
+            SchwabTransportTelemetry::default(),
+            reconnect_authority.clone(),
+        )
+        .unwrap_or_else(|error| panic!("reconnecting executor: {error}"));
         reconnecting_streamer
-            .run(
-                bootstrap.value(),
-                &mut reconnect_sink,
-                reconnect_cancellation.clone(),
+            .replace_desired(
+                StreamerSubscription::try_new(
+                    MarketDataService::LevelOneEquities,
+                    vec![
+                        ProviderIdentifier::try_new("AAPL")
+                            .unwrap_or_else(|error| panic!("reconnect symbol: {error}")),
+                    ],
+                    vec![0, 1, 2, 3, 4],
+                    stream_admission,
+                )
+                .unwrap_or_else(|error| panic!("reconnect subscription: {error}")),
             )
-            .await,
-        Err(SchwabTransportError::ReconnectExhausted)
-    );
-    assert!(!reconnect_cancellation.is_cancelled());
-    let reconnect_state = reconnect_state
-        .lock()
-        .unwrap_or_else(|error| panic!("reconnect mock state: {error}"));
-    assert_eq!(reconnect_state.connects, 3);
-    assert_eq!(
-        reconnect_state.sent.as_slice(),
-        [
-            ("ADMIN".to_owned(), "LOGIN".to_owned()),
-            ("LEVELONE_EQUITIES".to_owned(), "SUBS".to_owned()),
-            ("ADMIN".to_owned(), "LOGIN".to_owned()),
-            ("LEVELONE_EQUITIES".to_owned(), "SUBS".to_owned()),
-            ("ADMIN".to_owned(), "LOGIN".to_owned()),
-            ("LEVELONE_EQUITIES".to_owned(), "SUBS".to_owned()),
-        ]
-    );
+            .unwrap_or_else(|error| panic!("reconnect desired state: {error}"));
+        let reconnect_cancellation = CancellationToken::new();
+        let mut reconnect_sink = CancellingCaptureSink {
+            cancellation: reconnect_cancellation.clone(),
+            cancel_after: usize::MAX,
+            microbatches: Vec::new(),
+            blocked_handoff: None,
+        };
+        assert_eq!(
+            reconnecting_streamer
+                .run(
+                    bootstrap.value(),
+                    &mut reconnect_sink,
+                    reconnect_cancellation.clone(),
+                )
+                .await,
+            Err(SchwabTransportError::ReconnectExhausted)
+        );
+        assert!(!reconnect_cancellation.is_cancelled());
+        let reconnect_state = reconnect_state
+            .lock()
+            .unwrap_or_else(|error| panic!("reconnect mock state: {error}"));
+        assert_eq!(
+            reconnect_state.connects,
+            u64::try_from(expected_retrying.len()).expect("bounded attempt count")
+        );
+        let disconnects = reconnect_authority
+            .disconnects
+            .lock()
+            .unwrap_or_else(|error| panic!("reconnect disconnects: {error}"));
+        assert_eq!(disconnects.len(), expected_retrying.len());
+        for (index, (event, retrying)) in disconnects.iter().zip(expected_retrying).enumerate() {
+            assert_eq!(
+                *event,
+                SchwabStreamerRuntimeEvent::Disconnected {
+                    generation: ConnectionGeneration::new(
+                        NonZeroU64::new(51 + u64::try_from(index).expect("bounded attempt index"))
+                            .expect("nonzero attempt generation"),
+                    ),
+                    retrying,
+                    reason: SchwabStreamerDisconnectReason::RemoteClose,
+                }
+            );
+        }
+        if max_reconnect_attempts == 0 {
+            assert_eq!(reconnect_state.connects, 1);
+            assert_eq!(
+                reconnect_state.sent.as_slice(),
+                [
+                    ("ADMIN".to_owned(), "LOGIN".to_owned()),
+                    ("LEVELONE_EQUITIES".to_owned(), "SUBS".to_owned()),
+                ]
+            );
+            continue;
+        }
+        assert_eq!(reconnect_state.connects, 3);
+        assert_eq!(
+            reconnect_state.sent.as_slice(),
+            [
+                ("ADMIN".to_owned(), "LOGIN".to_owned()),
+                ("LEVELONE_EQUITIES".to_owned(), "SUBS".to_owned()),
+                ("ADMIN".to_owned(), "LOGIN".to_owned()),
+                ("LEVELONE_EQUITIES".to_owned(), "SUBS".to_owned()),
+                ("ADMIN".to_owned(), "LOGIN".to_owned()),
+                ("LEVELONE_EQUITIES".to_owned(), "SUBS".to_owned()),
+            ]
+        );
+    }
 }
 
 #[derive(Debug)]
