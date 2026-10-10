@@ -39,7 +39,7 @@ pub(crate) fn provider_rate_authority_from_store(
 ) -> Result<ProviderRateAuthority, ProviderRateStoreError> {
     let declaration = ProviderRateDeclaration::try_for_endpoint(
         SEC_EDGAR_AUTHORITY
-            .budget_policy()
+            .operational_budget_policy()
             .map_err(|_| ProviderRateStoreError::Corrupt)?,
         &SEC_EDGAR_AUTHORITY
             .endpoint_policy()

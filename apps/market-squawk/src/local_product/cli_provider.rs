@@ -5825,6 +5825,58 @@ mod tests {
             .provider_activation()
             .research_runtime_generation(lease.surface_id())?
             .ok_or("SEC connection did not register a runtime")?;
+        assert_eq!(
+            generation
+                .metadata()
+                .budget_policy()
+                .ok_or("SEC metadata budget absent")?
+                .max_concurrent(),
+            1,
+            "operational scheduling changed the saved source identity",
+        );
+        // Exercise the actual source registry and SQLite authority with the admitted metadata.
+        // Two requests may reserve concurrently, while a third waits. No network is dispatched.
+        {
+            struct MetadataAdapter(market_squawk_sources::SourceMetadata);
+            impl market_squawk_sources::SourceMetadataProvider for MetadataAdapter {
+                fn metadata(&self) -> &market_squawk_sources::SourceMetadata {
+                    &self.0
+                }
+            }
+            let paths = market_squawk_platform::LocalPaths::prepare(
+                temporary.path().join("sec-scheduling"),
+            )?;
+            let rate =
+                crate::provider_rate::open_provider_rate_authority(paths.control_root()?.root())?;
+            let mut registry = market_squawk_sources::AuthoritativeSourceRegistry::try_new_durable_with_provider_rate(
+                market_squawk_platform::LocalAuthorityStateStore::try_open(paths.root().join("authority"))?,
+                rate,
+            )?;
+            let metadata = generation.metadata().clone();
+            let registered = registry
+                .register_or_resume_exact(metadata.clone(), generation.authority_effective_at())?;
+            let adapter = MetadataAdapter(metadata);
+            let authority = registry.extraction_authority(&registered, &adapter)?;
+            let target = "https://data.sec.gov/submissions/CIK0000320193.json";
+            let first = authority.try_network_request(target)?;
+            let second = authority.try_network_request(target)?;
+            assert!(matches!(
+                authority.try_network_request(target),
+                Err(
+                    market_squawk_sources::ExtractionAuthorityError::BudgetUnavailable {
+                        reason:
+                            market_squawk_sources::BudgetUnavailableReason::ConcurrencyExhausted,
+                    }
+                ),
+            ));
+            drop(first);
+            let replacement = authority.try_network_request(target)?;
+            drop(replacement);
+            drop(second);
+            drop(authority);
+            drop(registered);
+            registry.shutdown()?;
+        }
         let invalid_selection = json!({"kind": "sec", "cik": "0000320193"});
         assert!(
             serde_json::from_value::<ProviderPortalActivationRequest>(invalid_selection).is_err()

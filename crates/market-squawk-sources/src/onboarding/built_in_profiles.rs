@@ -1286,7 +1286,7 @@ fn finish_profile(
             SourceIdentifier::try_from(format!("{}.onboarding-probe", spec.id))?,
             PROVIDER_RELEASE_REPORT_DIGEST,
             SEC_EDGAR_AUTHORITY
-                .budget_policy()
+                .operational_budget_policy()
                 .map_err(|_| ProviderProfileError::InvalidProfile)?,
             true,
         )?
@@ -1431,8 +1431,10 @@ fn capability_evidence(
 ) -> Result<Vec<EvidenceBinding>, ProviderProfileError> {
     let (report_source, report_digest) = if (revision.get() >= 3
         && has_provider_release_revision(spec.id))
-        || matches!(spec.id, FRED_PROFILE | EIA_PROFILE | SCHWAB_MARKET_DATA_PROFILE)
-    {
+        || matches!(
+            spec.id,
+            FRED_PROFILE | EIA_PROFILE | SCHWAB_MARKET_DATA_PROFILE
+        ) {
         (
             "MSQ-PROVIDER-RELEASE-EVIDENCE-2026-07-25",
             PROVIDER_RELEASE_REPORT_DIGEST,
@@ -1451,7 +1453,11 @@ fn capability_evidence(
         ));
     }
     if (is_selected_architecture_profile(spec.id) || spec.id == "bls.v2-registered")
-        && (revision.get() >= 3 || matches!(spec.id, FRED_PROFILE | EIA_PROFILE | SCHWAB_MARKET_DATA_PROFILE))
+        && (revision.get() >= 3
+            || matches!(
+                spec.id,
+                FRED_PROFILE | EIA_PROFILE | SCHWAB_MARKET_DATA_PROFILE
+            ))
     {
         evidence.push(EvidenceBinding::new(
             SourceIdentifier::try_from(SELECTED_MARKET_DATA_ARCHITECTURE_SOURCE)?,

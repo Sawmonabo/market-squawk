@@ -2818,8 +2818,8 @@
     },
     {
       "path": "adapters/market-squawk-adapter-sec/src/policy.rs",
-      "sha256": "6122c7b3104339d547f18ad735fc621eae9a3f85dc099b21179e23a0a1dd5761",
-      "size_bytes": 1229
+      "sha256": "b6550c94f81998e98a39869fb253941071653897bfa368096d53d6d7152e7f01",
+      "size_bytes": 1349
     },
     {
       "path": "adapters/market-squawk-adapter-sec/src/product.rs",
@@ -5323,8 +5323,8 @@
     },
     {
       "path": "apps/market-squawk/src/local_product/cli_provider.rs",
-      "sha256": "afd9dcdbd4871369d13157442c6a800ce9ce831fcb417a138691a33e8a80e889",
-      "size_bytes": 244595
+      "sha256": "c33a3eb98a4f0c7b22a12627fd71e5ed73859053d597b93667b21aae3fc929a5",
+      "size_bytes": 247095
     },
     {
       "path": "apps/market-squawk/src/local_product/cli_provider/ephemeral.rs",
@@ -5993,8 +5993,8 @@
     },
     {
       "path": "apps/market-squawk/src/provider_rate.rs",
-      "sha256": "707ac5eee514d5efc278132678760c91e79611111b0c3c71cc719ef216871f54",
-      "size_bytes": 6977
+      "sha256": "2d38081234307d98b55097f78c5960c1989cc36b1f5ffe5aced1d034ce1b9488",
+      "size_bytes": 6989
     },
     {
       "path": "apps/market-squawk/src/provider_rate/schwab_streamer.rs",
@@ -10043,8 +10043,8 @@
     },
     {
       "path": "crates/market-squawk-sources/src/onboarding/built_in_profiles.rs",
-      "sha256": "fc0489598f27cd59e5beb781212f2a261a165f62d6a6ae00de5e6c4342b7ad51",
-      "size_bytes": 131726
+      "sha256": "192d60d6aaa9a2d44f79d3d858c5fcd1c6472a6331420f1968dbee8e2de54019",
+      "size_bytes": 131826
     },
     {
       "path": "crates/market-squawk-sources/src/onboarding/capability.rs",
@@ -10073,13 +10073,13 @@
     },
     {
       "path": "crates/market-squawk-sources/src/onboarding/source_authority.rs",
-      "sha256": "0bf37357457a3a9fd20e0e6205791ce5a60731b70d3ece967161081ee9e03944",
-      "size_bytes": 34445
+      "sha256": "bc5c1bf09958b4fc15e2f71bb460c7d8c6e8b9d8f0377590249357eba98c596c",
+      "size_bytes": 34811
     },
     {
       "path": "crates/market-squawk-sources/src/onboarding/tests.rs",
-      "sha256": "edb76619d8eacae172a3d1f346d9c25d38e5fc6087d253c32f09c4ca353f4a57",
-      "size_bytes": 90934
+      "sha256": "62c24edae072d95bacc2d91fc2e9d300c1c12d247278a9e09b35ceae0e447415",
+      "size_bytes": 91313
     },
     {
       "path": "crates/market-squawk-sources/src/order.rs",
@@ -10108,8 +10108,8 @@
     },
     {
       "path": "crates/market-squawk-sources/src/policy/budget/coordinator/durability.rs",
-      "sha256": "71eeadd4c6464cca57fb847b64f3119d148a26bb4a0b3d561cadf1c27199e5ff",
-      "size_bytes": 58154
+      "sha256": "407fd94459e51eadcae4bac37bacadbfaddfe550c82b6f1145c80f57f2621cfa",
+      "size_bytes": 58248
     },
     {
       "path": "crates/market-squawk-sources/src/policy/budget/coordinator/durability/restore.rs",
@@ -10123,8 +10123,8 @@
     },
     {
       "path": "crates/market-squawk-sources/src/policy/budget/identity.rs",
-      "sha256": "c4f69126b2cee6b04b05bdd9add86953040d7ca7d472fcc20055814977222f78",
-      "size_bytes": 33788
+      "sha256": "73cec77ee1358131dd5818a84458042e1ee1a71f7163cf1778bdc72dd2eda2f9",
+      "size_bytes": 34265
     },
     {
       "path": "crates/market-squawk-sources/src/policy/budget/persistence.rs",
@@ -10208,8 +10208,8 @@
     },
     {
       "path": "crates/market-squawk-sources/src/policy/provider_rate.rs",
-      "sha256": "35c5b3338165848bb9224b53bd661ab5cba96782e44af0217bf709676e793de4",
-      "size_bytes": 65478
+      "sha256": "269411e6d66ad9ac45beb28ef13b7a372caecba797afa0223814ca3b99dcacde",
+      "size_bytes": 66909
     },
     {
       "path": "crates/market-squawk-sources/src/policy/provider_rate/admission.rs",

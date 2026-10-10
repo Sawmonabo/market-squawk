@@ -1,6 +1,6 @@
 //! Product-wide durable provider request and connection admission.
 
-use std::num::NonZeroU64;
+use std::num::{NonZeroU16, NonZeroU64};
 use std::sync::{Arc, Mutex, Weak};
 #[cfg(debug_assertions)]
 use std::time::Duration;
@@ -833,6 +833,7 @@ pub trait ProviderRateStore: std::fmt::Debug + Send + Sync {
 #[derive(Clone)]
 pub struct ProviderRateAuthority {
     inner: Arc<ProviderRateAuthorityInner>,
+    request_configuration: Arc<[ProviderRateDeclaration]>,
 }
 
 struct ProviderRateAuthorityInner {
@@ -918,10 +919,11 @@ impl ProviderRateAuthority {
         store: Arc<dyn ProviderRateStore>,
         declarations: &[ProviderRateDeclaration],
     ) -> Result<Self, ProviderRateStoreError> {
-        let authority = Self::try_new(store)?;
+        let mut authority = Self::try_new(store)?;
         authority.serialized_timed_store_operation(|store, run_id, now| {
             store.configure_request_concurrency(run_id, declarations, now)
         })?;
+        authority.request_configuration = Arc::from(declarations);
         Ok(authority)
     }
 
@@ -999,6 +1001,7 @@ impl ProviderRateAuthority {
             .wall_clock;
         let run_id = store.start_run(now)?;
         Ok(Self {
+            request_configuration: Arc::from([]),
             inner: Arc::new(ProviderRateAuthorityInner {
                 store,
                 run_id,
@@ -1011,6 +1014,32 @@ impl ProviderRateAuthority {
         })
     }
 
+    /// Applies only the exact code-owned request concurrency configuration. Source declarations
+    /// retain their original metadata; endpoints, subjects and every other policy dimension must
+    /// agree before a runtime allocation can use current scheduling capacity.
+    pub(in crate::policy) fn configured_request_declaration(
+        &self,
+        declaration: ProviderRateDeclaration,
+    ) -> Result<ProviderRateDeclaration, BudgetPoolError> {
+        let Some(configured) = self
+            .request_configuration
+            .iter()
+            .find(|configured| configured.collision_identities == declaration.collision_identities)
+        else {
+            return Ok(declaration);
+        };
+        let concurrency = NonZeroU16::new(configured.policy.max_concurrent())
+            .ok_or(BudgetPoolError::ConflictingPolicy)?;
+        let policy = declaration
+            .policy
+            .with_request_concurrency(concurrency)
+            .map_err(|_| BudgetPoolError::ConflictingPolicy)?;
+        if policy != configured.policy {
+            return Err(BudgetPoolError::ConflictingPolicy);
+        }
+        Ok(configured.clone())
+    }
+
     /// Registers a declaration and returns a locally enforced budget bound to the aggregate store.
     ///
     /// This performs control-plane SQLite work and must not be called from the live event-to-action
@@ -1019,6 +1048,7 @@ impl ProviderRateAuthority {
         &self,
         declaration: ProviderRateDeclaration,
     ) -> Result<SharedProviderBudget, BudgetPoolError> {
+        let declaration = self.configured_request_declaration(declaration)?;
         let binding = self.register_binding(&declaration)?;
         SharedProviderBudget::new_with_provider_rate(declaration.policy, binding)
     }

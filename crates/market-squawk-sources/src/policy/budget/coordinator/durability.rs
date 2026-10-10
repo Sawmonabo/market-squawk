@@ -767,7 +767,11 @@ impl ProcessBudgetCoordinator {
             .map_err(|_| BudgetPoolError::CoordinatorAllocation)?;
 
         for (input_index, resolved) in policies.iter().enumerate() {
-            provider_declarations.push(ProviderRateDeclaration::from_resolved(resolved)?);
+            let declaration = provider_rate.configured_request_declaration(
+                ProviderRateDeclaration::from_resolved(resolved)?,
+            )?;
+            let policy = declaration.policy().clone();
+            provider_declarations.push(declaration);
             let mut matching_index = None;
             for (index, allocation) in staged.iter().enumerate() {
                 if !allocation
@@ -784,7 +788,7 @@ impl ProcessBudgetCoordinator {
                 let existing = staged
                     .get_mut(index)
                     .ok_or(BudgetPoolError::CoordinatorCorrupt)?;
-                if !existing.policy().has_same_limits_as(resolved.policy()) {
+                if !existing.policy().has_same_limits_as(&policy) {
                     return Err(BudgetPoolError::ConflictingPolicy);
                 }
                 if let StagedProviderAllocationBacking::Existing(allocation) = &existing.backing {
@@ -820,9 +824,7 @@ impl ProcessBudgetCoordinator {
                 let index = staged.len();
                 staged.push(StagedProviderAllocation {
                     collision_key: resolved.collision_key().clone(),
-                    backing: StagedProviderAllocationBacking::New {
-                        policy: resolved.policy().clone(),
-                    },
+                    backing: StagedProviderAllocationBacking::New { policy },
                     input_indexes: vec![input_index],
                 });
                 index

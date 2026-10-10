@@ -1829,6 +1829,12 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
     assert_eq!(sec_budget.requests_per_window(), Some(2));
     assert_eq!(sec_budget.window_nanos(), Some(1_000_000_000));
     assert_eq!(sec_budget.max_concurrent(), 2);
+    // Scheduling must not change the source descriptor or its saved activation identity.
+    assert_eq!(SEC_EDGAR_AUTHORITY.budget_policy()?.max_concurrent(), 1);
+    assert_eq!(
+        &SEC_EDGAR_AUTHORITY.operational_budget_policy()?,
+        sec_budget
+    );
     assert_eq!(sec_budget.weighted_window_count(), 0);
     // Retained public capability identities must survive a scheduling-only change.
     // These are the exact descriptors present before the concurrency correction.
@@ -1881,7 +1887,11 @@ fn provider_onboarding_authority_rate_policies_are_explicit_and_fail_closed() ->
             authority.rate_scope()
         );
         assert_eq!(budget.window_nanos(), Some(1_000_000_000));
-        assert_eq!(budget.max_concurrent(), if index == 0 { 2 } else { 1 });
+        assert_eq!(budget.max_concurrent(), 1);
+        assert_eq!(
+            authority.operational_budget_policy()?.max_concurrent(),
+            if index == 0 { 2 } else { 1 }
+        );
         assert_eq!(endpoint.request_bounds().max_redirects(), 0);
         assert!(endpoint.client_profile().automatic_redirects_disabled());
         if index == 0 {

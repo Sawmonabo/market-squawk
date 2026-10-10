@@ -610,6 +610,21 @@ impl ProviderBudgetPolicy {
         Ok(qualified)
     }
 
+    pub(in crate::policy) fn with_request_concurrency(
+        &self,
+        max_concurrent: NonZeroU16,
+    ) -> Result<Self, NetworkPolicyError> {
+        if self
+            .windows()
+            .any(|window| u32::from(max_concurrent.get()) > window.requests_per_window())
+        {
+            return Err(NetworkPolicyError::InvalidBudgetPolicy);
+        }
+        let mut policy = self.clone();
+        policy.max_concurrent = max_concurrent;
+        Ok(policy)
+    }
+
     pub(crate) fn has_same_limits_as(&self, other: &Self) -> bool {
         self.requests_per_window == other.requests_per_window
             && self.window_nanos == other.window_nanos

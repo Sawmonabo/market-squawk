@@ -204,7 +204,7 @@ impl FilingTaxonomySourceAuthority {
         self.policy_for_endpoints(self.endpoints)
     }
 
-    /// Builds the code-owned application ceiling for this exact rate scope.
+    /// Builds the stable source declaration retained in metadata and revision evidence.
     pub fn budget_policy(
         self,
     ) -> Result<ProviderBudgetPolicy, FilingTaxonomyAuthorityContractError> {
@@ -239,6 +239,16 @@ impl FilingTaxonomySourceAuthority {
             backoff,
         )
         .map_err(|_| FilingTaxonomyAuthorityContractError::InvalidBudgetPolicy)
+    }
+
+    /// Returns current request scheduling capacity without changing source identity.
+    pub fn operational_budget_policy(
+        mut self,
+    ) -> Result<ProviderBudgetPolicy, FilingTaxonomyAuthorityContractError> {
+        if self.source_id == SEC_EDGAR_SOURCE_ID {
+            self.max_concurrent = 2;
+        }
+        self.budget_policy()
     }
 
     fn weighted_taxonomy_windows(
@@ -481,7 +491,7 @@ pub const SEC_EDGAR_AUTHORITY: FilingTaxonomySourceAuthority = FilingTaxonomySou
     taxonomy_endpoints: SEC_EDGAR_TAXONOMY_ENDPOINTS,
     request_header_class: FilingTaxonomyRequestHeaderClass::SecIdentifyingContact,
     requests_per_second: 2,
-    max_concurrent: 2,
+    max_concurrent: 1,
     max_response_bytes: 1024 * MEBIBYTE,
     total_timeout_nanos: 15 * MINUTE_NANOS,
     weighted_taxonomy_response_budget: false,

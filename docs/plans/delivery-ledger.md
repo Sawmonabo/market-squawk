@@ -74,6 +74,32 @@ AuthorityOrHealth; public crypto reference terms are unavailable. Full V1 remain
 | Astra option_acquisition | Read-only source and safe retained metadata; write ONLY `.agents/tmp/v1-first-stock/oct10-option-rejoin-identity.md` | Trace current chain.rejoin Identity after real resumed workflow at18b9. Identify actual missing/ambiguous identity relation and smallest producer-consumer correction; no guesses, state edits, credentials, API calls, source edits, builds, Git or process changes. |
 | Lead | Shared SEC operational-policy/source-metadata correction, integration and native scheduling | Next source slice separates operational concurrency from stable source identity; preserve normal recovery and existing quota semantics. No active source writers/builds at this handoff. |
 
+SEC correction in progress at dfdb4b3b; previous turn produced native evidence, not a wait.
+Watcher30632 stopped after confirming no Cargo/rustc process; current service/Desktop preserved.
+Lead owns source `onboarding/source_authority.rs`, `built_in_profiles.rs`, existing onboarding
+fixture, `policy/provider_rate.rs`, `policy/budget/identity.rs`,
+`policy/budget/coordinator/durability.rs`; adapter SEC `policy.rs`; app `provider_rate.rs` and
+existing `local_product/cli_provider.rs` fixture; closure/ledger/Git/build. No other source writer.
+Implementation boundary: stable source descriptor remains concurrency1; code-owned operational
+policy2 applies to exact configured collision identities and identical non-concurrency dimensions
+at shared declaration/allocation, before both local runtime and SQLite registration. Persisted
+source metadata stays unchanged. Existing local-only validation and durable quota checks remain.
+Smallest critical proof: source policy identity fixture plus actual SEC activation/restart and
+shared runtime concurrency in existing app fixture. No migration, live state editing or reset.
+Resulting pushed commit pending. Options diagnosis handed off and released: fresh chain contains
+86 contracts absent from the saved reference graph; exact evidence and bounded successor-acquisition
+requirements are in `oct10-option-rejoin-identity.md`. Do not filter those rows or reuse a chain with
+later reference observations. Source policy check PASS1/1 after correcting an obsolete metadata
+concurrency expectation; operational capacity remains separately asserted at2. Existing application
+SEC activation/restart fixture PASS1/1 (6m28s compile,2.81s test), including real SQLite-backed
+two-request reservation, third-request refusal, release/reuse and exact saved-generation reopen.
+Existing retained-quota/cooldown/disabled-state/stale-handle fixture PASS1/1 (55.44s compile,0.11s
+test). Logs `oct10-sec-{policy,recovery,quota}-critical.log`. All compilation was serialized with
+one job and the existing target; no source changes followed the passing checks. Native runtime
+remains18b9. Lead refreshes source closure, commits/pushes this coherent correction, then resumes
+the existing managed watcher for one native replacement. Blocked live SEC-session recovery still
+requires its normal lifecycle path; no direct state/credential edits or live-completion claim.
+
 ### Recent checkpoint history (superseded runtime/assignment states)
 
 
