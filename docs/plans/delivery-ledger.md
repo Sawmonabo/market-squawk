@@ -3,9 +3,8 @@
 ## Current execution — 2026-10-09
 
 Goal active; owner resumed after interruption. Previous turn made concrete source changes and
-proved the startup failure against retained state. Pushed HEAD remains **5ddad586**; current recovery
-and option-capacity changes are implemented and critically verified; integration commit follows,
-matching native verification remains pending. Main/release unchanged.
+proved the startup failure against retained state. Pushed HEAD is **18b9ff8f**; recovery and option-capacity corrections are implemented and
+critically verified. Native startup and all-nine retained market reads now verified; remaining failures below. Main/release unchanged.
 One primary worktree; local branches are feature, main, release/market-squawk-v0.1.0. No extra builds.
 
 **Current outcome:** ordinary restart must open the workspace, and option acquisition must wait for
@@ -18,17 +17,15 @@ validation stays intact; no reset, migration, credential changes or quota/histor
 
 | Active owner | Exact files / outcome | Check and next dependency |
 | --- | --- | --- |
-| Lead | Source `registry/catalog/construction.rs`; app `local_product/mod.rs`, `provider_rate.rs`; Alpaca Cargo manifest, Cargo.lock, source closure, ledger; all Git/build/runtime | New essential real-SQLite startup regression covers missing local checkpoints, repeated reconciliation, preserved quota/state and exact reopen. App critical1/1 PASS (6m26s compile,0.29s test); compiler61377/exec98161 terminal0. Watcher30632 stopped; supervisor30620 retained. |
+| Lead | Source `registry/catalog/construction.rs`; app `local_product/mod.rs`, `provider_rate.rs`; Alpaca Cargo manifest, Cargo.lock, source closure, ledger; all Git/build/runtime | New essential real-SQLite startup regression covers missing local checkpoints, repeated reconciliation, preserved quota/state and exact reopen. App critical1/1 PASS (6m26s compile,0.29s test); compiler61377/exec98161 terminal0. Native build66018 completed7m57s; service71463/Desktop71532 run generation-eA41mP. |
 | Astra option_capacity — handed off, frozen | Alpaca `src/option_chain.rs`, `historical_calendar.rs`, existing `historical.rs` fixture | Existing shared waiting reused; safe closed diagnostics added; authoritative fixture accounting repaired. Existing historical capture checks **5/5 PASS** (18.33s compile,0.11s test; oct10-option-capacity-critical.log). Exact earlier native Network cause remains unproven until normal recovery on matching build. |
-| Sol complete_asset_inventory | `.agents/tmp/provider-schemas/{alpaca,sec-company,market-squawk-derived,nasdaq,tiingo,occ,cboe}.csv` as applicable, `inventory.csv`, `README.md` | Complete owner-requested table: provider, exact path, type, actual example or explicit unrequested/absent/unverified status, asset applicability and consumer wiring. Integrates specialists; delivery independent of app build. |
-| Sol inventory_schwab — finishing | `.agents/tmp/provider-schemas/schwab.json` | 647 source field rows; five actual Instruments examples, remaining support/receipt status explicit. Coordinator verifies and integrates. |
+| Sol complete_asset_inventory — complete, released | `.agents/tmp/provider-schemas/{alpaca,sec-company,market-squawk-derived,nasdaq,tiingo,occ,cboe}.csv` as applicable, `inventory.csv`, `README.md` | Complete owner-requested table: provider, exact path, type, actual example or explicit unrequested/absent/unverified status, asset applicability and consumer wiring. Integrates specialists; delivery independent of app build. |
+| Sol inventory_schwab — complete, released | `.agents/tmp/provider-schemas/schwab.json` | 647 source field rows; five actual Instruments examples, remaining support/receipt status explicit. Coordinator verifies and integrates. |
 | Sol inventory_yahoo — complete | `.agents/tmp/provider-schemas/{yahoo,sec-funds,fund-nav}.json` | 270/203/63 rows, canonical contracts separated from provider payload; no invented values. |
 
 Source-closure verification and diff check pass; dependency lock adds only already-present tracing
-to Alpaca and Python lock changes only source identities. Lead next: commit/push coherent
-recovery+option correction and update PR43. Then let existing single managed
-watcher build matching native once; verify startup, all-nine affected market reads and normal saved
-workflow recovery. Source edits remain frozen during compilation. No final installed acceptance.
+to Alpaca and Python lock changes only source identities. Checkpoint18b9ff8f is pushed and PR43 updated. Native observations and the new option identity blocker are recorded below. The next source
+barrier is SEC stable identity versus operational quota. No final installed acceptance.
 
 **Other concrete dependencies remain:** SEC source descriptor concurrency1 versus operational2
 must be separated through allocation and normal blocked-session recovery (`oct9-sec-recovery-budget.md`);
@@ -40,8 +37,42 @@ No capability/provider dropped; whole-app RAM measurement remains deferred until
 records capacity bug and diagnostic limits. Native5a all9 detail and16stockfinancial first pages
 returned; handles closed, not full pagination/rendered coverage. Direct Alpaca all9 snapshots and
 one indicative MSFT option page HTTP200; complete schema inventory explicitly exceeds those samples.
-Managed launcher already removed the superseded generation; only active generation-0KjxPr remains
-under session-l9OANi (~1.44GB). Recovery/catalog and current compiler outputs preserved.
+Managed launcher already removed the superseded generation; only active generation-eA41mP remains
+under session-l9OANi. Recovery/catalog and current compiler outputs preserved.
+
+Inventory delivered and lead readback verified: `.agents/tmp/provider-schemas/README.md` and
+`inventory.csv` contain 2,198 definitions / 19,782 all-nine asset rows. All 13 final artifact
+hashes match the validation record; provider/field/type/example/receipt/consumer columns exist.
+Coordinator rechecked all 1,729 actual examples against retained safe payloads. These include
+historical quarantined Schwab values, explicitly not current accepted coverage. Missing,
+unrequested and unsupported fields remain visible; this is inventory completion, not API or
+product acceptance. All inventory lanes released.
+
+Fresh remote cleanup audit: one primary worktree and exactly the intended three local branches.
+Origin additionally has crc32fast and tokio Dependabot branches, tied to still-open PR55/PR56;
+these are active dependency work, not stale agent branches. No branch/worktree deletion warranted.
+Native build66018 completed under supervisor30620; no competing compiler or source writer.
+
+Native18b9 verification completed: matching managed build66018 PASS7m57s. Workspace
+composition completed2,419ms, service71463 and Desktop71532 remain alive. Actual background
+native `marketCollection(includeMarket=true)` returned all9 with retained prices/changes in3,700ms;
+all9 detail reads returned in512–3,494ms. Artifacts `oct10-recovery-native-{collection,all-nine}.json`.
+This proves workspace reopen and typed retained-market reads, not rendered-screen completeness,
+instant latency or streaming. Launcher removed the superseded generation automatically; only
+generation-eA41mP remains. No reset/migration/credential changes, new build root or workspace.
+
+One normal saved-workflow resume advanced8→10completed steps, then became unavailable.
+New exact option failure is `chain.rejoin`, category coverage / Identity:
+“exact canonical option identity is missing or ambiguous.” Previous chain.acquire Network did
+not recur in this attempt; this does not prove a complete chain or analytical journey.
+Artifacts `oct10-recovery-native-analysis-{resume,status}.json`; original workflow remains retained.
+SEC remains RequestSuperseded; Schwab first stream frame fails current qualification
+AuthorityOrHealth; public crypto reference terms are unavailable. Full V1 remains incomplete.
+
+| Active owner | Exact scope | Outcome / smallest check |
+| --- | --- | --- |
+| Astra option_acquisition | Read-only source and safe retained metadata; write ONLY `.agents/tmp/v1-first-stock/oct10-option-rejoin-identity.md` | Trace current chain.rejoin Identity after real resumed workflow at18b9. Identify actual missing/ambiguous identity relation and smallest producer-consumer correction; no guesses, state edits, credentials, API calls, source edits, builds, Git or process changes. |
+| Lead | Shared SEC operational-policy/source-metadata correction, integration and native scheduling | Next source slice separates operational concurrency from stable source identity; preserve normal recovery and existing quota semantics. No active source writers/builds at this handoff. |
 
 ### Recent checkpoint history (superseded runtime/assignment states)
 
